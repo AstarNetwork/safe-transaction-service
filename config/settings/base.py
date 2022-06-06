@@ -213,14 +213,12 @@ INSTALLED_APPS += [
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-broker_url
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="django://")
 # https://docs.celeryproject.org/en/stable/userguide/optimizing.html#broker-connection-pools
+# https://docs.celeryq.dev/en/latest/userguide/optimizing.html#broker-connection-pools
 CELERY_BROKER_POOL_LIMIT = env(
-    "CELERY_BROKER_POOL_LIMIT", default=env("CELERYD_CONCURRENCY", default=500)
+    "CELERY_BROKER_POOL_LIMIT", default=env("CELERYD_CONCURRENCY", default=1000)
 )
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-result_backend
-if CELERY_BROKER_URL == "django://":
-    CELERY_RESULT_BACKEND = "redis://"
-else:
-    CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default="redis://")
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-accept_content
 CELERY_ACCEPT_CONTENT = ["json"]
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-task_serializer
@@ -233,13 +231,11 @@ CELERY_IGNORE_RESULT = True
 CELERY_ALWAYS_EAGER = False
 # https://docs.celeryproject.org/en/latest/userguide/configuration.html#task-default-priority
 # Higher = more priority on RabbitMQ, opposite on Redis ¯\_(ツ)_/¯
-CELERY_TASK_DEFAULT_PRIORITY = 3
+CELERY_TASK_DEFAULT_PRIORITY = 5
 # https://docs.celeryproject.org/en/stable/userguide/configuration.html#task-queue-max-priority
 CELERY_TASK_QUEUE_MAX_PRIORITY = 10
 # https://docs.celeryproject.org/en/latest/userguide/configuration.html#broker-transport-options
-CELERY_BROKER_TRANSPORT_OPTIONS = {
-    "queue_order_strategy": "priority",
-}
+CELERY_BROKER_TRANSPORT_OPTIONS = {}
 
 
 # Django REST Framework
@@ -373,6 +369,9 @@ ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT = env.int(
     "ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT", default=10000
 )
 ETH_INTERNAL_NO_FILTER = env.bool("ETH_INTERNAL_NO_FILTER", default=False)
+ETH_INTERNAL_TRACE_TXS_BATCH_SIZE = env.int(
+    "ETH_INTERNAL_TRACE_TXS_BATCH_SIZE", default=0
+)
 ETH_L2_NETWORK = env.bool(
     "ETH_L2_NETWORK", default=not ETHEREUM_TRACING_NODE_URL
 )  # Use L2 event indexing
@@ -445,8 +444,3 @@ SWAGGER_SETTINGS = {
         "api_key": {"type": "apiKey", "in": "header", "name": "Authorization"}
     },
 }
-
-# Cache
-CACHE_OWNERS_VIEW_SECONDS = env.int(
-    "CACHE_OWNERS_VIEW_SECONDS", default=60 * 60
-)  # 1 hour

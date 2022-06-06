@@ -20,7 +20,14 @@ from .indexers import (
 )
 from .indexers.safe_events_indexer import SafeEventsIndexerProvider
 from .indexers.tx_processor import SafeTxProcessor, SafeTxProcessorProvider
-from .models import EthereumBlock, InternalTxDecoded, SafeStatus, WebHook, WebHookType
+from .models import (
+    EthereumBlock,
+    InternalTxDecoded,
+    SafeLastStatus,
+    SafeStatus,
+    WebHook,
+    WebHookType,
+)
 from .services import (
     IndexingException,
     IndexServiceProvider,
@@ -126,7 +133,7 @@ def index_erc20_events_out_of_sync_task(
         number_events_processed = 0
         while not updated:
             try:
-                events_processed, updated = erc20_events_indexer.process_addresses(
+                events_processed, _, updated = erc20_events_indexer.process_addresses(
                     addresses, current_block_number
                 )
                 number_events_processed += len(events_processed)
@@ -214,17 +221,19 @@ def index_safe_events_task(self) -> Optional[int]:
 def process_decoded_internal_txs_task(self) -> Optional[int]:
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
-            count = InternalTxDecoded.objects.pending_for_safes().count()
+            count = 0
+            for (
+                safe_to_process
+            ) in InternalTxDecoded.objects.safes_pending_to_be_processed().iterator():
+                count += 1
+                process_decoded_internal_txs_for_safe_task.delay(
+                    safe_to_process, reindex_master_copies=False
+                )
+
             if not count:
-                logger.info("No decoded internal txs to process")
+                logger.info("No Safes to process")
             else:
-                logger.info("%d decoded internal txs to process", count)
-                for (
-                    safe_to_process
-                ) in InternalTxDecoded.objects.safes_pending_to_be_processed():
-                    process_decoded_internal_txs_for_safe_task.delay(
-                        safe_to_process, reindex_master_copies=False
-                    )
+                logger.info("%d Safes to process", count)
 
 
 @app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
@@ -291,14 +300,15 @@ def process_decoded_internal_txs_for_safe_task(
                 "Start processing decoded internal txs for safe %s", safe_address
             )
             number_processed: int = 0
-            batch: int = (
-                100  # Process at most 100 decoded transactions for a single Safe
-            )
             tx_processor: SafeTxProcessor = SafeTxProcessorProvider()
 
             # Check if something is wrong during indexing
-            last_safe_status = SafeStatus.objects.last_for_address(safe_address)
-            if last_safe_status and last_safe_status.is_corrupted():
+            try:
+                safe_last_status = SafeLastStatus.objects.get(address=safe_address)
+            except SafeLastStatus.DoesNotExist:
+                safe_last_status = None
+
+            if safe_last_status and safe_last_status.is_corrupted():
                 tx_processor.clear_cache()
                 # Find first corrupted safe status
                 previous_safe_status: Optional[SafeStatus] = None
@@ -320,7 +330,7 @@ def process_decoded_internal_txs_for_safe_task(
                         )
                         if reindex_master_copies and previous_safe_status:
                             block_number = previous_safe_status.block_number
-                            to_block_number = last_safe_status.block_number
+                            to_block_number = safe_last_status.block_number
                             logger.info(
                                 "Safe-address=%s Last known not corrupted SafeStatus with nonce=%d on block=%d , "
                                 "reindexing until block=%d",
@@ -340,19 +350,13 @@ def process_decoded_internal_txs_for_safe_task(
                         raise ValueError(message)
                     previous_safe_status = safe_status
 
-            tx_processor.clear_cache()  # TODO Fix this properly
-            # Use slicing for memory issues
-            while True:
-                internal_txs_decoded = InternalTxDecoded.objects.pending_for_safe(
-                    safe_address
-                )[:batch]
-                if not internal_txs_decoded:
-                    break
-                number_processed += len(
-                    tx_processor.process_decoded_transactions(internal_txs_decoded)
-                )
-                if not number_processed:
-                    break
+            # Use iterator for memory issues
+            internal_txs_decoded = InternalTxDecoded.objects.pending_for_safe(
+                safe_address
+            ).iterator()
+            number_processed = len(
+                tx_processor.process_decoded_transactions(internal_txs_decoded)
+            )
             logger.info("Processed %d decoded transactions", number_processed)
             if number_processed:
                 logger.info(
@@ -373,7 +377,7 @@ def get_webhook_http_session(
         session.headers.update({"Authorization": authorization})
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=1,  # Doing all the connections to the same url
-        pool_maxsize=100,  # Number of concurrent connections
+        pool_maxsize=500,  # Number of concurrent connections
         pool_block=False,
     )
     session.mount("http://", adapter)
