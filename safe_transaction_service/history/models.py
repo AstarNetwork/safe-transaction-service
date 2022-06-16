@@ -941,7 +941,7 @@ class InternalTxDecodedQuerySet(models.QuerySet):
             "is_setup",
             "internal_tx__block_number",
             "internal_tx__ethereum_tx__transaction_index",
-            "internal_tx__trace_address",
+            "internal_tx_id",
         )
 
     def pending_for_safes(self):
@@ -1547,6 +1547,21 @@ class SafeStatusBase(models.Model):
 
 
 class SafeLastStatusManager(models.Manager):
+    def get_or_generate(self, address: ChecksumAddress) -> "SafeLastStatus":
+        """
+        :param address:
+        :return: `SafeLastStatus` if it exists. If not, it will try to build it from `SafeStatus` table
+        """
+        try:
+            return SafeLastStatus.objects.get(address=address)
+        except self.model.DoesNotExist:
+            safe_status = SafeStatus.objects.last_for_address(address)
+            if safe_status:
+                return SafeLastStatus.objects.update_or_create_from_safe_status(
+                    safe_status
+                )
+            raise
+
     def update_or_create_from_safe_status(
         self, safe_status: "SafeStatus"
     ) -> "SafeLastStatus":
@@ -1627,7 +1642,7 @@ class SafeStatusQuerySet(models.QuerySet):
             "-nonce",
             "-internal_tx__block_number",
             "-internal_tx__ethereum_tx__transaction_index",
-            "-internal_tx__trace_address",
+            "-internal_tx_id",
         )
 
     def sorted_reverse_by_mined(self):
@@ -1636,7 +1651,7 @@ class SafeStatusQuerySet(models.QuerySet):
             "nonce",
             "internal_tx__block_number",
             "internal_tx__ethereum_tx__transaction_index",
-            "internal_tx__trace_address",
+            "internal_tx_id",
         )
 
     def last_for_every_address(self) -> QuerySet:

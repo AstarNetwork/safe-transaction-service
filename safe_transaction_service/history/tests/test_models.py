@@ -581,26 +581,27 @@ class TestInternalTxDecoded(TestCase):
             InternalTxDecoded.objects.order_by_processing_queue(), []
         )
         ethereum_tx = EthereumTxFactory()
-        internal_tx_decoded_1 = InternalTxDecodedFactory(
-            internal_tx__trace_address="1", internal_tx__ethereum_tx=ethereum_tx
-        )
+        # `trace_address` is not used for ordering anymore
         internal_tx_decoded_0 = InternalTxDecodedFactory(
             internal_tx__trace_address="0", internal_tx__ethereum_tx=ethereum_tx
         )
-        internal_tx_decoded_5 = InternalTxDecodedFactory(
-            internal_tx__trace_address="5", internal_tx__ethereum_tx=ethereum_tx
+        internal_tx_decoded_1 = InternalTxDecodedFactory(
+            internal_tx__trace_address="2", internal_tx__ethereum_tx=ethereum_tx
+        )
+        internal_tx_decoded_15 = InternalTxDecodedFactory(
+            internal_tx__trace_address="15", internal_tx__ethereum_tx=ethereum_tx
         )
 
         self.assertQuerysetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(),
-            [internal_tx_decoded_0, internal_tx_decoded_1, internal_tx_decoded_5],
+            [internal_tx_decoded_0, internal_tx_decoded_1, internal_tx_decoded_15],
         )
 
-        internal_tx_decoded_5.function_name = "setup"
-        internal_tx_decoded_5.save()
+        internal_tx_decoded_15.function_name = "setup"
+        internal_tx_decoded_15.save()
         self.assertQuerysetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(),
-            [internal_tx_decoded_5, internal_tx_decoded_0, internal_tx_decoded_1],
+            [internal_tx_decoded_15, internal_tx_decoded_0, internal_tx_decoded_1],
         )
 
     def test_safes_pending_to_be_processed(self):
@@ -726,6 +727,28 @@ class TestLastSafeStatus(TestCase):
         self.assertCountEqual(
             SafeLastStatus.objects.addresses_for_owner(owner_address), []
         )
+
+
+class TestSafeLastStatus(TestCase):
+    def test_get_or_generate(self):
+        address = Account.create().address
+        with self.assertRaises(SafeLastStatus.DoesNotExist):
+            SafeLastStatus.objects.get_or_generate(address)
+
+        SafeStatusFactory(address=address, nonce=0)
+        SafeStatusFactory(address=address, nonce=5)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
+        # SafeLastStatus should be created from latest SafeStatus
+        self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 5)
+        self.assertEqual(SafeLastStatus.objects.count(), 1)
+
+        # SafeLastStatus was already created and will not be increased
+        SafeStatusFactory(address=address, nonce=7)
+        self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 5)
+
+        SafeLastStatus.objects.all().delete()
+        SafeLastStatusFactory(address=address, nonce=17)
+        self.assertEqual(SafeLastStatus.objects.get_or_generate(address).nonce, 17)
 
 
 class TestSafeStatus(TestCase):

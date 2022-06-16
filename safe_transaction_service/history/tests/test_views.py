@@ -36,7 +36,7 @@ from ..models import (
     SafeContractDelegate,
     SafeMasterCopy,
 )
-from ..serializers import DelegateSerializer, TransferType
+from ..serializers import TransferType
 from ..services import BalanceService, CollectiblesService
 from ..services.balance_service import Erc20InfoWithLogo
 from ..services.collectibles_service import CollectibleWithMetadata
@@ -1780,10 +1780,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         SafeContractFactory(address=safe_address)
-        with mock.patch.object(
-            DelegateSerializer,
-            "get_safe_owners",
-            autospec=True,
+        with mock.patch(
+            "safe_transaction_service.history.serializers.get_safe_owners",
             return_value=[Account.create().address],
         ) as get_safe_owners_mock:
             response = self.client.post(url, format="json", data=data)
@@ -2835,8 +2833,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
     def test_master_copies_view(self):
         response = self.client.get(reverse("v1:history:master-copies"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = []
-        self.assertEqual(response.data, expected)
+        self.assertEqual(response.data, [])
 
         deployed_block_number = 2
         last_indexed_block_number = 5
@@ -2846,7 +2843,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         response = self.client.get(reverse("v1:history:master-copies"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected = [
+        expected_master_copy = [
             {
                 "address": safe_master_copy.address,
                 "version": safe_master_copy.version,
@@ -2856,12 +2853,12 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "l2": False,
             }
         ]
-        self.assertCountEqual(response.data, expected)
+        self.assertCountEqual(response.data, expected_master_copy)
 
         safe_master_copy = SafeMasterCopyFactory(l2=True)
         response = self.client.get(reverse("v1:history:master-copies"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected += [
+        expected_l2_master_copy = [
             {
                 "address": safe_master_copy.address,
                 "version": safe_master_copy.version,
@@ -2872,7 +2869,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             }
         ]
 
-        self.assertCountEqual(response.data, expected)
+        self.assertCountEqual(
+            response.data, expected_master_copy + expected_l2_master_copy
+        )
+
+        with self.settings(ETH_L2_NETWORK=True):
+            response = self.client.get(reverse("v1:history:master-copies"))
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertCountEqual(response.data, expected_l2_master_copy)
 
     def test_analytics_multisig_txs_by_origin_view(self):
         response = self.client.get(
