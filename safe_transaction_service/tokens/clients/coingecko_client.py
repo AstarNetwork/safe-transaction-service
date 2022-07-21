@@ -65,6 +65,7 @@ class CoingeckoClient:
             return response.json()
         except (ValueError, IOError) as e:
             logger.warning("Problem fetching %s", url)
+            logger.warning("Response: %s", response)
             raise CoingeckoRequestError from e
 
     def _get_price(self, url: str, name: str):
