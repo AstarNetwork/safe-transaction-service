@@ -52,6 +52,7 @@ class CoingeckoClient:
             EthereumNetwork.MATIC,
             EthereumNetwork.OPTIMISTIC,
             EthereumNetwork.XDAI,
+            EthereumNetwork.ASTAR,
         )
 
     def _do_request(self, url: str) -> Dict[str, Any]:
