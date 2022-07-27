@@ -57,7 +57,7 @@ class CoingeckoClient:
 
     def _do_request(self, url: str) -> Dict[str, Any]:
         try:
-            response = self.http_session.get(url, timeout=10)
+            response = self.http_session.get(url, timeout=30)
             if not response.ok:
                 if response.status_code == 404:
                     raise Coingecko404
