@@ -9,7 +9,7 @@ for image in transaction_nginx transaction_web transaction_worker transaction_sc
 do
   docker tag $image:latest $repository-$image:latest
   docker push $repository-$image:latest
-  docker tag $image:latest $repository-$image:$now
-  docker push $repository-$image:$now
+  docker tag $image:latest $repository-$image:${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
+  docker push $repository-$image:${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
 done
 
