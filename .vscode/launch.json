@@ -12,6 +12,19 @@
             ],
             "django": true,
             "envFile": ".env.test"
+        },
+        {
+            "name": "Run current file tests",
+            "type": "python",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "--lf",
+                "-rxXs",
+                "${file}"
+            ],
+            "django": true,
+            "envFile": ".env.test"
         }
     ]
 }
