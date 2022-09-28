@@ -9,6 +9,7 @@ from gnosis.eth import EthereumClient, EthereumNetwork
 from gnosis.eth.oracles import (
     KyberOracle,
     OracleException,
+    UnderlyingToken,
     UniswapOracle,
     UniswapV2Oracle,
 )
@@ -108,6 +109,26 @@ class TestPriceService(TestCase):
             price_service.cache_eth_price.clear()
             self.assertEqual(price_service.get_native_coin_usd_price(), 1.3)
 
+        # Cronos
+        with mock.patch.object(KucoinClient, "get_cro_usd_price", return_value=4.4):
+            price_service.ethereum_network = EthereumNetwork.CRONOS_TESTNET
+            price_service.cache_eth_price.clear()
+            self.assertEqual(price_service.get_native_coin_usd_price(), 4.4)
+
+            price_service.ethereum_network = EthereumNetwork.CRONOS_MAINNET
+            price_service.cache_eth_price.clear()
+            self.assertEqual(price_service.get_native_coin_usd_price(), 4.4)
+
+        # Milkomeda
+        with mock.patch.object(BinanceClient, "get_ada_usd_price", return_value=5.5):
+            price_service.ethereum_network = EthereumNetwork.MILKOMEDA_C1_TESTNET
+            price_service.cache_eth_price.clear()
+            self.assertEqual(price_service.get_native_coin_usd_price(), 5.5)
+
+            price_service.ethereum_network = EthereumNetwork.MILKOMEDA_C1_MAINNET
+            price_service.cache_eth_price.clear()
+            self.assertEqual(price_service.get_native_coin_usd_price(), 5.5)
+
     @mock.patch.object(CoingeckoClient, "get_bnb_usd_price", return_value=3.0)
     @mock.patch.object(BinanceClient, "get_bnb_usd_price", return_value=5.0)
     def test_get_binance_usd_price(
@@ -205,3 +226,21 @@ class TestPriceService(TestCase):
                 self.assertEqual(
                     price_service.cache_token_eth_value[(random_address_2,)], 0.0
                 )
+
+    @mock.patch.object(
+        PriceService, "get_underlying_tokens", return_value=[], autospec=True
+    )
+    @mock.patch.object(
+        PriceService, "get_token_eth_value", autospec=True, return_value=1.0
+    )
+    def test_eth_price_from_composed_oracles(
+        self, get_token_eth_value_mock: MagicMock, price_service_mock: MagicMock
+    ):
+        price_service = self.price_service
+        token_one = UnderlyingToken("0x48f07301E9E29c3C38a80ae8d9ae771F224f1054", 0.482)
+        token_two = UnderlyingToken("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", 0.376)
+        token_three = UnderlyingToken("0xA0b86991c6218b36c1d19D4a2e9Eb0cE360", 0.142)
+        price_service_mock.return_value = [token_one, token_two, token_three]
+        curve_price = "0xe7ce624c00381b4b7abb03e633fb4acac4537dd6"
+        eth_price = price_service.get_eth_price_from_composed_oracles(curve_price)
+        self.assertEqual(eth_price, 1.0)

@@ -155,6 +155,9 @@ class PriceService:
     def get_aurora_usd_price(self) -> float:
         return self.coingecko_client.get_aoa_usd_price()
 
+    def get_cardano_usd_price(self) -> float:
+        return self.binance_client.get_ada_usd_price()
+
     def get_binance_usd_price(self) -> float:
         try:
             return self.binance_client.get_bnb_usd_price()
@@ -187,6 +190,9 @@ class PriceService:
                 return self.coingecko_client.get_astar_usd_price()
             except CannotGetPrice:
                 return self.coingecko_client.get_astar_usd_price()
+
+    def get_cronos_usd_price(self) -> float:
+        return self.kucoin_client.get_cro_usd_price()
 
     @cachedmethod(cache=operator.attrgetter("cache_eth_price"))
     @cache_memoize(60 * 30, prefix="balances-get_eth_usd_price")  # 30 minutes
@@ -222,6 +228,11 @@ class PriceService:
         elif self.ethereum_network == EthereumNetwork.AVALANCHE:
             return self.get_avalanche_usd_price()
         elif self.ethereum_network in (
+            EthereumNetwork.MILKOMEDA_C1_TESTNET,
+            EthereumNetwork.MILKOMEDA_C1_MAINNET,
+        ):
+            return self.get_cardano_usd_price()
+        elif self.ethereum_network in (
             EthereumNetwork.AURORA,
             EthereumNetwork.AURORA_BETANET,
             EthereumNetwork.ARBITRUM_TESTNET,
@@ -229,6 +240,11 @@ class PriceService:
             return self.get_aurora_usd_price()
         elif self.ethereum_network == EthereumNetwork.ASTAR:
             return self.get_astar_usd_price()
+        elif self.ethereum_network in (
+            EthereumNetwork.CRONOS_TESTNET,
+            EthereumNetwork.CRONOS_MAINNET,
+        ):
+            return self.get_cronos_usd_price()
         else:
             try:
                 return self.kraken_client.get_eth_usd_price()
@@ -363,3 +379,34 @@ class PriceService:
                 FiatCode.USD,
                 token_eth_values_with_timestamp.timestamp,
             )
+
+    def get_eth_price_from_oracles(self, token_address: ChecksumAddress) -> float:
+        """
+        Calculate eth_price from oracles
+        :param token_address
+        :return: Current token price
+        """
+        return (
+            self.get_token_eth_value(token_address)
+            or self.get_token_usd_price(token_address)
+            / self.get_native_coin_usd_price()
+        )
+
+    def get_eth_price_from_composed_oracles(
+        self, token_address: ChecksumAddress
+    ) -> float:
+        """
+        Calculate eth_price from composed oracles
+        :param token_address
+        :return: Current token price
+        """
+        eth_price = 0
+        if underlying_tokens := self.get_underlying_tokens(token_address):
+            for underlying_token in underlying_tokens:
+                # Find underlying token price and multiply by quantity
+                address = underlying_token.address
+                eth_price += (
+                    self.get_eth_price_from_oracles(address) * underlying_token.quantity
+                )
+
+        return eth_price
