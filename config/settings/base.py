@@ -230,6 +230,10 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {}
 CELERY_ROUTES = (
     [
         (
+            "safe_transaction_service.history.tasks.retry_get_metadata_task",
+            {"queue": "tokens"},
+        ),
+        (
             "safe_transaction_service.history.tasks.send_webhook_task",
             {"queue": "webhooks"},
         ),
@@ -385,8 +389,8 @@ ETH_EVENTS_BLOCK_PROCESS_LIMIT_MAX = env.int(
     "ETH_EVENTS_BLOCK_PROCESS_LIMIT_MAX", default=0
 )  # Maximum number of blocks to process together when searching for events. 0 == no limit.
 ETH_EVENTS_QUERY_CHUNK_SIZE = env.int(
-    "ETH_EVENTS_QUERY_CHUNK_SIZE", default=5_000
-)  # Number of addresses to use as `getLogs` parameter. `0 == no limit`. By testing `5000` looks like a good default
+    "ETH_EVENTS_QUERY_CHUNK_SIZE", default=1_000
+)  # Number of addresses to use as `getLogs` parameter. `0 == no limit`. By testing `1_000` looks like a good default
 ETH_EVENTS_UPDATED_BLOCK_BEHIND = env.int(
     "ETH_EVENTS_UPDATED_BLOCK_BEHIND", default=24 * 60 * 60 // 15
 )  # Number of blocks to consider an address 'almost updated'.
@@ -396,10 +400,14 @@ ETH_REORG_BLOCKS = env.int(
 
 # Tokens
 # ------------------------------------------------------------------------------
-TOKENS_LOGO_BASE_URI = env(
-    "TOKENS_LOGO_BASE_URI", default="https://gnosis-safe-token-logos.s3.amazonaws.com/"
+TOKENS_LOGO_BASE_URI = env.str(
+    "TOKENS_LOGO_BASE_URI", default="https://tokens-logo.localhost/"
+)  # Used if AWS_S3_PUBLIC_URL is not defined
+TOKENS_LOGO_EXTENSION = env.str("TOKENS_LOGO_EXTENSION", default=".png")
+TOKENS_ENS_IMAGE_URL = env.str(
+    "TOKENS_ENS_IMAGE_URL",
+    default="https://safe-transaction-assets.safe.global/tokens/logos/ENS.png",
 )
-TOKENS_LOGO_EXTENSION = env("TOKENS_LOGO_EXTENSION", default=".png")
 
 # Notifications
 # ------------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import contextlib
+import json
 from functools import cache
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -9,6 +10,7 @@ from celery.utils.log import get_task_logger
 from eth_typing import ChecksumAddress
 from redis.exceptions import LockError
 
+from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.utils import close_gevent_db_connection_decorator
 
 from ..utils.tasks import LOCK_TIMEOUT, SOFT_TIMEOUT, only_one_running_task
@@ -30,9 +32,15 @@ from .models import (
 )
 from .services import (
     IndexingException,
+    IndexService,
     IndexServiceProvider,
     ReorgService,
     ReorgServiceProvider,
+)
+from .services.collectibles_service import (
+    Collectible,
+    CollectibleWithMetadata,
+    MetadataRetrievalExceptionTimeout,
 )
 
 logger = get_task_logger(__name__)
@@ -312,7 +320,7 @@ def reindex_erc20_events_task(
 
 @app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
 def process_decoded_internal_txs_for_safe_task(
-    self, safe_address: str, reindex_master_copies: bool = True
+    self, safe_address: ChecksumAddress, reindex_master_copies: bool = True
 ) -> Optional[int]:
     """
     Process decoded internal txs for one Safe. Processing decoded transactions is very slow and this way multiple
@@ -327,56 +335,64 @@ def process_decoded_internal_txs_for_safe_task(
             logger.info(
                 "Start processing decoded internal txs for safe %s", safe_address
             )
-            number_processed: int = 0
             tx_processor: SafeTxProcessor = SafeTxProcessorProvider()
+            index_service: IndexService = IndexServiceProvider()
 
             # Check if something is wrong during indexing
             try:
-                safe_last_status = SafeLastStatus.objects.get(address=safe_address)
+                safe_last_status = SafeLastStatus.objects.get_or_generate(
+                    address=safe_address
+                )
             except SafeLastStatus.DoesNotExist:
                 safe_last_status = None
 
             if safe_last_status and safe_last_status.is_corrupted():
-                tx_processor.clear_cache()
-                # Find first corrupted safe status
-                previous_safe_status: Optional[SafeStatus] = None
-                for safe_status in SafeStatus.objects.filter(
-                    address=safe_address
-                ).sorted_reverse_by_mined():
-                    if safe_status.is_corrupted():
-                        message = (
-                            f"Safe-address={safe_address} A problem was found in SafeStatus "
-                            f"with nonce={safe_status.nonce} "
-                            f"on internal-tx-id={safe_status.internal_tx_id} "
-                            f"tx-hash={safe_status.internal_tx.ethereum_tx_id} "
-                        )
-                        logger.error(message)
-                        index_service = IndexServiceProvider()
-                        logger.info(
-                            "Safe-address=%s Processing traces again",
-                            safe_address,
-                        )
-                        if reindex_master_copies and previous_safe_status:
-                            block_number = previous_safe_status.block_number
-                            to_block_number = safe_last_status.block_number
+                try:
+                    # Find first corrupted safe status
+                    previous_safe_status: Optional[SafeStatus] = None
+                    for safe_status in SafeStatus.objects.filter(
+                        address=safe_address
+                    ).sorted_reverse_by_mined():
+                        if safe_status.is_corrupted():
+                            message = (
+                                f"Safe-address={safe_address} A problem was found in SafeStatus "
+                                f"with nonce={safe_status.nonce} "
+                                f"on internal-tx-id={safe_status.internal_tx_id} "
+                                f"tx-hash={safe_status.internal_tx.ethereum_tx_id} "
+                            )
+                            logger.error(message)
                             logger.info(
-                                "Safe-address=%s Last known not corrupted SafeStatus with nonce=%d on block=%d , "
-                                "reindexing until block=%d",
+                                "Safe-address=%s Processing traces again",
                                 safe_address,
-                                previous_safe_status.nonce,
-                                block_number,
-                                to_block_number,
                             )
-                            reindex_master_copies_task.delay(
-                                block_number, to_block_number
+                            if reindex_master_copies and previous_safe_status:
+                                block_number = previous_safe_status.block_number
+                                to_block_number = safe_last_status.block_number
+                                logger.info(
+                                    "Safe-address=%s Last known not corrupted SafeStatus with nonce=%d on block=%d , "
+                                    "reindexing until block=%d",
+                                    safe_address,
+                                    previous_safe_status.nonce,
+                                    block_number,
+                                    to_block_number,
+                                )
+                                reindex_master_copies_task.delay(
+                                    block_number, to_block_number
+                                )
+                            logger.info(
+                                "Safe-address=%s Processing traces again after reindexing",
+                                safe_address,
                             )
-                        logger.info(
-                            "Safe-address=%s Processing traces again after reindexing",
-                            safe_address,
-                        )
-                        index_service.reprocess_addresses([safe_address])
-                        raise ValueError(message)
-                    previous_safe_status = safe_status
+                            raise ValueError(message)
+                        previous_safe_status = safe_status
+                finally:
+                    tx_processor.clear_cache(safe_address)
+                    index_service.reprocess_addresses([safe_address])
+
+            # Check if a new decoded tx appeared before other already processed (due to a reindex)
+            if InternalTxDecoded.objects.out_of_order_for_safe(safe_address):
+                tx_processor.clear_cache(safe_address)
+                index_service.reprocess_addresses([safe_address])
 
             # Use iterator for memory issues
             internal_txs_decoded = InternalTxDecoded.objects.pending_for_safe(
@@ -454,7 +470,7 @@ def send_webhook_task(address: Optional[str], payload: Dict[str, Any]) -> int:
             )
 
         r = get_webhook_http_session(full_url, webhook.authorization).post(
-            full_url, json=payload
+            full_url, json=payload, timeout=5
         )
         if r.ok:
             logger.info(
@@ -472,3 +488,63 @@ def send_webhook_task(address: Optional[str], payload: Dict[str, Any]) -> int:
 
         sent_requests += 1
     return sent_requests
+
+
+@app.shared_task(
+    bind=True,
+    soft_time_limit=SOFT_TIMEOUT,
+    autoretry_for=(MetadataRetrievalExceptionTimeout,),
+    time_limit=LOCK_TIMEOUT,
+    retry_backoff=60,
+    retry_kwargs={"max_retries": 4},
+)
+def retry_get_metadata_task(self, address: str, id: int) -> bool:
+    """
+    Retry to get metadata from an uri that during the first try returned a timeout error.
+
+    :param address: collectible address
+    :param id: collectible id
+    """
+    from .services import CollectiblesServiceProvider
+
+    collectibles_service = CollectiblesServiceProvider()
+    redis_key = collectibles_service.get_redis_metadata_key(address, id)
+    redis = get_redis()
+    # The collectible is shared with the task by redis cache.
+    # This avoid to have the collectible serialized on redis and also on rabbit.
+    redis_collectible = redis.get(redis_key)
+    # If the collectible doesn't exist means that the cache was removed and should wait for first try from the view.
+    if not redis_collectible:
+        return None
+
+    collectible_with_metadata_cached: CollectibleWithMetadata = json.loads(
+        redis_collectible
+    )
+
+    collectible = Collectible(
+        collectible_with_metadata_cached["token_name"],
+        collectible_with_metadata_cached["token_symbol"],
+        collectible_with_metadata_cached["logo_uri"],
+        collectible_with_metadata_cached["address"],
+        int(collectible_with_metadata_cached["id"]),
+        collectible_with_metadata_cached["uri"],
+    )
+
+    metadata = collectibles_service.get_metadata(collectible)
+    collectible_with_metadata = CollectibleWithMetadata(
+        collectible.token_name,
+        collectible.token_symbol,
+        collectible.logo_uri,
+        collectible.address,
+        collectible.id,
+        collectible.uri,
+        metadata,
+    )
+
+    redis.set(
+        redis_key,
+        json.dumps(collectible_with_metadata.__dict__),
+        collectibles_service.COLLECTIBLE_EXPIRATION,
+    )
+
+    return collectible_with_metadata

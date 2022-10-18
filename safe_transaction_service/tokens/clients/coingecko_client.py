@@ -53,6 +53,7 @@ class CoingeckoClient:
             EthereumNetwork.OPTIMISTIC,
             EthereumNetwork.XDAI,
             EthereumNetwork.ASTAR,
+            EthereumNetwork.FUSE_MAINNET,
         )
 
     def _do_request(self, url: str) -> Dict[str, Any]:
@@ -144,3 +145,6 @@ class CoingeckoClient:
 
     def get_astar_usd_price(self) -> float:
         return self.get_price("astar")
+
+    def get_fuse_usd_price(self) -> float:
+        return self.get_price("fuse-network-token")

@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from django.db.models import Case, F, OuterRef, QuerySet, Subquery, Value, When
+from django.db.models import Case, Exists, F, OuterRef, QuerySet, Subquery, Value, When
 from django.utils import timezone
 
 from redis import Redis
@@ -157,13 +157,14 @@ class TransactionService:
                 "block",
                 "safe_nonce",
             )
+            .order_by("-execution_date")
         )
         # Block is needed to get stable ordering
 
         if not queued:  # Filter out txs with nonce >= Safe nonce
             last_nonce_query = (
                 MultisigTransaction.objects.filter(safe=safe_address)
-                .exclude(ethereum_tx=None)
+                .executed()
                 .order_by("-nonce")
                 .values("nonce")
             )
@@ -172,17 +173,17 @@ class TransactionService:
             )
 
         if trusted:  # Just show trusted transactions
-            multisig_safe_tx_ids = multisig_safe_tx_ids.filter(trusted=True)
+            multisig_safe_tx_ids = multisig_safe_tx_ids.trusted()
 
         if executed:
-            multisig_safe_tx_ids = multisig_safe_tx_ids.exclude(ethereum_tx__block=None)
+            multisig_safe_tx_ids = multisig_safe_tx_ids.executed()
 
         # Get module txs
         module_tx_ids = (
             ModuleTransaction.objects.filter(safe=safe_address)
             .annotate(
-                execution_date=F("internal_tx__ethereum_tx__block__timestamp"),
-                block=F("internal_tx__ethereum_tx__block_id"),
+                execution_date=F("internal_tx__timestamp"),
+                block=F("internal_tx__block_number"),
                 safe_nonce=Value(0, output_field=Uint256Field()),
             )
             .values(
@@ -193,24 +194,23 @@ class TransactionService:
                 "safe_nonce",
             )
             .distinct()
+            .order_by("-execution_date")
         )
 
-        multisig_hashes = (
-            MultisigTransaction.objects.filter(safe=safe_address)
-            .exclude(ethereum_tx=None)
-            .values("ethereum_tx_id")
+        multisig_hashes = MultisigTransaction.objects.filter(
+            safe=safe_address, ethereum_tx_id=OuterRef("ethereum_tx_id")
         )
-        module_hashes = ModuleTransaction.objects.filter(safe=safe_address).values(
-            "internal_tx__ethereum_tx_id"
+        module_hashes = ModuleTransaction.objects.filter(
+            safe=safe_address, internal_tx__ethereum_tx_id=OuterRef("ethereum_tx_id")
         )
-        multisig_and_module_hashes = multisig_hashes.union(module_hashes)
 
         # Get incoming/outgoing tokens not included on Multisig or Module txs.
         # Outgoing tokens can be triggered by another user after the Safe calls `approve`, that's why it will not
         # always appear as a MultisigTransaction
         erc20_tx_ids = (
             ERC20Transfer.objects.to_or_from(safe_address)
-            .exclude(ethereum_tx__in=multisig_and_module_hashes)
+            .exclude(Exists(multisig_hashes))
+            .exclude(Exists(module_hashes))
             .annotate(
                 execution_date=F("timestamp"),
                 created=F("timestamp"),
@@ -221,11 +221,13 @@ class TransactionService:
                 "ethereum_tx_id", "execution_date", "created", "block", "safe_nonce"
             )
             .distinct()
+            .order_by("-execution_date")
         )
 
         erc721_tx_ids = (
             ERC721Transfer.objects.to_or_from(safe_address)
-            .exclude(ethereum_tx__in=multisig_and_module_hashes)
+            .exclude(Exists(multisig_hashes))
+            .exclude(Exists(module_hashes))
             .annotate(
                 execution_date=F("timestamp"),
                 created=F("timestamp"),
@@ -236,16 +238,18 @@ class TransactionService:
                 "ethereum_tx_id", "execution_date", "created", "block", "safe_nonce"
             )
             .distinct()
+            .order_by("-execution_date")
         )
 
-        # Get incoming txs not included on Multisig or Module txs
+        # Get incoming ether txs not included on Multisig or Module txs
         internal_tx_ids = (
             InternalTx.objects.filter(
                 call_type=EthereumTxCallType.CALL.value,
                 value__gt=0,
                 to=safe_address,
             )
-            .exclude(ethereum_tx__in=multisig_and_module_hashes)
+            .exclude(Exists(multisig_hashes))
+            .exclude(Exists(module_hashes))
             .annotate(
                 execution_date=F("timestamp"),
                 created=F("timestamp"),
@@ -256,14 +260,15 @@ class TransactionService:
                 "ethereum_tx_id", "execution_date", "created", "block", "safe_nonce"
             )
             .distinct()
+            .order_by("-execution_date")
         )
 
         # Tricky, we merge SafeTx hashes with EthereumTx hashes
         queryset = (
-            multisig_safe_tx_ids.union(erc20_tx_ids)
-            .union(erc721_tx_ids)
-            .union(internal_tx_ids)
-            .union(module_tx_ids)
+            multisig_safe_tx_ids.union(erc20_tx_ids, all=True)
+            .union(erc721_tx_ids, all=True)
+            .union(internal_tx_ids, all=True)
+            .union(module_tx_ids, all=True)
             .order_by("-execution_date", "-safe_nonce", "block", "-created")
         )
         # Order by block because `block_number < NULL`, so txs mined will have preference,
