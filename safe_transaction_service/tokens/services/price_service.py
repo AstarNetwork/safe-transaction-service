@@ -185,6 +185,24 @@ class PriceService:
             except CannotGetPrice:
                 return self.coingecko_client.get_matic_usd_price()
 
+    def get_astar_usd_price(self) -> float:
+        try:
+            return self.coingecko_client.get_astar_usd_price()
+        except CannotGetPrice:
+            try:
+                return self.coingecko_client.get_astar_usd_price()
+            except CannotGetPrice:
+                return self.coingecko_client.get_astar_usd_price()
+
+    def get_shiden_usd_price(self) -> float:
+        try:
+            return self.coingecko_client.get_shiden_usd_price()
+        except CannotGetPrice:
+            try:
+                return self.coingecko_client.get_shiden_usd_price()
+            except CannotGetPrice:
+                return self.coingecko_client.get_shiden_usd_price()
+
     def get_cronos_usd_price(self) -> float:
         return self.kucoin_client.get_cro_usd_price()
 
@@ -258,6 +276,13 @@ class PriceService:
             EthereumNetwork.ARBITRUM_RINKEBY,
         ):
             return self.get_aurora_usd_price()
+        elif self.ethereum_network in (
+            EthereumNetwork.ASTAR,
+            EthereumNetwork.ZENITH_TESTNET_VILNIUS, #SHIBUYA
+        ):
+            return self.get_astar_usd_price()
+        elif self.ethereum_network == EthereumNetwork.SHIDEN:
+            return self.get_shiden_usd_price()
         elif self.ethereum_network in (
             EthereumNetwork.CRONOS_TESTNET,
             EthereumNetwork.CRONOS_MAINNET_BETA,

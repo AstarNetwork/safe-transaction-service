@@ -34,6 +34,8 @@ class CoingeckoClient(BaseHTTPClient):
         EthereumNetwork.POLYGON_ZKEVM: "polygon-zkevm",
         EthereumNetwork.CELO_MAINNET: "celo",
         EthereumNetwork.METER_MAINNET: "meter",
+        EthereumNetwork.ASTAR: "astar",
+        EthereumNetwork.SHIDEN: "shiden",
     }
     base_url = "https://api.coingecko.com/"
 
@@ -138,6 +140,12 @@ class CoingeckoClient(BaseHTTPClient):
 
     def get_gather_usd_price(self) -> float:
         return self.get_price("gather")
+
+    def get_astar_usd_price(self) -> float:
+        return self.get_price("astar")
+
+    def get_shiden_usd_price(self) -> float:
+        return self.get_price("shiden")
 
     def get_fuse_usd_price(self) -> float:
         return self.get_price("fuse-network-token")
