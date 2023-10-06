@@ -70,11 +70,11 @@ class AboutView(APIView):
 
     renderer_classes = (JSONRenderer,)
 
-    @method_decorator(cache_page(5 * 60))  # 5 minutes
+    #@method_decorator(cache_page(5 * 60))  # 5 minutes
     def get(self, request, format=None):
         content = {
             "name": "Safe Transaction Service",
-            "version": __version__,
+            "version": __version__ + "_all-safes-2",
             "api_version": request.version,
             "secure": request.is_secure(),
             "host": request.get_host(),
@@ -1237,6 +1237,26 @@ class OwnersView(GenericAPIView):
 
         safes_for_owner = SafeLastStatus.objects.addresses_for_owner(address)
         serializer = self.get_serializer(data={"safes": safes_for_owner})
+        assert serializer.is_valid()
+        return Response(status=status.HTTP_200_OK, data=serializer.data)
+
+class AllSafesView(GenericAPIView):
+    serializer_class = serializers.OwnerResponseSerializer
+    pagination_class = None  # Don't show limit/offset in swagger
+
+    @method_decorator(cache_page(15))  # 15 seconds
+    def get(self, request):
+        """
+        Return all created Safes
+        """
+
+        # Get all safes
+        logger.info("Getting all safes")
+        all_safes = SafeLastStatus.objects.addresses_all()
+        logger.info(f"Found {len(all_safes)} safes")
+        logger.info(all_safes)
+
+        serializer = self.get_serializer(data={"safes": all_safes})
         assert serializer.is_valid()
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 

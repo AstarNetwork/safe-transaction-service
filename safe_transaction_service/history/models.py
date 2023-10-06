@@ -1881,6 +1881,15 @@ class SafeLastStatusManager(models.Manager):
         return self.filter(owners__contains=[owner_address]).values_list(
             "address", flat=True
         )
+    
+    def addresses_all(self) -> QuerySet[str]:
+        """
+        :return: all Safes
+        """
+
+        return self.values_list(
+            "address", flat=True
+        )
 
 
 class SafeLastStatus(SafeStatusBase):
