@@ -19,7 +19,7 @@ TOKEN_LIST_BY_NETWORK = {
         "Official",
     ),
     EthereumNetwork.GNOSIS: ("https://tokens.honeyswap.org/", "HoneySwap"),
-    EthereumNetwork.BINANCE_SMART_CHAIN_MAINNET: (
+    EthereumNetwork.BNB_SMART_CHAIN_MAINNET: (
         "https://tokens.pancakeswap.finance/pancakeswap-extended.json",
         "PancakeSwap",
     ),
@@ -38,7 +38,6 @@ def add_default_token_lists(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("tokens", "0009_token_token_spam_idx"),
     ]
