@@ -2,6 +2,7 @@ import itertools
 import operator
 from functools import cache, cached_property
 from logging import getLogger
+from threading import Lock
 from typing import (
     Any,
     Dict,
@@ -118,6 +119,9 @@ class MultisendDecoded(TypedDict):
     data_decoded: Optional[DataDecoded]
 
 
+mutex = Lock()
+
+
 @cache
 def get_db_tx_decoder() -> "DbTxDecoder":
     """
@@ -127,16 +131,19 @@ def get_db_tx_decoder() -> "DbTxDecoder":
         the ``DbTxDecoder`` multiple times, and depending on the number of Contracts in the database it could
         take a lot.
     """
+    with mutex:
+        if is_db_tx_decoder_loaded():
+            return get_db_tx_decoder()
 
-    def _get_db_tx_decoder() -> "DbTxDecoder":
-        return DbTxDecoder()
+        def _get_db_tx_decoder() -> "DbTxDecoder":
+            return DbTxDecoder()
 
-    if running_on_gevent():
-        # It's a very intensive CPU task, so to prevent blocking
-        # http://www.gevent.org/api/gevent.threadpool.html
-        pool = gevent.get_hub().threadpool
-        return pool.spawn(_get_db_tx_decoder).get()
-    return _get_db_tx_decoder()
+        if running_on_gevent():
+            # It's a very intensive CPU task, so to prevent blocking
+            # http://www.gevent.org/api/gevent.threadpool.html
+            pool = gevent.get_hub().threadpool
+            return pool.spawn(_get_db_tx_decoder).get()
+        return _get_db_tx_decoder()
 
 
 def is_db_tx_decoder_loaded() -> bool:
@@ -164,9 +171,9 @@ class SafeTxDecoder:
 
     def __init__(self):
         logger.info("%s: Loading contract ABIs for decoding", self.__class__.__name__)
-        self.fn_selectors_with_abis: Dict[
-            bytes, ABIFunction
-        ] = self._generate_selectors_with_abis_from_abis(self.get_supported_abis())
+        self.fn_selectors_with_abis: Dict[bytes, ABIFunction] = (
+            self._generate_selectors_with_abis_from_abis(self.get_supported_abis())
+        )
         logger.info(
             "%s: Contract ABIs for decoding were loaded", self.__class__.__name__
         )
