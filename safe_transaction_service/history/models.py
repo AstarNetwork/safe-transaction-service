@@ -10,6 +10,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Self,
     Sequence,
     Set,
     Tuple,
@@ -27,6 +28,7 @@ from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Case, Count, Exists, Index, JSONField, Max, Q, QuerySet
 from django.db.models.expressions import F, OuterRef, RawSQL, Subquery, Value, When
 from django.db.models.functions import Coalesce
+from django.db.models.query import RawQuerySet
 from django.db.models.signals import post_save
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -40,7 +42,7 @@ from web3.types import EventData
 from gnosis.eth.constants import ERC20_721_TRANSFER_TOPIC, NULL_ADDRESS
 from gnosis.eth.django.models import (
     EthereumAddressV2Field,
-    HexField,
+    HexV2Field,
     Keccak256Field,
     Uint256Field,
 )
@@ -49,13 +51,17 @@ from gnosis.safe import SafeOperationEnum
 from gnosis.safe.safe import SafeInfo
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 
+from safe_transaction_service.account_abstraction.constants import (
+    USER_OPERATION_EVENT_TOPIC,
+)
 from safe_transaction_service.contracts.models import Contract
+from safe_transaction_service.utils.constants import (
+    SIGNATURE_LENGTH as MAX_SIGNATURE_LENGTH,
+)
 
 from .utils import clean_receipt_log
 
 logger = getLogger(__name__)
-
-MAX_SIGNATURE_LENGTH = 5_000
 
 
 class ConfirmationType(Enum):
@@ -71,7 +77,7 @@ class EthereumTxCallType(Enum):
     STATIC_CALL = 3
 
     @staticmethod
-    def parse_call_type(call_type: Optional[str]):
+    def parse_call_type(call_type: Optional[str]) -> Optional[Self]:
         if not call_type:
             return None
 
@@ -253,7 +259,7 @@ class EthereumBlockManager(models.Manager):
                     f"Marking block as not confirmed"
                 )
 
-    @lru_cache(maxsize=10000)
+    @lru_cache(maxsize=10_000)
     def get_timestamp_by_hash(self, block_hash: HexBytes) -> datetime.datetime:
         try:
             return self.values("timestamp").get(block_hash=block_hash)["timestamp"]
@@ -360,6 +366,16 @@ class EthereumTxManager(models.Manager):
             to=tx.get("to"),
             value=tx["value"],
             type=tx.get("type", 0),
+        )
+
+    def account_abstraction_txs(self) -> RawQuerySet:
+        """
+        :return: Transactions containing ERC4337 `UserOperation` event
+        """
+        query = '{"topics": ["' + USER_OPERATION_EVENT_TOPIC.hex() + '"]}'
+
+        return self.raw(
+            f"SELECT * FROM history_ethereumtx WHERE '{query}'::jsonb <@ ANY (logs)"
         )
 
 
@@ -992,6 +1008,12 @@ class InternalTx(models.Model):
                 include=["ethereum_tx_id", "block_number"],
                 condition=Q(call_type=0) & Q(value__gt=0),
             ),
+            Index(
+                name="history_internal_transfer_from",
+                fields=["_from", "timestamp"],
+                include=["ethereum_tx_id", "block_number"],
+                condition=Q(call_type=0) & Q(value__gt=0),
+            ),
         ]
 
     def __str__(self):
@@ -1143,7 +1165,7 @@ class InternalTxDecodedQuerySet(models.QuerySet):
         return (
             self.pending_for_safes()
             .filter(internal_tx___from=safe_address)
-            .select_related("internal_tx")
+            .select_related("internal_tx", "internal_tx__ethereum_tx")
         )
 
     def safes_pending_to_be_processed(self) -> QuerySet[ChecksumAddress]:
@@ -1561,7 +1583,7 @@ class MultisigConfirmation(TimeStampedModel):
     )  # Use this while we don't have a `multisig_transaction`
     owner = EthereumAddressV2Field()
 
-    signature = HexField(null=True, default=None, max_length=MAX_SIGNATURE_LENGTH)
+    signature = HexV2Field(null=True, default=None, max_length=MAX_SIGNATURE_LENGTH)
     signature_type = models.PositiveSmallIntegerField(
         choices=[(tag.value, tag.name) for tag in SafeSignatureType], db_index=True
     )
@@ -1662,70 +1684,6 @@ class SafeContractManager(models.Manager):
     def get_banned_safes(self) -> QuerySet[ChecksumAddress]:
         return self.filter(banned=True).values_list("address", flat=True)
 
-    def get_count_relevant_txs_for_safe(self, address: ChecksumAddress) -> int:
-        """
-        This method searches multiple tables and count every tx or event for a Safe.
-        It will return the same or higher value if compared to counting ``get_all_tx_identifiers``
-        as that method will group some transactions (for example, 3 ERC20 can be grouped in a ``MultisigTransaction``,
-        so it will be ``1`` element for ``get_all_tx_identifiers`` but ``4`` for this function.
-
-        This query should be pretty fast, and it's meant to be used for invalidating caches.
-
-        :param address:
-        :return: number of relevant txs for a Safe
-        """
-
-        query = """
-                SELECT SUM(count_all)
-                FROM (
-                    -- Get multisig transactions
-                    SELECT COUNT(*) AS count_all
-                    FROM "history_multisigtransaction"
-                    WHERE "history_multisigtransaction"."safe" = %s
-                    UNION ALL
-                    -- Get confirmations
-                    SELECT COUNT(*)
-                    FROM "history_multisigtransaction"
-                       JOIN "history_multisigconfirmation" ON "history_multisigtransaction"."safe_tx_hash" = "history_multisigconfirmation"."multisig_transaction_id"
-                    WHERE "history_multisigtransaction"."safe" = %s
-                    UNION ALL
-                    -- Get ERC20 Transfers
-                    SELECT COUNT(*)
-                    FROM "history_erc20transfer"
-                    WHERE (
-                            "history_erc20transfer"."to" = %s
-                            OR "history_erc20transfer"."_from" = %s
-                        )
-                    UNION ALL
-                    -- Get ERC721 Transfers
-                    SELECT COUNT(*)
-                    FROM "history_erc721transfer"
-                    WHERE (
-                            "history_erc721transfer"."to" = %s
-                            OR "history_erc721transfer"."_from" = %s
-                        )
-                    UNION ALL
-                    -- Get Ether Transfers
-                    SELECT COUNT(*)
-                    FROM "history_internaltx"
-                    WHERE (
-                            "history_internaltx"."call_type" = 0
-                            AND "history_internaltx"."to" = %s
-                            AND "history_internaltx"."value" > 0
-                        )
-                    UNION ALL
-                    -- Get Module Transactions
-                    SELECT COUNT(*)
-                    FROM "history_moduletransaction"
-                    WHERE "history_moduletransaction"."safe" = %s
-                ) subquery
-                """
-
-        with connection.cursor() as cursor:
-            hex_address = HexBytes(address)
-            cursor.execute(query, [hex_address] * 8)
-            return cursor.fetchone()[0]
-
 
 class SafeContract(models.Model):
     objects = SafeContractManager()
@@ -1789,6 +1747,19 @@ class SafeContractDelegateManager(models.Manager):
             .values_list("delegate", flat=True)
             .distinct()
         )
+
+    def remove_delegates_for_owner_in_safe(
+        self, safe_address: ChecksumAddress, owner_address: ChecksumAddress
+    ) -> int:
+        """
+        This method deletes delegated users only if the safe address and the owner address match.
+        Used when an owner is removed from the Safe.
+
+        :return: number of delegated users deleted
+        """
+        return self.filter(
+            safe_contract_id=safe_address, delegator=owner_address
+        ).delete()[0]
 
 
 class SafeContractDelegate(models.Model):

@@ -13,6 +13,7 @@ from eth_account import Account
 from gnosis.eth.utils import fast_keccak_text
 from gnosis.safe.safe_signature import SafeSignatureType
 
+from safe_transaction_service.account_abstraction.tests.mocks import aa_tx_receipt_mock
 from safe_transaction_service.contracts.models import ContractQuerySet
 from safe_transaction_service.contracts.tests.factories import ContractFactory
 
@@ -35,6 +36,7 @@ from ..models import (
     SafeStatus,
     WebHook,
 )
+from ..utils import clean_receipt_log
 from .factories import (
     ERC20TransferFactory,
     ERC721TransferFactory,
@@ -361,6 +363,21 @@ class TestEthereumTx(TestCase):
                 self.assertEqual(
                     ethereum_tx.transaction_index, tx_receipt["transactionIndex"]
                 )
+
+    def test_account_abstraction_tx_hashes(self):
+        self.assertEqual(len(EthereumTx.objects.account_abstraction_txs()), 0)
+
+        # Insert random transaction
+        EthereumTxFactory()
+        self.assertEqual(len(EthereumTx.objects.account_abstraction_txs()), 0)
+
+        # Insert a 4337 transaction
+        ethereum_tx = EthereumTxFactory(
+            logs=[clean_receipt_log(log) for log in aa_tx_receipt_mock["logs"]]
+        )
+        ethereum_txs = EthereumTx.objects.account_abstraction_txs()
+        self.assertEqual(len(ethereum_txs), 1)
+        self.assertEqual(ethereum_txs[0], ethereum_tx)
 
 
 class TestTokenTransfer(TestCase):
@@ -1166,6 +1183,45 @@ class TestSafeContractDelegate(TestCase):
                 Account.create().address, [owner_2]
             ),
             set(),
+        )
+
+    def test_remove_delegates_for_owner_in_safe(self):
+        safe_address = Account.create().address
+        owner = Account.create().address
+        self.assertCountEqual(
+            SafeContractDelegate.objects.get_for_safe(None, [owner]), []
+        )
+
+        safe_contract_delegate = SafeContractDelegateFactory(
+            delegator=owner, safe_contract=None
+        )
+        self.assertEqual(
+            SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                Account.create().address, [owner]
+            ),
+            {safe_contract_delegate.delegate},
+        )
+
+        safe_specific_delegate = SafeContractDelegateFactory(
+            delegator=owner, safe_contract__address=safe_address
+        )
+
+        self.assertEqual(
+            SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                safe_address, [owner]
+            ),
+            {safe_contract_delegate.delegate, safe_specific_delegate.delegate},
+        )
+
+        SafeContractDelegate.objects.remove_delegates_for_owner_in_safe(
+            safe_address, owner
+        )
+
+        self.assertEqual(
+            SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                safe_address, [owner]
+            ),
+            {safe_contract_delegate.delegate},
         )
 
 

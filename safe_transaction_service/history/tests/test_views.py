@@ -2,7 +2,6 @@ import datetime
 import json
 import logging
 import pickle
-from dataclasses import asdict
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock
 
@@ -28,11 +27,13 @@ from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 from gnosis.safe.signatures import signature_to_bytes
 from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
 
+from safe_transaction_service.account_abstraction.tests import factories as aa_factories
 from safe_transaction_service.contracts.models import ContractQuerySet
 from safe_transaction_service.contracts.tests.factories import ContractFactory
 from safe_transaction_service.contracts.tx_decoder import DbTxDecoder
 from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.tokens.tests.factories import TokenFactory
+from safe_transaction_service.utils.utils import datetime_to_str
 
 from ...utils.redis import get_redis
 from ..helpers import DelegateSignatureHelper, DeleteMultisigTxSignatureHelper
@@ -44,8 +45,7 @@ from ..models import (
     SafeMasterCopy,
 )
 from ..serializers import TransferType
-from ..services import BalanceService
-from ..services.balance_service import Erc20InfoWithLogo
+from ..services import TransactionServiceProvider
 from ..views import SafeMultisigTransactionListView
 from .factories import (
     ERC20TransferFactory,
@@ -61,6 +61,12 @@ from .factories import (
     SafeLastStatusFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
+)
+from .mocks.deployments_mock import (
+    mainnet_deployments,
+    mainnet_deployments_1_4_1,
+    mainnet_deployments_1_4_1_multisend,
+    mainnet_deployments_1_4_1_safe,
 )
 from .mocks.mocks_safe_creation import (
     create_cpk_test_data,
@@ -203,6 +209,43 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 47)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+
+    # Mock chain id to mainnet
+    @mock.patch("safe_transaction_service.history.views.get_chain_id", return_value=1)
+    def test_safe_deployments_view(self, get_chain_id_mock):
+        url = reverse("v1:history:deployments")
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), mainnet_deployments)
+
+        response = self.client.get(url + "?version=5.0.0", format="json")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        response = self.client.get(url + "?version=1.4.1", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), [mainnet_deployments_1_4_1])
+
+        response = self.client.get(
+            url + "?version=1.4.1&contract=MultiSend", format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            [{"version": "1.4.1", "contracts": [mainnet_deployments_1_4_1_multisend]}],
+        )
+
+        response = self.client.get(url + "?contract=Safe", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            [
+                {"version": "1.0.0", "contracts": []},
+                {"version": "1.1.1", "contracts": []},
+                {"version": "1.2.0", "contracts": []},
+                {"version": "1.3.0", "contracts": []},
+                {"version": "1.4.1", "contracts": [mainnet_deployments_1_4_1_safe]},
+            ],
+        )
 
     def test_all_transactions_view(self):
         safe_address = Account.create().address
@@ -406,11 +449,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             MultisigTransactionFactory(safe=safe_address),
             MultisigTransactionFactory(safe=safe_address),
         ]
-        # all-txs:{safe}:{executed}{queued}{trusted}:{limit}:{offset}:{ordering}:{relevant_elements}
-        cache_key = "all-txs:0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9:100:10:0:execution_date:2"
+        # all-txs:{safe_address}
+        cache_hash_key = f"all-txs:{safe_address}"
+        # {executed}{queued}{trusted}:{limit}:{offset}:{ordering}
+        cache_query_field = "100:10:0:execution_date"
         redis = get_redis()
-        redis.delete(cache_key)
-        cache_result = redis.get(cache_key)
+        redis.unlink(cache_hash_key)
+        cache_result = redis.hget(cache_hash_key, cache_query_field)
         # Should be empty at the beginning
         self.assertIsNone(cache_result)
 
@@ -421,7 +466,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 2)
 
-        cache_result = redis.get(cache_key)
+        cache_result = redis.hget(cache_hash_key, cache_query_field)
         # Should be stored in redis cache
         self.assertIsNotNone(cache_result)
         # Cache should content the expected values
@@ -440,7 +485,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             )
             self.assertEqual(cache_value["safe_nonce"], factory_transaction.nonce)
         # Modify cache to empty list
-        redis.set(cache_key, pickle.dumps(([], 0)), ex=60 * 10)
+        redis.hset(cache_hash_key, cache_query_field, pickle.dumps(([], 0)))
+        redis.expire(cache_hash_key, 60 * 10)
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
             + "?executed=True&queued=False&trusted=False&ordering=execution_date"
@@ -463,16 +509,18 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         """
         safe_address = "0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9"
         number_transactions = 100
-
+        transaction_service = TransactionServiceProvider()
         for _ in range(number_transactions):
             MultisigTransactionFactory(safe=safe_address)
 
         for limit, offset in ((57, 12), (13, 24)):
             with self.subTest(limit=limit, offset=offset):
-                # all-txs:{safe}:{executed}{queued}{trusted}:{limit}:{offset}:{ordering}:{relevant_elements}
-                cache_key = f"all-txs:0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9:100:{limit}:{offset}:execution_date:{number_transactions}"
+                # all-txs:{safe_address}
+                cache_hash_key = f"all-txs:{safe_address}"
+                # {executed}{queued}{trusted}:{limit}:{offset}:{ordering}:{relevant_elements}
+                cache_query_field = f"100:{limit}:{offset}:execution_date"
                 redis = get_redis()
-                self.assertFalse(redis.exists(cache_key))
+                self.assertFalse(redis.hexists(cache_hash_key, cache_query_field))
 
                 response = self.client.get(
                     reverse("v1:history:all-transactions", args=(safe_address,))
@@ -480,7 +528,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 )
                 self.assertEqual(response.data["count"], number_transactions)
                 self.assertEqual(len(response.data["results"]), limit)
-                self.assertTrue(redis.exists(cache_key))
+                self.assertTrue(redis.hexists(cache_hash_key, cache_query_field))
 
     def test_all_transactions_wrong_transfer_type_view(self):
         # No token in database, so we must trust the event
@@ -662,11 +710,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(
             response.json(),
             {
-                "created": module_transaction.created.isoformat().replace(
-                    "+00:00", "Z"
-                ),
-                "executionDate": module_transaction.internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "created": datetime_to_str(module_transaction.created),
+                "executionDate": datetime_to_str(
+                    module_transaction.internal_tx.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": module_transaction.internal_tx.ethereum_tx.block_id,
                 "isSuccessful": not module_transaction.failed,
@@ -2093,79 +2139,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             ],
         )
 
-    @mock.patch.object(BalanceService, "get_token_info", autospec=True)
-    @mock.patch.object(timezone, "now", return_value=timezone.now())
-    def test_safe_balances_usd_view(
-        self,
-        timezone_now_mock: MagicMock,
-        get_token_info_mock: MagicMock,
-    ):
-        timestamp_str = "1970-01-01T00:00:00Z"
-        safe_address = Account.create().address
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-        SafeContractFactory(address=safe_address)
-        value = 7
-        self.send_ether(safe_address, 7)
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-        self.assertIsNone(response.data[0]["token_address"])
-        self.assertEqual(response.data[0]["balance"], str(value))
-        self.assertEqual(response.data[0]["eth_value"], "0.0")
-
-        tokens_value = int(12 * 1e18)
-        erc20 = self.deploy_example_erc20(tokens_value, safe_address)
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-
-        erc20_info = Erc20InfoWithLogo(
-            erc20.address, "UXIO", "UXI", 18, None, "http://logo_uri.es"
-        )
-        get_token_info_mock.return_value = erc20_info
-
-        ERC20TransferFactory(address=erc20.address, to=safe_address)
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        token_dict = asdict(erc20_info)
-        del token_dict["address"]
-        del token_dict["copy_price"]
-        self.assertCountEqual(
-            response.data,
-            [
-                {
-                    "token_address": None,
-                    "token": None,
-                    "balance": str(value),
-                    "eth_value": "0.0",
-                    "timestamp": timestamp_str,
-                    "fiat_balance": "0.0",
-                    "fiat_conversion": "0.0",
-                    "fiat_code": "USD",
-                },  # 7 wei is rounded to 0.0
-                {
-                    "token_address": erc20.address,
-                    "token": token_dict,
-                    "balance": str(tokens_value),
-                    "eth_value": "0.0",
-                    "timestamp": timestamp_str,
-                    "fiat_balance": "0.0",
-                    "fiat_conversion": "0.0",
-                    "fiat_code": "USD",
-                },
-            ],
-        )
-
     def test_delegates_post(self):
         url = reverse("v1:history:delegates")
         safe_address = Account.create().address
@@ -2465,7 +2438,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertIn("Not found", response.data["detail"])
+        self.assertEqual(
+            "No SafeContractDelegate matches the given query.", response.data["detail"]
+        )
 
         # Test previous otp
         hash_to_sign = DelegateSignatureHelper.calculate_hash(
@@ -2478,7 +2453,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertIn("Not found", response.data["detail"])
+        self.assertEqual(
+            "No SafeContractDelegate matches the given query.", response.data["detail"]
+        )
 
         hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate_address)
         data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
@@ -2488,7 +2465,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertIn("Not found", response.data["detail"])
+        self.assertEqual(
+            "No SafeContractDelegate matches the given query.", response.data["detail"]
+        )
 
         SafeContractDelegateFactory(
             safe_contract=safe_contract, delegate=delegate_address
@@ -2606,8 +2585,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             [
                 {
                     "type": TransferType.ERC20_TRANSFER.name,
-                    "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        ethereum_erc_20_event.ethereum_tx.block.timestamp
                     ),
                     "transferId": erc20_transfer_id,
                     "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
@@ -2629,8 +2608,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ETHER_TRANSFER.name,
-                    "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        internal_tx.ethereum_tx.block.timestamp
                     ),
                     "transferId": internal_tx_transfer_id,
                     "transactionHash": internal_tx.ethereum_tx_id,
@@ -2667,8 +2646,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             [
                 {
                     "type": TransferType.ERC721_TRANSFER.name,
-                    "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        ethereum_erc_721_event.ethereum_tx.block.timestamp
                     ),
                     "transferId": erc721_transfer_id,
                     "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
@@ -2682,8 +2661,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ERC20_TRANSFER.name,
-                    "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        ethereum_erc_20_event.ethereum_tx.block.timestamp
                     ),
                     "transferId": erc20_transfer_id,
                     "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
@@ -2705,8 +2684,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ETHER_TRANSFER.name,
-                    "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        internal_tx.ethereum_tx.block.timestamp
                     ),
                     "transferId": internal_tx_transfer_id,
                     "transactionHash": internal_tx.ethereum_tx_id,
@@ -2837,8 +2816,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         expected_results = [
             {
                 "type": TransferType.ERC20_TRANSFER.name,
-                "executionDate": ethereum_erc_20_event_2.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_20_event_2.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": ethereum_erc_20_event_2.ethereum_tx.block_id,
                 "transferId": erc20_transfer_id_2,
@@ -2852,8 +2831,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ERC20_TRANSFER.name,
-                "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_20_event.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
                 "transferId": erc20_transfer_id,
@@ -2875,8 +2854,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ETHER_TRANSFER.name,
-                "executionDate": internal_tx_2.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    internal_tx_2.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": internal_tx_2.ethereum_tx.block_id,
                 "transferId": internal_tx_2_transfer_id,
@@ -2890,8 +2869,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ETHER_TRANSFER.name,
-                "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    internal_tx.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": internal_tx.ethereum_tx.block_id,
                 "transferId": internal_tx_transfer_id,
@@ -2935,8 +2914,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         expected_results = [
             {
                 "type": TransferType.ERC721_TRANSFER.name,
-                "executionDate": ethereum_erc_721_event_2.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_721_event_2.ethereum_tx.block.timestamp
                 ),
                 "transactionHash": ethereum_erc_721_event_2.ethereum_tx_id,
                 "transferId": erc721_transfer_id_2,
@@ -2950,8 +2929,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ERC721_TRANSFER.name,
-                "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_721_event.ethereum_tx.block.timestamp
                 ),
                 "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
                 "transferId": erc721_transfer_id,
@@ -3073,9 +3052,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ETHER_TRANSFER.name,
-            "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
-            ),
+            "executionDate": datetime_to_str(internal_tx.ethereum_tx.block.timestamp),
             "blockNumber": internal_tx.ethereum_tx.block_id,
             "transferId": transfer_id,
             "transactionHash": internal_tx.ethereum_tx_id,
@@ -3106,8 +3083,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ETHER_TRANSFER.name,
-            "executionDate": internal_tx_empty_trace_address.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
+            "executionDate": datetime_to_str(
+                internal_tx_empty_trace_address.ethereum_tx.block.timestamp
             ),
             "blockNumber": internal_tx_empty_trace_address.ethereum_tx.block_id,
             "transferId": transfer_id_empty_trace_address,
@@ -3140,8 +3117,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ERC20_TRANSFER.name,
-            "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
+            "executionDate": datetime_to_str(
+                ethereum_erc_20_event.ethereum_tx.block.timestamp
             ),
             "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
             "transferId": transfer_id,
@@ -3182,8 +3159,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ERC721_TRANSFER.name,
-            "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
+            "executionDate": datetime_to_str(
+                ethereum_erc_721_event.ethereum_tx.block.timestamp
             ),
             "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
             "transferId": transfer_id,
@@ -3204,9 +3181,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        owner_address = Account.create().address
+        safe_address = Account.create().address
         response = self.client.get(
-            reverse("v1:history:safe-creation", args=(owner_address,))
+            reverse("v1:history:safe-creation", args=(safe_address,))
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
@@ -3215,18 +3192,16 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         ):
             # Insert create contract internal tx
             internal_tx = InternalTxFactory(
-                contract_address=owner_address,
+                contract_address=safe_address,
                 trace_address="0,0",
                 ethereum_tx__status=1,
             )
             response = self.client.get(
-                reverse("v1:history:safe-creation", args=(owner_address,)),
+                reverse("v1:history:safe-creation", args=(safe_address,)),
                 format="json",
             )
             self.assertEqual(response.status_code, status.HTTP_200_OK)
-            created_iso = internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
-            )
+            created_iso = datetime_to_str(internal_tx.ethereum_tx.block.timestamp)
             expected = {
                 "created": created_iso,
                 "creator": internal_tx.ethereum_tx._from,
@@ -3235,8 +3210,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "setup_data": None,
                 "data_decoded": None,
                 "transaction_hash": internal_tx.ethereum_tx_id,
+                "user_operation": None,
             }
-            self.assertEqual(response.data, expected)
+            self.assertDictEqual(response.data, expected)
 
         # Next children internal_tx should not alter the result
         another_trace = dict(call_trace)
@@ -3248,11 +3224,54 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             return_value=[another_trace],
         ):
             response = self.client.get(
-                reverse("v1:history:safe-creation", args=(owner_address,)),
+                reverse("v1:history:safe-creation", args=(safe_address,)),
                 format="json",
             )
             self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(response.data, expected)
+            self.assertDictEqual(response.data, expected)
+
+        # Test 4337 SafeOperation showing in the creation
+        safe_operation = aa_factories.SafeOperationFactory(
+            user_operation__ethereum_tx_id=internal_tx.ethereum_tx_id,
+            user_operation__sender=safe_address,
+            user_operation__init_code=HexBytes("0x1234"),
+        )
+        response = self.client.get(
+            reverse("v1:history:safe-creation", args=(safe_address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        expected["user_operation"] = {
+            "sender": safe_operation.user_operation.sender,
+            "nonce": safe_operation.user_operation.nonce,
+            "user_operation_hash": safe_operation.user_operation.hash,
+            "ethereum_tx_hash": internal_tx.ethereum_tx_id,
+            "init_code": "0x1234",
+            "call_data": "0x",
+            "call_data_gas_limit": safe_operation.user_operation.call_data_gas_limit,
+            "verification_gas_limit": safe_operation.user_operation.verification_gas_limit,
+            "pre_verification_gas": safe_operation.user_operation.pre_verification_gas,
+            "max_fee_per_gas": safe_operation.user_operation.max_fee_per_gas,
+            "max_priority_fee_per_gas": safe_operation.user_operation.max_priority_fee_per_gas,
+            "paymaster": safe_operation.user_operation.paymaster,
+            "paymaster_data": "0x",
+            "signature": "0x",
+            "entry_point": safe_operation.user_operation.entry_point,
+            "safe_operation": {
+                "created": datetime_to_str(safe_operation.created),
+                "modified": datetime_to_str(safe_operation.created),
+                "safe_operation_hash": safe_operation.hash,
+                "valid_after": datetime_to_str(safe_operation.valid_after),
+                "valid_until": datetime_to_str(safe_operation.valid_until),
+                "module_address": safe_operation.module_address,
+                "confirmations": [],
+                "prepared_signature": None,
+            },
+        }
+
+        self.assertIsNotNone(response.data["user_operation"])
+        self.assertDictEqual(response.data, expected)
+        safe_operation.user_operation.delete()
 
         another_trace_2 = dict(call_trace)
         another_trace_2["traceAddress"] = [0]
@@ -3273,16 +3292,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 with self.subTest(test_data=test_data, data_decoded=data_decoded):
                     another_trace_2["action"]["input"] = HexBytes(test_data["data"])
                     response = self.client.get(
-                        reverse("v1:history:safe-creation", args=(owner_address,)),
+                        reverse("v1:history:safe-creation", args=(safe_address,)),
                         format="json",
                     )
                     self.assertEqual(response.status_code, status.HTTP_200_OK)
-                    created_iso = (
-                        internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                            "+00:00", "Z"
-                        )
+                    created_iso = datetime_to_str(
+                        internal_tx.ethereum_tx.block.timestamp
                     )
-                    self.assertEqual(
+                    self.assertDictEqual(
                         response.data,
                         {
                             "created": created_iso,
@@ -3292,6 +3309,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                             "master_copy": test_data["master_copy"],
                             "setup_data": test_data["setup_data"],
                             "data_decoded": data_decoded,
+                            "user_operation": None,
                         },
                     )
 
@@ -3497,10 +3515,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
     def test_singletons_view(self):
         url = reverse("v1:history:singletons")
-        return self._test_singletons_view(url)
-
-    def test_master_copies_view(self):
-        url = reverse("v1:history:master-copies")
         return self._test_singletons_view(url)
 
     def test_modules_view(self):

@@ -1,4 +1,3 @@
-import datetime
 import logging
 from unittest import mock
 from unittest.mock import MagicMock
@@ -26,17 +25,11 @@ from safe_transaction_service.safe_messages.tests.factories import (
     SafeMessageConfirmationFactory,
     SafeMessageFactory,
 )
+from safe_transaction_service.utils.utils import datetime_to_str
 
 from .mocks import get_eip712_payload_mock
 
 logger = logging.getLogger(__name__)
-
-
-def datetime_to_str(value: datetime.datetime) -> str:
-    value = value.isoformat()
-    if value.endswith("+00:00"):
-        value = value[:-6] + "Z"
-    return value
 
 
 class TestMessageViews(SafeTestCaseMixin, APITestCase):
@@ -48,7 +41,9 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
             reverse("v1:safe_messages:message", args=(random_safe_message_hash,))
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertEqual(response.json(), {"detail": "Not found."})
+        self.assertEqual(
+            response.json(), {"detail": "No SafeMessage matches the given query."}
+        )
         safe_message = SafeMessageFactory(safe=self.deploy_test_safe().address)
         response = self.client.get(
             reverse("v1:safe_messages:message", args=(safe_message.message_hash,))
@@ -87,13 +82,13 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
-                "preparedSignature": safe_message_confirmation.signature,
+                "preparedSignature": safe_message_confirmation.signature.hex(),
                 "confirmations": [
                     {
                         "created": datetime_to_str(safe_message_confirmation.created),
                         "modified": datetime_to_str(safe_message_confirmation.modified),
                         "owner": safe_message_confirmation.owner,
-                        "signature": safe_message_confirmation.signature,
+                        "signature": safe_message_confirmation.signature.hex(),
                         "signatureType": "EOA",
                     }
                 ],
@@ -123,13 +118,13 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
-                "preparedSignature": safe_message_confirmation.signature,
+                "preparedSignature": safe_message_confirmation.signature.hex(),
                 "confirmations": [
                     {
                         "created": datetime_to_str(safe_message_confirmation.created),
                         "modified": datetime_to_str(safe_message_confirmation.modified),
                         "owner": safe_message_confirmation.owner,
-                        "signature": safe_message_confirmation.signature,
+                        "signature": safe_message_confirmation.signature.hex(),
                         "signatureType": "EOA",
                     }
                 ],
@@ -339,7 +334,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
         )
 
         # Test same signature
-        data["signature"] = safe_message_confirmation.signature
+        data["signature"] = safe_message_confirmation.signature.hex()
         response = self.client.post(
             reverse("v1:safe_messages:signatures", args=(safe_message.message_hash,)),
             format="json",
@@ -470,7 +465,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                         "message": safe_message.message,
                         "proposedBy": safe_message.proposed_by,
                         "safeAppId": safe_message.safe_app_id,
-                        "preparedSignature": safe_message_confirmation.signature,
+                        "preparedSignature": safe_message_confirmation.signature.hex(),
                         "confirmations": [
                             {
                                 "created": datetime_to_str(
@@ -480,7 +475,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                                     safe_message_confirmation.modified
                                 ),
                                 "owner": safe_message_confirmation.owner,
-                                "signature": safe_message_confirmation.signature,
+                                "signature": safe_message_confirmation.signature.hex(),
                                 "signatureType": "EOA",
                             }
                         ],
@@ -517,7 +512,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                         "message": safe_message.message,
                         "proposedBy": safe_message.proposed_by,
                         "safeAppId": safe_message.safe_app_id,
-                        "preparedSignature": safe_message_confirmation.signature,
+                        "preparedSignature": safe_message_confirmation.signature.hex(),
                         "confirmations": [
                             {
                                 "created": datetime_to_str(
@@ -527,7 +522,7 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                                     safe_message_confirmation.modified
                                 ),
                                 "owner": safe_message_confirmation.owner,
-                                "signature": safe_message_confirmation.signature,
+                                "signature": safe_message_confirmation.signature.hex(),
                                 "signatureType": "EOA",
                             }
                         ],
@@ -544,7 +539,9 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
             reverse("v1:safe_messages:message", args=(random_safe_message_hash,))
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertEqual(response.json(), {"detail": "Not found."})
+        self.assertEqual(
+            response.json(), {"detail": "No SafeMessage matches the given query."}
+        )
         safe_message = SafeMessageFactory(safe=self.deploy_test_safe_v1_1_1().address)
         response = self.client.get(
             reverse("v1:safe_messages:message", args=(safe_message.message_hash,))
@@ -583,13 +580,13 @@ class TestMessageViews(SafeTestCaseMixin, APITestCase):
                 "message": safe_message.message,
                 "proposedBy": safe_message.proposed_by,
                 "safeAppId": safe_message.safe_app_id,
-                "preparedSignature": safe_message_confirmation.signature,
+                "preparedSignature": safe_message_confirmation.signature.hex(),
                 "confirmations": [
                     {
                         "created": datetime_to_str(safe_message_confirmation.created),
                         "modified": datetime_to_str(safe_message_confirmation.modified),
                         "owner": safe_message_confirmation.owner,
-                        "signature": safe_message_confirmation.signature,
+                        "signature": safe_message_confirmation.signature.hex(),
                         "signatureType": "EOA",
                     }
                 ],

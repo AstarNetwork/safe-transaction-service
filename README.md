@@ -1,4 +1,4 @@
-![Build Status](https://github.com/safe-global/safe-transaction-service/workflows/Python%20CI/badge.svg?branch=main)
+[![CI/CD](https://github.com/safe-global/safe-transaction-service/actions/workflows/python.yml/badge.svg)](https://github.com/safe-global/safe-transaction-service/actions/workflows/python.yml)
 [![Coverage Status](https://coveralls.io/repos/github/safe-global/safe-transaction-service/badge.svg?branch=main)](https://coveralls.io/github/safe-global/safe-transaction-service?branch=main)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)
@@ -194,9 +194,9 @@ The `banned` field in the `SafeContract` model is used to prevent indexing of ce
 
 ## Troubleshooting
 
-### Issues installing grpc on a Mac M1
+### Issues installing grpc on an Apple silicon system
 
-If you face issues installing the `grpc` dependency locally (required by this project) on a M1 chip, set `GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1` and `GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1` and then try to install the dependency again.
+If you face issues installing the `grpc` dependency locally (required by this project) on a Apple silicon chip, set `GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1` and `GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1` and then try to install the dependency again.
 
 ## Contributors
 [See contributors](https://github.com/safe-global/safe-transaction-service/graphs/contributors)

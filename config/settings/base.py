@@ -104,13 +104,14 @@ THIRD_PARTY_APPS = [
     "rest_framework.authtoken",
 ]
 LOCAL_APPS = [
+    "safe_transaction_service.account_abstraction.apps.AccountAbstractionConfig",
     "safe_transaction_service.analytics.apps.AnalyticsConfig",
     "safe_transaction_service.contracts.apps.ContractsConfig",
+    "safe_transaction_service.events.apps.EventsConfig",
     "safe_transaction_service.history.apps.HistoryConfig",
     "safe_transaction_service.notifications.apps.NotificationsConfig",
     "safe_transaction_service.safe_messages.apps.SafeMessagesConfig",
     "safe_transaction_service.tokens.apps.TokensConfig",
-    "safe_transaction_service.events.apps.EventsConfig",
 ]
 # https://docs.djangoproject.com/en/dev/ref/settings/#installed-apps
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -227,8 +228,10 @@ CELERY_BROKER_POOL_LIMIT = env.int("CELERY_BROKER_POOL_LIMIT", default=0)
 CELERY_BROKER_HEARTBEAT = env.int("CELERY_BROKER_HEARTBEAT", default=0)
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-broker_connection_max_retries
-CELERY_BROKER_CONNECTION_MAX_RETRIES = env.int(
-    "CELERY_BROKER_CONNECTION_MAX_RETRIES", default=0
+CELERY_BROKER_CONNECTION_MAX_RETRIES = (
+    value
+    if (value := env.int("CELERY_BROKER_CONNECTION_MAX_RETRIES", default=-1)) > 0
+    else None
 )
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#broker-channel-error-retry
 CELERY_BROKER_CHANNEL_ERROR_RETRY = env.bool(
@@ -435,6 +438,18 @@ REDIS_URL = env("REDIS_URL", default="redis://localhost:6379/0")
 # ------------------------------------------------------------------------------
 ETHEREUM_NODE_URL = env("ETHEREUM_NODE_URL", default=None)
 
+# Ethereum 4337 Bundler RPC
+# ------------------------------------------------------------------------------
+ETHEREUM_4337_BUNDLER_URL = env("ETHEREUM_4337_BUNDLER_URL", default=None)
+ETHEREUM_4337_SUPPORTED_ENTRY_POINTS = env.list(
+    "ETHEREUM_4337_SUPPORTED_ENTRY_POINTS",
+    default=["0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789"],
+)
+ETHEREUM_4337_SUPPORTED_SAFE_MODULES = env.list(
+    "ETHEREUM_4337_SUPPORTED_SAFE_MODULES",
+    default=["0xa581c4A4DB7175302464fF3C06380BC3270b4037"],
+)
+
 # Tracing indexing configuration (not useful for L2 indexing)
 # ------------------------------------------------------------------------------
 ETHEREUM_TRACING_NODE_URL = env("ETHEREUM_TRACING_NODE_URL", default=None)
@@ -557,8 +572,14 @@ SWAGGER_SETTINGS = {
     "SECURITY_DEFINITIONS": {
         "api_key": {"type": "apiKey", "in": "header", "name": "Authorization"}
     },
+    "DEFAULT_AUTO_SCHEMA_CLASS": "safe_transaction_service.utils.swagger.CustomSwaggerSchema",
 }
 
 # Shell Plus
 # ------------------------------------------------------------------------------
 SHELL_PLUS_PRINT_SQL_TRUNCATE = env.int("SHELL_PLUS_PRINT_SQL_TRUNCATE", default=10_000)
+
+# Endpoints
+TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS = env.int(
+    "TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS", default=1_000
+)  # Don't return more than 1_000 transfers
