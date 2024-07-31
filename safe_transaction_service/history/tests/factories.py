@@ -33,7 +33,6 @@ from ..models import (
     SafeMasterCopy,
     SafeStatus,
     TokenTransfer,
-    WebHook,
 )
 
 
@@ -221,6 +220,7 @@ class ModuleTransactionFactory(DjangoModelFactory):
     class Meta:
         model = ModuleTransaction
 
+    created = factory.LazyAttribute(lambda o: o.internal_tx.timestamp)
     internal_tx = factory.SubFactory(InternalTxFactory)
     safe = factory.LazyFunction(lambda: Account.create().address)
     module = factory.LazyFunction(lambda: Account.create().address)
@@ -328,17 +328,3 @@ class SafeLastStatusFactory(DjangoModelFactory):
 class SafeStatusFactory(SafeLastStatusFactory):
     class Meta:
         model = SafeStatus
-
-
-class WebHookFactory(DjangoModelFactory):
-    class Meta:
-        model = WebHook
-
-    address = factory.LazyFunction(lambda: Account.create().address)
-    url = factory.Sequence(lambda n: f"http://localhost/test/{n}")
-    # Configurable webhook types to listen to
-    new_confirmation = True
-    pending_multisig_transaction = True
-    new_executed_multisig_transaction = True
-    new_incoming_transaction = True
-    authorization = None

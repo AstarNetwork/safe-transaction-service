@@ -1,3 +1,4 @@
+import itertools
 import json
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -5,13 +6,15 @@ from typing import Any, Dict, List, Optional
 from django.http import Http404
 
 from drf_yasg.utils import swagger_serializer_method
-from eth_typing import ChecksumAddress, HexStr
+from eth_typing import ChecksumAddress
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, ValidationError
 
-from gnosis.eth import EthereumClient, EthereumClientProvider
+from gnosis.eth import EthereumClient, get_auto_ethereum_client
 from gnosis.eth.constants import NULL_ADDRESS
-from gnosis.eth.django.models import EthereumAddressV2Field as EthereumAddressDbField
+from gnosis.eth.django.models import (
+    EthereumAddressBinaryField as EthereumAddressDbField,
+)
 from gnosis.eth.django.models import Keccak256Field as Keccak256DbField
 from gnosis.eth.django.serializers import (
     EthereumAddressField,
@@ -20,7 +23,7 @@ from gnosis.eth.django.serializers import (
 )
 from gnosis.safe import Safe
 from gnosis.safe.safe_signature import EthereumBytes, SafeSignature, SafeSignatureType
-from gnosis.safe.serializers import SafeMultisigTxSerializerV1
+from gnosis.safe.serializers import SafeMultisigTxSerializer
 
 from safe_transaction_service.account_abstraction import serializers as aa_serializers
 from safe_transaction_service.contracts.tx_decoder import (
@@ -90,7 +93,7 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
             )
 
         safe_address = multisig_transaction.safe
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         safe = Safe(safe_address, ethereum_client)
         safe_tx = safe.build_multisig_tx(
             multisig_transaction.to,
@@ -107,10 +110,10 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
 
         safe_owners = get_safe_owners(safe_address)
         parsed_signatures = SafeSignature.parse_signature(
-            signature, safe_tx_hash, safe_tx.safe_tx_hash_preimage
+            signature, safe_tx_hash, safe_hash_preimage=safe_tx.safe_tx_hash_preimage
         )
         signature_owners = []
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         for safe_signature in parsed_signatures:
             owner = safe_signature.owner
             if owner not in safe_owners:
@@ -151,7 +154,7 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
         return multisig_confirmations
 
 
-class SafeMultisigTransactionSerializer(SafeMultisigTxSerializerV1):
+class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
     to = EthereumAddressField(allow_zero_address=True, allow_sentinel_address=True)
     contract_transaction_hash = Sha3HashField()
     sender = EthereumAddressField()
@@ -176,7 +179,7 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializerV1):
     def validate(self, attrs):
         super().validate(attrs)
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         safe_address = attrs["safe"]
 
         safe = Safe(safe_address, ethereum_client)
@@ -347,7 +350,7 @@ class SafeMultisigTransactionEstimateSerializer(serializers.Serializer):
 
     def save(self, **kwargs):
         safe_address = self.context["safe_address"]
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         safe = Safe(safe_address, ethereum_client)
         exc = None
         # Retry thrice to get an estimation
@@ -404,10 +407,12 @@ class DelegateSerializerMixin:
         signature: EthereumBytes,
         signer: ChecksumAddress,
     ) -> bool:
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         chain_id = ethereum_client.get_chain_id()
         # Accept a message with the current topt and the previous totp (to prevent replay attacks)
-        for previous_totp in (True, False):
+        for previous_totp, chain_id in list(
+            itertools.product((True, False), (chain_id, None))
+        ):
             message_hash = DelegateSignatureHelperV2.calculate_hash(
                 delegate, chain_id, previous_totp=previous_totp
             )
@@ -514,7 +519,7 @@ class SafeMultisigTransactionDeleteSerializer(serializers.Serializer):
         if not proposer or proposer == NULL_ADDRESS:
             raise ValidationError("Old transactions without proposer cannot be deleted")
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         chain_id = ethereum_client.get_chain_id()
         safe_address = multisig_tx.safe
         # Accept a message with the current topt and the previous totp (to prevent replay attacks)
@@ -554,12 +559,13 @@ class SafeModuleTransactionResponseSerializer(GnosisBaseModelSerializer):
     execution_date = serializers.DateTimeField()
     data = HexadecimalField(allow_null=True, allow_blank=True)
     data_decoded = serializers.SerializerMethodField()
-    transaction_hash = serializers.SerializerMethodField()
-    block_number = serializers.SerializerMethodField()
+    transaction_hash = HexadecimalField(source="internal_tx.ethereum_tx_id")
+    block_number = serializers.IntegerField(source="internal_tx.block_number")
     is_successful = serializers.SerializerMethodField()
-    module_transaction_id = serializers.SerializerMethodField(
+    module_transaction_id = serializers.CharField(
+        source="unique_id",
         help_text="Internally calculated parameter to uniquely identify a moduleTransaction \n"
-        "`ModuleTransactionId = i+tx_hash+trace_address`"
+        "`ModuleTransactionId = i+tx_hash+trace_address`",
     )
 
     class Meta:
@@ -580,9 +586,6 @@ class SafeModuleTransactionResponseSerializer(GnosisBaseModelSerializer):
             "module_transaction_id",
         )
 
-    def get_block_number(self, obj: ModuleTransaction) -> Optional[int]:
-        return obj.internal_tx.block_number
-
     def get_data_decoded(self, obj: ModuleTransaction) -> Dict[str, Any]:
         return get_data_decoded_from_data(
             obj.data.tobytes() if obj.data else b"", address=obj.to
@@ -590,12 +593,6 @@ class SafeModuleTransactionResponseSerializer(GnosisBaseModelSerializer):
 
     def get_is_successful(self, obj: ModuleTransaction) -> bool:
         return not obj.failed
-
-    def get_transaction_hash(self, obj: ModuleTransaction) -> HexStr:
-        return obj.internal_tx.ethereum_tx_id
-
-    def get_module_transaction_id(self, obj: ModuleTransaction) -> str:
-        return "i" + obj.internal_tx.ethereum_tx_id[2:] + obj.internal_tx.trace_address
 
 
 class SafeMultisigConfirmationResponseSerializer(GnosisBaseModelSerializer):
@@ -621,7 +618,7 @@ class SafeMultisigConfirmationResponseSerializer(GnosisBaseModelSerializer):
         return SafeSignatureType(obj.signature_type).name
 
 
-class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializerV1):
+class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
     execution_date = serializers.DateTimeField()
     submission_date = serializers.DateTimeField(
         source="created"
@@ -835,9 +832,8 @@ class TransferResponseSerializer(serializers.Serializer):
             return TransferType.UNKNOWN.name
 
     def get_transfer_id(self, obj: TransferDict) -> str:
-        # Remove 0x on transaction_hash
-        transaction_hash = obj["transaction_hash"][2:]
-        if self.get_type(obj) == "ETHER_TRANSFER":
+        transaction_hash = obj["transaction_hash"][2:]  # Remove 0x
+        if self.get_type(obj) == TransferType.ETHER_TRANSFER.name:
             return "i" + transaction_hash + obj["_trace_address"]
         else:
             return "e" + transaction_hash + str(obj["_log_index"])
@@ -1037,7 +1033,7 @@ class SafeDelegateDeleteSerializer(serializers.Serializer):
         signature = attrs["signature"]
         delegate = attrs["delegate"]  # Delegate address to be added/removed
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         valid_delegators = self.get_valid_delegators(
             ethereum_client, safe_address, delegate
         )
@@ -1137,7 +1133,7 @@ class DelegateSerializer(DelegateSignatureCheckerMixin, serializers.Serializer):
             "delegator"
         ]  # Delegator giving permissions to delegate (signer)
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         if safe_address:
             # Valid delegators must be owners
             valid_delegators = get_safe_owners(safe_address)
@@ -1192,7 +1188,7 @@ class DelegateDeleteSerializer(DelegateSignatureCheckerMixin, serializers.Serial
         delegate = attrs["delegate"]  # Delegate address to be added/removed
         delegator = attrs["delegator"]  # Delegator
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         # Tries to find a valid delegator using multiple strategies
         for operation_hash in DelegateSignatureHelper.calculate_all_possible_hashes(
             delegate

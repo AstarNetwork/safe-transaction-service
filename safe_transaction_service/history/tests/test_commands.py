@@ -87,22 +87,6 @@ class TestCommands(SafeTestCaseMixin, TestCase):
         self.assertIn("Old tasks were removed", buf.getvalue())
         self.assertIn("Created Periodic Task", buf.getvalue())
 
-    def test_add_webhook(self):
-        command = "add_webhook"
-
-        with self.assertRaisesMessage(
-            CommandError, "the following arguments are required: --url"
-        ):
-            call_command(command)
-
-        buf = StringIO()
-        call_command(command, "--url=http://docker-url", stdout=buf)
-        self.assertIn("Created webhook for", buf.getvalue())
-
-        buf = StringIO()
-        call_command(command, "--url=https://test-url.com", stdout=buf)
-        self.assertIn("Created webhook for", buf.getvalue())
-
     def test_index_erc20(self):
         command = "index_erc20"
         buf = StringIO()
@@ -126,10 +110,11 @@ class TestCommands(SafeTestCaseMixin, TestCase):
 
         with self.assertLogs(logger=task_logger) as cm:
             safe_contract = SafeContractFactory()
+            addresses = {safe_contract.address}
             buf = StringIO()
             call_command(command, stdout=buf)
             self.assertIn(
-                f"Start indexing of erc20/721 events for out of sync addresses {[safe_contract.address]}",
+                f"Start indexing of erc20/721 events for out of sync addresses {addresses}",
                 cm.output[0],
             )
             self.assertIn(
@@ -139,10 +124,11 @@ class TestCommands(SafeTestCaseMixin, TestCase):
 
         with self.assertLogs(logger=task_logger) as cm:
             safe_contract_2 = SafeContractFactory()
+            addresses = {safe_contract_2.address}
             buf = StringIO()
             call_command(command, f"--addresses={safe_contract_2.address}", stdout=buf)
             self.assertIn(
-                f"Start indexing of erc20/721 events for out of sync addresses {[safe_contract_2.address]}",
+                f"Start indexing of erc20/721 events for out of sync addresses {addresses}",
                 cm.output[0],
             )
             self.assertIn(
@@ -153,12 +139,13 @@ class TestCommands(SafeTestCaseMixin, TestCase):
         # Test sync task call
         with self.assertLogs(logger=task_logger) as cm:
             safe_contract_2 = SafeContractFactory()
+            addresses = {safe_contract_2.address}
             buf = StringIO()
             call_command(
                 command, f"--addresses={safe_contract_2.address}", "--sync", stdout=buf
             )
             self.assertIn(
-                f"Start indexing of erc20/721 events for out of sync addresses {[safe_contract_2.address]}",
+                f"Start indexing of erc20/721 events for out of sync addresses {addresses}",
                 cm.output[0],
             )
             self.assertIn(
@@ -206,22 +193,23 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                     f"--from-block-number={from_block_number}",
                     stdout=buf,
                 )
+                expected_addresses = {safe_master_copy.address}
                 self.assertIn(
-                    f"Start reindexing addresses {[safe_master_copy.address]}",
+                    f"Start reindexing addresses {expected_addresses}",
                     cm.output[0],
                 )
                 self.assertIn("found 0 traces/events", cm.output[1])
                 self.assertIn(
-                    f"End reindexing addresses {[safe_master_copy.address]}",
+                    f"End reindexing addresses {expected_addresses}",
                     cm.output[3],
                 )
                 find_relevant_elements_mock.assert_any_call(
-                    [safe_master_copy.address],
+                    {safe_master_copy.address},
                     from_block_number,
                     from_block_number + block_process_limit - 1,
                 )
                 find_relevant_elements_mock.assert_any_call(
-                    [safe_master_copy.address],
+                    {safe_master_copy.address},
                     from_block_number + block_process_limit,
                     current_block_number_mock.return_value,
                 )
@@ -248,22 +236,23 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                         f"--from-block-number={from_block_number}",
                         stdout=buf,
                     )
+                    expected_addresses = {safe_l2_master_copy.address}
                     self.assertIn(
-                        f"Start reindexing addresses {[safe_l2_master_copy.address]}",
+                        f"Start reindexing addresses {expected_addresses}",
                         cm.output[0],
                     )
                     self.assertIn("found 0 traces/events", cm.output[1])
                     self.assertIn(
-                        f"End reindexing addresses {[safe_l2_master_copy.address]}",
+                        f"End reindexing addresses {expected_addresses}",
                         cm.output[3],
                     )
                     find_relevant_elements_mock.assert_any_call(
-                        [safe_l2_master_copy.address],
+                        {safe_l2_master_copy.address},
                         from_block_number,
                         from_block_number + block_process_limit - 1,
                     )
                     find_relevant_elements_mock.assert_any_call(
-                        [safe_l2_master_copy.address],
+                        {safe_l2_master_copy.address},
                         from_block_number + block_process_limit,
                         current_block_number_mock.return_value,
                     )
@@ -310,22 +299,23 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                     f"--from-block-number={from_block_number}",
                     stdout=buf,
                 )
+                expected_addresses = {safe_contract.address}
                 self.assertIn(
-                    f"Start reindexing addresses {[safe_contract.address]}",
+                    f"Start reindexing addresses {expected_addresses}",
                     cm.output[0],
                 )
                 self.assertIn("found 0 traces/events", cm.output[1])
                 self.assertIn(
-                    f"End reindexing addresses {[safe_contract.address]}",
+                    f"End reindexing addresses {expected_addresses}",
                     cm.output[3],
                 )
                 find_relevant_elements_mock.assert_any_call(
-                    [safe_contract.address],
+                    {safe_contract.address},
                     from_block_number,
                     from_block_number + block_process_limit - 1,
                 )
                 find_relevant_elements_mock.assert_any_call(
-                    [safe_contract.address],
+                    {safe_contract.address},
                     from_block_number + block_process_limit,
                     current_block_number_mock.return_value,
                 )

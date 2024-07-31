@@ -19,9 +19,11 @@ from ..models import (
     IndexingStatus,
     InternalTx,
     InternalTxDecoded,
+    MultisigTransaction,
     SafeContract,
     SafeLastStatus,
     SafeMasterCopy,
+    SafeRelevantTransaction,
     SafeStatus,
 )
 from .factories import EthereumTxFactory, SafeMasterCopyFactory
@@ -140,6 +142,9 @@ class TestInternalTxIndexer(TestCase):
         self.assertFalse(create_internal_tx.is_call)
         self.assertFalse(create_internal_tx.is_delegate_call)
         self.assertTrue(create_internal_tx.is_create)
+        self.assertEqual(
+            SafeRelevantTransaction.objects.count(), 2
+        )  # 2 Ether Transfers
 
         ethereum_tx = EthereumTx.objects.get(
             tx_hash="0x18f8eb25336203d4e561229c08a3a0ef88db1dd9767b641301d9ea3121dfeaea"
@@ -203,9 +208,9 @@ class TestInternalTxIndexer(TestCase):
     ):
         current_block_number = current_block_number_mock.return_value
         internal_tx_indexer = self.internal_tx_indexer
-        addresses = ["0x5aC255889882aCd3da2aA939679E3f3d4cea221e"]
+        addresses = {"0x5aC255889882aCd3da2aA939679E3f3d4cea221e"}
         trace_filter_transactions = OrderedDict(
-            (trace["transactionHash"], []) for trace in trace_filter_mock.return_value
+            (trace["transactionHash"], None) for trace in trace_filter_mock.return_value
         )
         trace_block_transactions = OrderedDict(
             (
@@ -221,12 +226,12 @@ class TestInternalTxIndexer(TestCase):
         elements = internal_tx_indexer.find_relevant_elements(
             addresses, 1, current_block_number - 50
         )
-        self.assertEqual(trace_filter_transactions, elements)
+        self.assertDictEqual(trace_filter_transactions, elements)
         trace_filter_mock.assert_called_once_with(
             internal_tx_indexer.ethereum_client.tracing,
             from_block=1,
             to_block=current_block_number - 50,
-            to_address=addresses,
+            to_address=list(addresses),
         )
         trace_block_mock.assert_not_called()
         trace_filter_mock.reset_mock()
@@ -235,12 +240,14 @@ class TestInternalTxIndexer(TestCase):
         elements = internal_tx_indexer.find_relevant_elements(
             addresses, current_block_number - 50, current_block_number
         )
-        self.assertEqual(trace_filter_transactions | trace_block_transactions, elements)
+        self.assertDictEqual(
+            trace_filter_transactions | trace_block_transactions, elements
+        )
         trace_filter_mock.assert_called_once_with(
             internal_tx_indexer.ethereum_client.tracing,
             from_block=current_block_number - 50,
             to_block=current_block_number - internal_tx_indexer.number_trace_blocks,
-            to_address=addresses,
+            to_address=list(addresses),
         )
 
         trace_block_mock.assert_called_with(
@@ -274,9 +281,11 @@ class TestInternalTxIndexer(TestCase):
         self.assertEqual(InternalTxDecoded.objects.count(), 2)  # Setup and execute tx
         internal_txs_decoded = InternalTxDecoded.objects.pending_for_safes()
         self.assertEqual(len(internal_txs_decoded), 2)
+        self.assertEqual(MultisigTransaction.objects.count(), 0)
         number_processed = tx_processor.process_decoded_transactions(
             internal_txs_decoded
         )  # Index using `setup` trace
+        self.assertEqual(MultisigTransaction.objects.count(), 1)
         self.assertEqual(len(number_processed), 2)  # Setup and execute trace
         self.assertEqual(SafeContract.objects.count(), 1)
         self.assertEqual(SafeStatus.objects.count(), 2)
@@ -285,6 +294,16 @@ class TestInternalTxIndexer(TestCase):
         self.assertEqual(len(safe_status.owners), 1)
         self.assertEqual(safe_status.nonce, 0)
         self.assertEqual(safe_status.threshold, 1)
+
+        safe_status = SafeStatus.objects.last()
+        self.assertEqual(len(safe_status.owners), 1)
+        self.assertEqual(safe_status.nonce, 1)
+        self.assertEqual(safe_status.threshold, 1)
+
+        # Ether transfer matches the Multisig Transaction, so no new elements are added
+        self.assertEqual(
+            SafeRelevantTransaction.objects.count(), 2
+        )  # 2 Ether Transfers
 
         # Try to decode again without new traces, nothing should be decoded
         internal_txs_decoded = InternalTxDecoded.objects.pending_for_safes()
@@ -295,9 +314,6 @@ class TestInternalTxIndexer(TestCase):
             internal_txs_decoded
         )
         self.assertEqual(len(number_processed), 0)  # Setup trace
-        safe_status = SafeStatus.objects.get(nonce=1)
-        self.assertEqual(len(safe_status.owners), 1)
-        self.assertEqual(safe_status.threshold, 1)
 
         safe_last_status = SafeLastStatus.objects.get()
         self.assertEqual(

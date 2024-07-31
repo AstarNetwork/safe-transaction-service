@@ -6,7 +6,7 @@ from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 import gnosis.eth.django.serializers as eth_serializers
-from gnosis.eth import EthereumClientProvider
+from gnosis.eth import get_auto_ethereum_client
 from gnosis.eth.eip712 import eip712_encode_hash
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
 
@@ -36,7 +36,7 @@ class SafeMessageSignatureParserMixin:
                 f"1 owner signature was expected, {len(safe_signatures)} received"
             )
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         for safe_signature in safe_signatures:
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
@@ -99,7 +99,7 @@ class SafeMessageSerializer(SafeMessageSignatureParserMixin, serializers.Seriali
             )
 
         safe_signatures = SafeSignature.parse_signature(
-            signature, safe_message_hash, message_hash
+            signature, safe_message_hash, safe_hash_preimage=message_hash
         )
         owner, signature_type = self.get_valid_owner_from_signatures(
             safe_signatures, safe_address, None
@@ -141,7 +141,7 @@ class SafeMessageSignatureSerializer(
         safe_message_hash = safe_message.message_hash
 
         safe_signatures = SafeSignature.parse_signature(
-            signature, safe_message_hash, message_hash
+            signature, safe_message_hash, safe_hash_preimage=message_hash
         )
         owner, signature_type = self.get_valid_owner_from_signatures(
             safe_signatures, safe_address, safe_message

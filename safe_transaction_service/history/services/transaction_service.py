@@ -11,7 +11,7 @@ from django.utils import timezone
 from eth_typing import ChecksumAddress, HexStr
 from redis import Redis
 
-from gnosis.eth import EthereumClient, EthereumClientProvider
+from gnosis.eth import EthereumClient, get_auto_ethereum_client
 from gnosis.eth.django.models import Uint256Field
 
 from safe_transaction_service.tokens.models import Token
@@ -46,7 +46,7 @@ class TransactionServiceException(Exception):
 class TransactionServiceProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            cls.instance = TransactionService(EthereumClientProvider(), get_redis())
+            cls.instance = TransactionService(get_auto_ethereum_client(), get_redis())
         return cls.instance
 
     @classmethod
@@ -210,7 +210,7 @@ class TransactionService:
         module_tx_ids = (
             ModuleTransaction.objects.filter(safe=safe_address)
             .annotate(
-                execution_date=F("internal_tx__timestamp"),
+                execution_date=F("created"),
                 block=F("internal_tx__block_number"),
                 safe_nonce=Value(0, output_field=Uint256Field()),
             )

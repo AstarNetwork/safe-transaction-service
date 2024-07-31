@@ -10,7 +10,7 @@ from django.http import HttpRequest
 from hexbytes import HexBytes
 from rest_framework.authtoken.admin import TokenAdmin
 
-from gnosis.eth import EthereumClientProvider
+from gnosis.eth import get_auto_ethereum_client
 from gnosis.eth.django.admin import AdvancedAdminSearchMixin
 from gnosis.safe import SafeTx
 
@@ -32,7 +32,6 @@ from .models import (
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
-    WebHook,
 )
 from .services import IndexServiceProvider
 from .utils import HexField
@@ -407,7 +406,7 @@ class MultisigTransactionAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
         # Calculate new tx hash
         # All the numbers are decimals, they need to be parsed as integers for SafeTx
         safe_tx = SafeTx(
-            EthereumClientProvider(),
+            get_auto_ethereum_client(),
             obj.safe,
             obj.to,
             int(obj.value),
@@ -519,7 +518,7 @@ class SafeContractERC20ListFilter(admin.SimpleListFilter):
         )
 
     def queryset(self, request, queryset):
-        current_block_number = EthereumClientProvider().current_block_number
+        current_block_number = get_auto_ethereum_client().current_block_number
         condition = {"erc20_block_number__gte": current_block_number - 200}
         if self.value() == "YES":
             return queryset.filter(**condition)
@@ -637,31 +636,3 @@ class SafeLastStatusAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
 @admin.register(SafeStatus)
 class SafeStatusAdmin(SafeLastStatusAdmin):
     pass
-
-
-@admin.register(WebHook)
-class WebHookAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
-    list_display = (
-        "pk",
-        "url",
-        "authorization",
-        "address",
-        "pending_multisig_transaction",
-        "new_confirmation",
-        "new_executed_multisig_transaction",
-        "new_incoming_transaction",
-        "new_safe",
-        "new_module_transaction",
-        "new_outgoing_transaction",
-    )
-    list_filter = (
-        "pending_multisig_transaction",
-        "new_confirmation",
-        "new_executed_multisig_transaction",
-        "new_incoming_transaction",
-        "new_safe",
-        "new_module_transaction",
-        "new_outgoing_transaction",
-    )
-    ordering = ["-pk"]
-    search_fields = ["==address", "==url"]
