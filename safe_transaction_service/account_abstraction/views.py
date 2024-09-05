@@ -8,10 +8,14 @@ from rest_framework.response import Response
 from gnosis.eth.utils import fast_is_checksum_address
 
 from . import pagination, serializers
-from .models import SafeOperation, UserOperation
+from .models import SafeOperation, SafeOperationConfirmation, UserOperation
 
 
 class SafeOperationView(RetrieveAPIView):
+    """
+    Returns a SafeOperation given its Safe operation hash
+    """
+
     lookup_field = "hash"
     lookup_url_kwarg = "safe_operation_hash"
     queryset = SafeOperation.objects.prefetch_related("confirmations").select_related(
@@ -25,8 +29,8 @@ class SafeOperationsView(ListCreateAPIView):
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,
     ]
-    ordering = ["-user_operation__nonce"]
-    ordering_fields = ["user_operation__nonce"]
+    ordering = ["-user_operation__nonce", "-created"]
+    ordering_fields = ["user_operation__nonce", "created"]
     pagination_class = pagination.DefaultPagination
 
     def get_queryset(self):
@@ -52,6 +56,9 @@ class SafeOperationsView(ListCreateAPIView):
             return serializers.SafeOperationSerializer
 
     def get(self, request, address, *args, **kwargs):
+        """
+        Returns the list of SafeOperations for a given Safe account
+        """
         if not fast_is_checksum_address(address):
             return Response(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -69,13 +76,7 @@ class SafeOperationsView(ListCreateAPIView):
     )
     def post(self, request, address, *args, **kwargs):
         """
-        Create a new 4337 ``SafeOperation`` for a Safe.
-
-        :param request:
-        :param address:
-        :param args:
-        :param kwargs:
-        :return:
+        Adds a new SafeOperation for a given Safe account
         """
 
         if not fast_is_checksum_address(address):
@@ -93,7 +94,48 @@ class SafeOperationsView(ListCreateAPIView):
         return Response(status=status.HTTP_201_CREATED)
 
 
+class SafeOperationConfirmationsView(ListCreateAPIView):
+    pagination_class = pagination.DefaultPagination
+
+    def get_queryset(self):
+        return SafeOperationConfirmation.objects.filter(
+            safe_operation__hash=self.kwargs["safe_operation_hash"]
+        )
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["safe_operation_hash"] = self.kwargs.get("safe_operation_hash")
+        return context
+
+    def get_serializer_class(self):
+        if self.request.method == "GET":
+            return serializers.SafeOperationConfirmationResponseSerializer
+        elif self.request.method == "POST":
+            return serializers.SafeOperationConfirmationSerializer
+
+    @swagger_auto_schema(responses={400: "Invalid data"})
+    def get(self, request, *args, **kwargs):
+        """
+        Get the list of confirmations for a multisig transaction
+        """
+        return super().get(request, *args, **kwargs)
+
+    @swagger_auto_schema(
+        responses={201: "Created", 400: "Malformed data", 422: "Error processing data"}
+    )
+    def post(self, request, *args, **kwargs):
+        """
+        Add a confirmation for a transaction. More than one signature can be used. This endpoint does not support
+        the use of delegates to make a transaction trusted.
+        """
+        return super().post(request, *args, **kwargs)
+
+
 class UserOperationView(RetrieveAPIView):
+    """
+    Returns a UserOperation given its user operation hash
+    """
+
     lookup_field = "hash"
     lookup_url_kwarg = "user_operation_hash"
     queryset = (
@@ -109,8 +151,8 @@ class UserOperationsView(ListAPIView):
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,
     ]
-    ordering = ["-nonce"]
-    ordering_fields = ["nonce"]
+    ordering = ["-nonce", "-ethereum_tx__block__timestamp"]
+    ordering_fields = ["nonce", "ethereum_tx__block__timestamp"]
     pagination_class = pagination.DefaultPagination
     serializer_class = serializers.UserOperationWithSafeOperationResponseSerializer
 
@@ -131,6 +173,9 @@ class UserOperationsView(ListAPIView):
         return context
 
     def get(self, request, address, *args, **kwargs):
+        """
+        Returns the list of UserOperations for a given Safe account
+        """
         if not fast_is_checksum_address(address):
             return Response(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,

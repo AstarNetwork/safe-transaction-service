@@ -5,13 +5,14 @@ from typing import Optional
 from django.db import models
 from django.db.models import Index
 
+from eth_abi.packed import encode_packed
 from hexbytes import HexBytes
 from model_utils.models import TimeStampedModel
 
 from gnosis.eth.account_abstraction import UserOperation as UserOperationClass
 from gnosis.eth.account_abstraction import UserOperationMetadata
 from gnosis.eth.django.models import (
-    EthereumAddressV2Field,
+    EthereumAddressBinaryField,
     HexV2Field,
     Keccak256Field,
     Uint256Field,
@@ -36,21 +37,21 @@ class UserOperation(models.Model):
     ethereum_tx = models.ForeignKey(
         history_models.EthereumTx, on_delete=models.CASCADE, null=True, blank=True
     )
-    sender = EthereumAddressV2Field(db_index=True)
+    sender = EthereumAddressBinaryField(db_index=True)
     nonce = Uint256Field()
     init_code = models.BinaryField(null=True, blank=True, editable=True)
     call_data = models.BinaryField(null=True, blank=True, editable=True)
-    call_data_gas_limit = Uint256Field()
+    call_gas_limit = Uint256Field()
     verification_gas_limit = Uint256Field()
     pre_verification_gas = Uint256Field()
     max_fee_per_gas = Uint256Field()
     max_priority_fee_per_gas = Uint256Field()
-    paymaster = EthereumAddressV2Field(
+    paymaster = EthereumAddressBinaryField(
         db_index=True, null=True, blank=True, editable=True
     )
     paymaster_data = models.BinaryField(null=True, blank=True, editable=True)
     signature = models.BinaryField(null=True, blank=True, editable=True)
-    entry_point = EthereumAddressV2Field(db_index=True)
+    entry_point = EthereumAddressBinaryField(db_index=True)
 
     class Meta:
         indexes = [
@@ -83,19 +84,23 @@ class UserOperation(models.Model):
             else None
         )
 
+        if not self.signature:
+            raise ValueError("Signature should not be empty")
+        signature = HexBytes(self.signature)
+
         return UserOperationClass(
             HexBytes(self.hash),
             self.sender,
             self.nonce,
             HexBytes(self.init_code) if self.init_code else b"",
             HexBytes(self.call_data) if self.call_data else b"",
-            self.call_data_gas_limit,
+            self.call_gas_limit,
             self.verification_gas_limit,
             self.pre_verification_gas,
             self.max_fee_per_gas,
             self.max_priority_fee_per_gas,
             self.paymaster_and_data if self.paymaster_and_data else b"",
-            HexBytes(self.signature) if self.signature else b"",
+            signature,
             self.entry_point,
             user_operation_metadata,
         )
@@ -105,9 +110,7 @@ class UserOperation(models.Model):
         :return: SafeOperation built from UserOperation
         :raises: ValueError
         """
-        if self.signature and bytes(self.signature):
-            return SafeOperationClass.from_user_operation(self.to_user_operation())
-        raise ValueError("Not enough information to build SafeOperation")
+        return SafeOperationClass.from_user_operation(self.to_user_operation())
 
 
 class UserOperationReceipt(models.Model):
@@ -131,13 +134,40 @@ class SafeOperation(TimeStampedModel):
     )
     valid_after = models.DateTimeField(null=True)  # Epoch uint48
     valid_until = models.DateTimeField(null=True)  # Epoch uint48
-    module_address = EthereumAddressV2Field(db_index=True)
+    module_address = EthereumAddressBinaryField(db_index=True)
 
     def __str__(self) -> str:
         return f"{HexBytes(self.hash).hex()} SafeOperation for user-operation={HexBytes(self.user_operation_id).hex()}"
 
+    def build_signature_prefix(self) -> bytes:
+        """
+        `UserOperation` `signature` is used to store data for the `SafeOperation`
+        First 6 bytes of the signature are `SafeOperation` `valid_after` and next 6 are `valid_until`
+        Real user signature is after those 12 bytes
+
+        :return: 12 bytes of `valid` encoded
+        """
+        return encode_packed(
+            ["uint48"] * 2,
+            [
+                int(valid_date.timestamp()) if valid_date else 0
+                for valid_date in (
+                    self.valid_after,
+                    self.valid_until,
+                )
+            ],
+        )
+
     def build_signature(self) -> bytes:
-        return b"".join(
+        """
+        `UserOperation` `signature` is used to store data for the `SafeOperation`
+        First 6 bytes of the signature are `SafeOperation` `valid_after` and next 6 are `valid_until`
+        Real user signature is after those 12 bytes
+
+        :return: 12 bytes of `valid` encoded following by the signature built from the confirmations
+        """
+        valid_encoded = self.build_signature_prefix()
+        confirmations_signature = b"".join(
             [
                 HexBytes(signature)
                 for _, signature in sorted(
@@ -146,6 +176,7 @@ class SafeOperation(TimeStampedModel):
                 )
             ]
         )
+        return valid_encoded + confirmations_signature
 
 
 class SafeOperationConfirmation(TimeStampedModel):
@@ -154,7 +185,7 @@ class SafeOperationConfirmation(TimeStampedModel):
         on_delete=models.CASCADE,
         related_name="confirmations",
     )
-    owner = EthereumAddressV2Field()
+    owner = EthereumAddressBinaryField()
     signature = HexV2Field(null=True, default=None, max_length=SIGNATURE_LENGTH)
     signature_type = models.PositiveSmallIntegerField(
         choices=[(tag.value, tag.name) for tag in SafeSignatureType], db_index=True

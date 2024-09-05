@@ -18,8 +18,8 @@ from imagekit.models import ProcessedImageField
 from pilkit.processors import Resize
 from web3.exceptions import Web3Exception
 
-from gnosis.eth import EthereumClientProvider, InvalidERC20Info, InvalidERC721Info
-from gnosis.eth.django.models import EthereumAddressV2Field
+from gnosis.eth import InvalidERC20Info, InvalidERC721Info, get_auto_ethereum_client
+from gnosis.eth.django.models import EthereumAddressBinaryField
 
 from .clients.zerion_client import (
     BalancerTokenAdapterClient,
@@ -66,7 +66,7 @@ class PoolTokenManager(models.Manager):
         All Uniswap V2 tokens have the same name: "Uniswap V2". This method will return better names
         :return: Number of pool tokens fixed
         """
-        zerion_client = ZerionUniswapV2TokenAdapterClient(EthereumClientProvider())
+        zerion_client = ZerionUniswapV2TokenAdapterClient(get_auto_ethereum_client())
         return self._fix_pool_tokens("Uniswap V2", zerion_client)
 
     def fix_balancer_pool_tokens(self) -> int:
@@ -74,7 +74,7 @@ class PoolTokenManager(models.Manager):
         All Uniswap V2 tokens have the same name: "Uniswap V2". This method will return better names
         :return: Number of pool tokens fixed
         """
-        zerion_client = BalancerTokenAdapterClient(EthereumClientProvider())
+        zerion_client = BalancerTokenAdapterClient(get_auto_ethereum_client())
         return self._fix_pool_tokens("Balancer Pool Token", zerion_client)
 
 
@@ -87,7 +87,7 @@ class TokenManager(models.Manager):
     def create_from_blockchain(
         self, token_address: ChecksumAddress
     ) -> Optional["Token"]:
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         if token_address in ENS_CONTRACTS_WITH_TLD:  # Special case for ENS
             return self.create(
                 address=token_address,
@@ -205,7 +205,7 @@ class TokenQuerySet(models.QuerySet):
 class Token(models.Model):
     objects = TokenManager.from_queryset(TokenQuerySet)()
     pool_tokens = PoolTokenManager()
-    address = EthereumAddressV2Field(primary_key=True)
+    address = EthereumAddressBinaryField(primary_key=True)
     name = models.CharField(max_length=60)
     symbol = models.CharField(max_length=60)
     decimals = models.PositiveSmallIntegerField(
@@ -232,7 +232,7 @@ class Token(models.Model):
     trusted = models.BooleanField(
         default=False, help_text="Spam and trusted cannot be both True"
     )
-    copy_price = EthereumAddressV2Field(
+    copy_price = EthereumAddressBinaryField(
         null=True, blank=True, help_text="If provided, copy the price from the token"
     )
 
