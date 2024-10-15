@@ -6,9 +6,8 @@ from django.core.management.base import BaseCommand
 from django.db.models import Min
 
 from django_celery_beat.models import CrontabSchedule, IntervalSchedule, PeriodicTask
-
-from gnosis.eth import EthereumClientProvider
-from gnosis.safe.addresses import MASTER_COPIES, PROXY_FACTORIES
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.safe.addresses import MASTER_COPIES, PROXY_FACTORIES
 
 from ...models import IndexingStatus, IndexingStatusType, ProxyFactory, SafeMasterCopy
 
@@ -190,7 +189,7 @@ class Command(BaseCommand):
                 )
 
         self.stdout.write(self.style.SUCCESS("Setting up Safe Contract Addresses"))
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         ethereum_network = ethereum_client.get_network()
         if ethereum_network in MASTER_COPIES:
             self.stdout.write(

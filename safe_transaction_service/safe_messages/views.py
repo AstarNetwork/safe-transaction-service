@@ -8,8 +8,7 @@ from rest_framework import status
 from rest_framework.filters import OrderingFilter
 from rest_framework.generics import CreateAPIView, ListCreateAPIView, RetrieveAPIView
 from rest_framework.response import Response
-
-from gnosis.eth.utils import fast_is_checksum_address
+from safe_eth.eth.utils import fast_is_checksum_address
 
 from . import pagination, serializers
 from .models import SafeMessage
@@ -24,6 +23,10 @@ class DisableCamelCaseForMessageRenderer(CamelCaseJSONRenderer):
 
 
 class SafeMessageView(RetrieveAPIView):
+    """
+    Returns detailed information on a message associated with a given message hash
+    """
+
     lookup_url_kwarg = "message_hash"
     queryset = SafeMessage.objects.prefetch_related("confirmations")
     serializer_class = serializers.SafeMessageResponseSerializer
@@ -47,6 +50,9 @@ class SafeMessageSignatureView(CreateAPIView):
         responses={201: "Created"},
     )
     def post(self, request, *args, **kwargs):
+        """
+        Adds the signature of a message given its message hash
+        """
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
@@ -79,6 +85,9 @@ class SafeMessagesView(ListCreateAPIView):
             return serializers.SafeMessageSerializer
 
     def get(self, request, address, *args, **kwargs):
+        """
+        Returns the list of messages for a given Safe account
+        """
         if not fast_is_checksum_address(address):
             return Response(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -96,7 +105,8 @@ class SafeMessagesView(ListCreateAPIView):
     )
     def post(self, request, address, *args, **kwargs):
         """
-        Create a new signed message for a Safe. Message can be:
+        Adds a new message for a given Safe account.
+        Message can be:
         - A ``string``, so ``EIP191`` will be used to get the hash.
         - An ``EIP712`` ``object``.
 

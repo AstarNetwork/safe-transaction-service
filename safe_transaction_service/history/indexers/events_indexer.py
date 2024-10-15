@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, OrderedDict, Sequence
 from django.conf import settings
 
 import gevent
-from eth_typing import ChecksumAddress
+from eth_abi.exceptions import DecodingError
+from eth_typing import ChecksumAddress, HexStr
 from eth_utils import event_abi_to_log_topic
 from gevent import pool
 from hexbytes import HexBytes
@@ -64,7 +65,7 @@ class EventsIndexer(EthereumIndexer):
         """
 
     @cached_property
-    def events_to_listen(self) -> Dict[bytes, List[ContractEvent]]:
+    def events_to_listen(self) -> Dict[HexStr, List[ContractEvent]]:
         """
         Build a dictionary with a `topic` and a list of ABIs to use for decoding. One single topic can have
         multiple ways of decoding as events with different `indexed` parameters must be decoded
@@ -74,13 +75,13 @@ class EventsIndexer(EthereumIndexer):
         """
         events_to_listen = {}
         for event in self.contract_events:
-            key = HexBytes(event_abi_to_log_topic(event.abi)).hex()
+            key = HexStr(HexBytes(event_abi_to_log_topic(event.abi)).hex())
             events_to_listen.setdefault(key, []).append(event)
         return events_to_listen
 
     def _do_node_query(
         self,
-        addresses: List[ChecksumAddress],
+        addresses: set[ChecksumAddress],
         from_block_number: int,
         to_block_number: int,
     ) -> List[LogReceipt]:
@@ -100,9 +101,10 @@ class EventsIndexer(EthereumIndexer):
         }
 
         if not self.IGNORE_ADDRESSES_ON_LOG_FILTER:
-            # Search logs only for the provided addresses
+            # Search logs only for the provided addresses, otherwise all the events will be
+            # retrieved and then filtering will happen here
             if self.query_chunk_size:
-                addresses_chunks = chunks(addresses, self.query_chunk_size)
+                addresses_chunks = chunks(list(addresses), self.query_chunk_size)
             else:
                 addresses_chunks = [addresses]
 
@@ -131,12 +133,12 @@ class EventsIndexer(EthereumIndexer):
 
     def _find_elements_using_topics(
         self,
-        addresses: List[ChecksumAddress],
+        addresses: set[ChecksumAddress],
         from_block_number: int,
         to_block_number: int,
     ) -> List[LogReceipt]:
         """
-        It will get Safe events using all the Gnosis Safe topics for filtering.
+        It will get Safe events using all the Safe topics for filtering.
 
         :param addresses:
         :param from_block_number:
@@ -174,7 +176,7 @@ class EventsIndexer(EthereumIndexer):
 
     def find_relevant_elements(
         self,
-        addresses: List[ChecksumAddress],
+        addresses: set[ChecksumAddress],
         from_block_number: int,
         to_block_number: int,
         current_block_number: Optional[int] = None,
@@ -218,11 +220,14 @@ class EventsIndexer(EthereumIndexer):
         :return: Decode `log_receipt` using all the possible ABIs for the topic. Returns `EventData` if successful,
             or `None` if decoding was not possible
         """
-        for event_to_listen in self.events_to_listen[log_receipt["topics"][0].hex()]:
+        for event_to_listen in self.events_to_listen[
+            HexStr(log_receipt["topics"][0].hex())
+        ]:
             # Try to decode using all the existing ABIs
+            # One topic can have multiple matching ABIs due to `indexed` elements changing how to decode it
             try:
                 return event_to_listen.process_log(log_receipt)
-            except LogTopicError:
+            except (LogTopicError, DecodingError):
                 continue
 
         logger.error(
@@ -243,6 +248,13 @@ class EventsIndexer(EthereumIndexer):
                 decoded_elements.append(decoded_element)
         return decoded_elements
 
+    def _process_decoded_elements(self, decoded_elements: List[EventData]) -> List[Any]:
+        processed_elements = []
+        for decoded_element in decoded_elements:
+            if processed_element := self._process_decoded_element(decoded_element):
+                processed_elements.append(processed_element)
+        return processed_elements
+
     def process_elements(self, log_receipts: Sequence[LogReceipt]) -> List[Any]:
         """
         Process all events found by `find_relevant_elements`
@@ -253,6 +265,7 @@ class EventsIndexer(EthereumIndexer):
         if not log_receipts:
             return []
 
+        logger.debug("Excluding events processed recently")
         # Ignore already processed events
         not_processed_log_receipts = [
             log_receipt
@@ -263,9 +276,11 @@ class EventsIndexer(EthereumIndexer):
                 log_receipt["logIndex"],
             )
         ]
+        logger.debug("Decoding `log_receipts` of the events")
         decoded_elements: List[EventData] = self.decode_elements(
             not_processed_log_receipts
         )
+        logger.debug("Decoded `log_receipts` of the events")
         tx_hashes = OrderedDict.fromkeys(
             [event["transactionHash"] for event in not_processed_log_receipts]
         ).keys()
@@ -273,10 +288,7 @@ class EventsIndexer(EthereumIndexer):
         self.index_service.txs_create_or_update_from_tx_hashes(tx_hashes)
         logger.debug("End prefetching and storing of ethereum txs")
         logger.debug("Processing %d decoded events", len(decoded_elements))
-        processed_elements = []
-        for decoded_element in decoded_elements:
-            if processed_element := self._process_decoded_element(decoded_element):
-                processed_elements.append(processed_element)
+        processed_elements = self._process_decoded_elements(decoded_elements)
         logger.debug("End processing %d decoded events", len(decoded_elements))
 
         logger.debug("Marking events as processed")

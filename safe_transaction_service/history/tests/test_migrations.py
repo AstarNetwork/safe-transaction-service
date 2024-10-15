@@ -5,9 +5,7 @@ from django.utils import timezone
 
 from django_test_migrations.migrator import Migrator
 from eth_account import Account
-from web3 import Web3
-
-from safe_transaction_service.history.tests.factories import MultisigTransactionFactory
+from safe_eth.eth.utils import fast_keccak, fast_keccak_text
 
 
 class TestMigrations(TestCase):
@@ -27,13 +25,13 @@ class TestMigrations(TestCase):
             gas_limit=2,
             gas_used=2,
             timestamp=timezone.now(),
-            block_hash=Web3.keccak(b"34"),
-            parent_hash=Web3.keccak(b"12"),
+            block_hash=fast_keccak(b"34"),
+            parent_hash=fast_keccak(b"12"),
         )
 
         return ethereum_tx_class.objects.create(
             block=ethereum_block,
-            tx_hash=Web3.keccak(b"tx-hash"),
+            tx_hash=fast_keccak(b"tx-hash"),
             gas=23000,
             gas_price=1,
             nonce=0,
@@ -55,7 +53,7 @@ class TestMigrations(TestCase):
         ]
         for origin in origins:
             MultisigTransactionOld.objects.create(
-                safe_tx_hash=Web3.keccak(text=f"multisig-tx-{origin}").hex(),
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
                 safe=Account.create().address,
                 value=0,
                 operation=0,
@@ -74,21 +72,21 @@ class TestMigrations(TestCase):
         )
 
         # String should keep string
-        hash = Web3.keccak(text=f"multisig-tx-{origins[0]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[0]}").hex()
         self.assertEqual(MultisigTransactionNew.objects.get(pk=hash).origin, origins[0])
 
         # String json should be converted to json
-        hash = Web3.keccak(text=f"multisig-tx-{origins[1]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[1]}").hex()
         self.assertEqual(
             MultisigTransactionNew.objects.get(pk=hash).origin, json.loads(origins[1])
         )
 
         # Empty string should be empty object
-        hash = Web3.keccak(text=f"multisig-tx-{origins[2]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[2]}").hex()
         self.assertEqual(MultisigTransactionNew.objects.get(pk=hash).origin, {})
 
         # None should be empty object
-        hash = Web3.keccak(text=f"multisig-tx-{origins[2]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[2]}").hex()
         self.assertEqual(MultisigTransactionNew.objects.get(pk=hash).origin, {})
 
     def test_migration_backward_0068(self):
@@ -101,7 +99,7 @@ class TestMigrations(TestCase):
         origins = ["{ TestString", {"url": "https://example.com", "name": "app"}, {}]
         for origin in origins:
             MultisigTransactionNew.objects.create(
-                safe_tx_hash=Web3.keccak(text=f"multisig-tx-{origin}").hex(),
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
                 safe=Account.create().address,
                 value=0,
                 operation=0,
@@ -120,17 +118,17 @@ class TestMigrations(TestCase):
         )
 
         # String should keep string
-        hash = Web3.keccak(text=f"multisig-tx-{origins[0]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[0]}").hex()
         self.assertEqual(MultisigTransactionOld.objects.get(pk=hash).origin, origins[0])
 
         # Json should be converted to a string json
-        hash = Web3.keccak(text=f"multisig-tx-{origins[1]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[1]}").hex()
         self.assertEqual(
             MultisigTransactionOld.objects.get(pk=hash).origin, json.dumps(origins[1])
         )
 
         # Empty object should be None
-        hash = Web3.keccak(text=f"multisig-tx-{origins[2]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[2]}").hex()
         self.assertEqual(MultisigTransactionOld.objects.get(pk=hash).origin, None)
 
     def test_migration_forward_0069(self):
@@ -252,23 +250,28 @@ class TestMigrations(TestCase):
         new_state = self.migrator.apply_initial_migration(
             ("history", "0072_safecontract_banned_and_more"),
         )
-
-        # Factories can be used as there are no database definition changes
-        # Make sure there are no issues with empty `origin` or `origin` lacking `url`
-        MultisigTransactionFactory(origin={"not_url": "random"})
-
-        # Make sure other urls are not affected
-        MultisigTransactionFactory(
-            origin={"url": "https://app.zerion.io", "name": "Zerion"}
-        )
-
-        # This origin must be replaced
-        MultisigTransactionFactory(
-            origin={
+        origins = [
+            {"not_url": "random"},
+            {"url": "https://app.zerion.io", "name": "Zerion"},
+            {
                 "url": "https://apps.gnosis-safe.io/tx-builder/",
                 "name": "Transaction Builder",
-            }
-        )
+            },
+        ]
+
+        MultisigTransaction = new_state.apps.get_model("history", "MultisigTransaction")
+        for origin in origins:
+            MultisigTransaction.objects.create(
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
+                safe=Account.create().address,
+                value=0,
+                operation=0,
+                safe_tx_gas=0,
+                base_gas=0,
+                gas_price=0,
+                nonce=0,
+                origin=origin,
+            )
 
         new_state = self.migrator.apply_tested_migration(
             ("history", "0073_safe_apps_links"),
@@ -295,22 +298,28 @@ class TestMigrations(TestCase):
             ("history", "0073_safe_apps_links"),
         )
 
-        # Factories can be used as there are no database definition changes
-        # Make sure there are no issues with empty `origin` or `origin` lacking `url`
-        MultisigTransactionFactory(origin={"not_url": "random"})
-
-        # Make sure other urls are not affected
-        MultisigTransactionFactory(
-            origin={"url": "https://app.zerion.io", "name": "Zerion"}
-        )
-
-        # This origin must be replaced
-        MultisigTransactionFactory(
-            origin={
-                "url": "https://apps-portal.safe.global/tx-builder/",
+        origins = [
+            {"not_url": "random"},
+            {"url": "https://app.zerion.io", "name": "Zerion"},
+            {
+                "url": "https://apps.gnosis-safe.io/tx-builder/",
                 "name": "Transaction Builder",
-            }
-        )
+            },
+        ]
+
+        MultisigTransaction = new_state.apps.get_model("history", "MultisigTransaction")
+        for origin in origins:
+            MultisigTransaction.objects.create(
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
+                safe=Account.create().address,
+                value=0,
+                operation=0,
+                safe_tx_gas=0,
+                base_gas=0,
+                gas_price=0,
+                nonce=0,
+                origin=origin,
+            )
 
         new_state = self.migrator.apply_tested_migration(
             ("history", "0072_safecontract_banned_and_more"),
@@ -327,4 +336,30 @@ class TestMigrations(TestCase):
                     "name": "Transaction Builder",
                 },
             ],
+        )
+
+    def test_migration_0082_safecontract_created(self):
+        # Add `created` field to SafeContract
+        old_state = self.migrator.apply_initial_migration(
+            ("history", "0081_internaltx_history_internal_transfer_from"),
+        )
+
+        SafeContract = old_state.apps.get_model("history", "SafeContract")
+
+        EthereumBlock = old_state.apps.get_model("history", "EthereumBlock")
+        EthereumTx = old_state.apps.get_model("history", "EthereumTx")
+        ethereum_tx = self.build_ethereum_tx(EthereumBlock, EthereumTx)
+        SafeContract.objects.create(
+            address=Account.create().address,
+            ethereum_tx=ethereum_tx,
+        )
+
+        new_state = self.migrator.apply_tested_migration(
+            ("history", "0082_safecontract_created"),
+        )
+
+        SafeContractNew = new_state.apps.get_model("history", "SafeContract")
+        safe_contract = SafeContractNew.objects.get()
+        self.assertEqual(
+            safe_contract.created, safe_contract.ethereum_tx.block.timestamp
         )

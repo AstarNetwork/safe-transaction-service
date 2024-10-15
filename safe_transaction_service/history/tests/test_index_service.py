@@ -4,10 +4,10 @@ from unittest.mock import PropertyMock
 from django.test import TestCase
 
 from eth_account import Account
-from web3 import Web3
-
-from gnosis.eth import EthereumClient
-from gnosis.eth.tests.ethereum_test_case import EthereumTestCaseMixin
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from safe_eth.eth import EthereumClient
+from safe_eth.eth.tests.ethereum_test_case import EthereumTestCaseMixin
+from safe_eth.eth.utils import fast_keccak_text
 
 from ..models import (
     EthereumTx,
@@ -23,6 +23,7 @@ from ..services.index_service import (
 )
 from .factories import (
     EthereumTxFactory,
+    InternalTxDecodedFactory,
     MultisigTransactionFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
@@ -87,7 +88,7 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
 
         # Test block hash changes
         ethereum_tx = ethereum_txs[0]
-        ethereum_tx.block.block_hash = Web3.keccak(text="aloha")
+        ethereum_tx.block.block_hash = fast_keccak_text("aloha")
         ethereum_tx.block.save(update_fields=["block_hash"])
         tx_hash = ethereum_tx.tx_hash
 
@@ -120,6 +121,55 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
             current_block_number_mock.return_value - reorg_blocks
         )
         self.assertTrue(self.index_service.is_service_synced())
+
+        # Test connection error to the node
+        current_block_number_mock.side_effect = RequestsConnectionError
+        self.assertFalse(self.index_service.is_service_synced())
+
+    def test_process_decoded_txs(self):
+        safe_address = Account.create().address
+        with mock.patch.object(
+            IndexService, "fix_out_of_order"
+        ) as fix_out_of_order_mock:
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 0)
+            fix_out_of_order_mock.assert_not_called()
+
+            # Setup for a random Safe should not be processed
+            InternalTxDecodedFactory(
+                function_name="setup",
+            )
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 0)
+
+            setup_internal_tx = InternalTxDecodedFactory(
+                function_name="setup",
+                internal_tx___from=safe_address,
+            )
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 1)
+            fix_out_of_order_mock.assert_not_called()
+            # After processed, it should not be processed again
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 0)
+
+            exec_transactions = [
+                InternalTxDecodedFactory(
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                )
+                for _ in range(3)
+            ]
+
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 3)
+            fix_out_of_order_mock.assert_not_called()
+            # After processed, they should not be processed again
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 0)
+
+            # Add a transaction out of order
+            exec_transactions[1].processed = False
+            exec_transactions[1].save(update_fields=["processed"])
+            self.assertEqual(self.index_service.process_decoded_txs(safe_address), 1)
+            # Out of order transaction was detected
+            fix_out_of_order_mock.assert_called_with(
+                safe_address, exec_transactions[1].internal_tx
+            )
 
     def test_reprocess_addresses(self):
         index_service: IndexService = self.index_service
@@ -158,3 +208,33 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
         self.assertEqual(SafeStatus.objects.count(), 0)
         self.assertEqual(SafeLastStatus.objects.count(), 0)
         self.assertEqual(MultisigTransaction.objects.count(), 2)
+
+    def test_fix_out_of_order(self):
+        index_service: IndexService = self.index_service
+        self.assertIsNone(index_service.reprocess_addresses([]))
+
+        safe_status = SafeStatusFactory()
+        safe_address = safe_status.address
+        safe_status_2 = SafeStatusFactory(address=safe_address)
+        safe_status_3 = SafeStatusFactory(address=safe_address)
+        safe_status_4 = SafeStatusFactory(address=safe_address)
+        random_safe_status = SafeStatusFactory()  # It should not be removed
+        SafeLastStatus.objects.get_or_generate(safe_address)
+        MultisigTransactionFactory()  # It shouldn't be deleted (safe not matching)
+        MultisigTransactionFactory(
+            safe=safe_status.address, origin={}
+        )  # It should be deleted
+        MultisigTransactionFactory(
+            safe=safe_status.address, ethereum_tx=None
+        )  # It shouldn't be deleted
+        MultisigTransactionFactory(
+            safe=safe_status.address, origin="Something"
+        )  # It shouldn't be deleted
+        self.assertEqual(MultisigTransaction.objects.count(), 4)
+        self.assertEqual(SafeStatus.objects.count(), 5)
+        self.assertIsNone(
+            index_service.fix_out_of_order(safe_address, safe_status_3.internal_tx)
+        )
+        self.assertEqual(SafeStatus.objects.count(), 3)
+        self.assertEqual(SafeLastStatus.objects.count(), 0)
+        self.assertEqual(MultisigTransaction.objects.count(), 4)

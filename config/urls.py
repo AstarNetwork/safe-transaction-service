@@ -13,7 +13,7 @@ schema_view = get_schema_view(
     openapi.Info(
         title="Safe Transaction Service API",
         default_version="v1",
-        description="API to keep track of transactions sent via Gnosis Safe smart contracts",
+        description="API to keep track of transactions sent via Safe smart contracts",
         license=openapi.License(name="MIT License"),
     ),
     validators=["flex", "ssv"],
@@ -43,6 +43,13 @@ swagger_urlpatterns = [
 
 urlpatterns_v1 = [
     path("", include("safe_transaction_service.history.urls", namespace="history")),
+    path(
+        "",
+        include(
+            "safe_transaction_service.account_abstraction.urls",
+            namespace="account_abstraction",
+        ),
+    ),
     path(
         "contracts/",
         include("safe_transaction_service.contracts.urls", namespace="contracts"),

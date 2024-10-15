@@ -2,15 +2,15 @@ from functools import cached_property
 from logging import getLogger
 from typing import List, Optional, Sequence
 
+from safe_eth.eth import EthereumClient
+from safe_eth.eth.constants import NULL_ADDRESS
+from safe_eth.eth.contracts import (
+    get_proxy_factory_V1_1_1_contract,
+    get_proxy_factory_V1_3_0_contract,
+    get_proxy_factory_V1_4_1_contract,
+)
 from web3.contract.contract import ContractEvent
 from web3.types import EventData, LogReceipt
-
-from gnosis.eth import EthereumClient
-from gnosis.eth.constants import NULL_ADDRESS
-from gnosis.eth.contracts import (
-    get_proxy_factory_contract,
-    get_proxy_factory_V1_1_1_contract,
-)
 
 from ..models import ProxyFactory, SafeContract
 from .events_indexer import EventsIndexer
@@ -40,13 +40,22 @@ class ProxyFactoryIndexerProvider:
 class ProxyFactoryIndexer(EventsIndexer):
     @cached_property
     def contract_events(self) -> List[ContractEvent]:
-        old_proxy_factory_contract = get_proxy_factory_V1_1_1_contract(
+        proxy_factory_v1_1_1_contract = get_proxy_factory_V1_1_1_contract(
             self.ethereum_client.w3
         )
-        proxy_factory_contract = get_proxy_factory_contract(self.ethereum_client.w3)
+        proxy_factory_v1_3_0_contract = get_proxy_factory_V1_3_0_contract(
+            self.ethereum_client.w3
+        )
+        proxy_factory_v_1_4_1_contract = get_proxy_factory_V1_4_1_contract(
+            self.ethereum_client.w3
+        )
         return [
-            old_proxy_factory_contract.events.ProxyCreation(),
-            proxy_factory_contract.events.ProxyCreation(),
+            # event ProxyCreation(Proxy proxy)
+            proxy_factory_v1_1_1_contract.events.ProxyCreation(),
+            # event ProxyCreation(GnosisSafeProxy proxy, address singleton)
+            proxy_factory_v1_3_0_contract.events.ProxyCreation(),
+            # event ProxyCreation(SafeProxy indexed proxy, address singleton)
+            proxy_factory_v_1_4_1_contract.events.ProxyCreation(),
         ]
 
     @property

@@ -1,9 +1,10 @@
 import factory
 from eth_account import Account
 from factory.django import DjangoModelFactory
+from safe_eth.safe.safe_signature import SafeSignatureType
 
 from ..models import SafeMessage, SafeMessageConfirmation
-from ..utils import get_safe_message_hash_for_message
+from ..utils import get_hash_for_message, get_safe_message_hash_for_message
 
 
 class SafeMessageFactory(DjangoModelFactory):
@@ -17,7 +18,9 @@ class SafeMessageFactory(DjangoModelFactory):
 
     @factory.lazy_attribute
     def message_hash(self):
-        return get_safe_message_hash_for_message(self.safe, self.message).hex()
+        return get_safe_message_hash_for_message(
+            self.safe, get_hash_for_message(self.message)
+        ).hex()
 
 
 class SafeMessageConfirmationFactory(DjangoModelFactory):
@@ -30,8 +33,6 @@ class SafeMessageConfirmationFactory(DjangoModelFactory):
     safe_message = factory.SubFactory(SafeMessageFactory)
     owner = factory.LazyAttribute(lambda o: o.signing_owner.address)
     signature = factory.LazyAttribute(
-        lambda o: o.signing_owner.signHash(o.safe_message.message_hash)[
-            "signature"
-        ].hex()
+        lambda o: o.signing_owner.signHash(o.safe_message.message_hash)["signature"]
     )
-    signature_type = 2
+    signature_type = SafeSignatureType.EOA.value

@@ -36,7 +36,7 @@ CACHES = {
 SECURE_CONTENT_TYPE_NOSNIFF = env.bool(
     "DJANGO_SECURE_CONTENT_TYPE_NOSNIFF", default=True
 )
-# https://docs.djangoproject.com/en/3.2/ref/settings/#csrf-trusted-origins
+# https://docs.djangoproject.com/en/5.0/ref/settings/#csrf-trusted-origins
 CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
 
 # SSO (tested with https://github.com/buzzfeed/sso)
@@ -64,10 +64,6 @@ if SSO_ENABLED:
 # ------------------------------------------------------------------------------
 # Django Admin URL regex.
 ADMIN_URL = env("DJANGO_ADMIN_URL", default="admin/")
-
-# CELERY
-# ------------------------------------------------------------------------------
-CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=REDIS_URL)
 
 # Gunicorn
 # ------------------------------------------------------------------------------

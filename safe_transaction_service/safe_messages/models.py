@@ -5,9 +5,14 @@ from django.db.models import JSONField
 
 from hexbytes import HexBytes
 from model_utils.models import TimeStampedModel
+from safe_eth.eth.django.models import (
+    EthereumAddressBinaryField,
+    HexV2Field,
+    Keccak256Field,
+)
+from safe_eth.safe.safe_signature import SafeSignatureType
 
-from gnosis.eth.django.models import EthereumAddressV2Field, HexField, Keccak256Field
-from gnosis.safe.safe_signature import SafeSignatureType
+from safe_transaction_service.utils.constants import SIGNATURE_LENGTH
 
 logger = getLogger(__name__)
 
@@ -19,9 +24,9 @@ class SafeMessage(TimeStampedModel):
 
     # Message hash is tied to Safe domain, so it's guaranteed to be unique
     message_hash = Keccak256Field(primary_key=True)
-    safe = EthereumAddressV2Field(db_index=True)
+    safe = EthereumAddressBinaryField(db_index=True)
     message = JSONField()  # String if EIP191, object if EIP712
-    proposed_by = EthereumAddressV2Field()  # Owner proposing the message
+    proposed_by = EthereumAddressBinaryField()  # Owner proposing the message
     safe_app_id = models.PositiveIntegerField(blank=True, null=True)
 
     class Meta:
@@ -60,14 +65,19 @@ class SafeMessageConfirmation(TimeStampedModel):
         default=None,
         related_name="confirmations",
     )
-    owner = EthereumAddressV2Field(db_index=True)
-    signature = HexField(max_length=5000)
+    owner = EthereumAddressBinaryField(db_index=True)
+    signature = HexV2Field(max_length=SIGNATURE_LENGTH)
     signature_type = models.PositiveSmallIntegerField(
         choices=[(tag.value, tag.name) for tag in SafeSignatureType], db_index=True
     )
 
     class Meta:
-        unique_together = (("safe_message", "owner"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["safe_message", "owner"],
+                name="unique_safe_message_confirmation_owner",
+            )
+        ]
         ordering = ["created"]
 
     def __str__(self):

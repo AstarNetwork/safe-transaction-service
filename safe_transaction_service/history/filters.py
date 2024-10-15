@@ -3,11 +3,9 @@ from django.db.models import Q
 import django_filters
 from django_filters import rest_framework as filters
 from rest_framework.exceptions import ValidationError
-
-from gnosis.eth.django.filters import EthereumAddressFilter, Keccak256Filter
-from gnosis.eth.django.models import (
-    EthereumAddressField,
-    EthereumAddressV2Field,
+from safe_eth.eth.django.filters import EthereumAddressFilter, Keccak256Filter
+from safe_eth.eth.django.models import (
+    EthereumAddressBinaryField,
     Keccak256Field,
     Uint256Field,
 )
@@ -17,8 +15,7 @@ from .models import ModuleTransaction, MultisigTransaction
 filter_overrides = {
     Uint256Field: {"filter_class": django_filters.NumberFilter},
     Keccak256Field: {"filter_class": Keccak256Filter},
-    EthereumAddressField: {"filter_class": EthereumAddressFilter},
-    EthereumAddressV2Field: {"filter_class": EthereumAddressFilter},
+    EthereumAddressBinaryField: {"filter_class": EthereumAddressFilter},
 }
 
 
@@ -103,20 +100,30 @@ class MultisigTransactionFilter(filters.FilterSet):
     )
     transaction_hash = Keccak256Filter(field_name="ethereum_tx_id")
 
-    def filter_confirmations(self, queryset, name: str, value: bool):
+    def __init__(self, data=None, *args, **kwargs):
+        if data is not None:
+            data = data.copy()
+            data.setdefault("trusted", True)
+
+        super().__init__(data, *args, **kwargs)
+
+    def filter_confirmations(self, queryset, _name: str, value: bool):
         if value:
             return queryset.with_confirmations()
         else:
             return queryset.without_confirmations()
 
-    def filter_executed(self, queryset, name: str, value: bool):
+    def filter_executed(self, queryset, _name: str, value: bool):
         if value:
             return queryset.executed()
         else:
             return queryset.not_executed()
 
-    def filter_trusted(self, queryset, name: str, value: bool):
-        return queryset.filter(trusted=value)
+    def filter_trusted(self, queryset, _name: str, value: bool):
+        if value:
+            return queryset.trusted()
+        else:
+            return queryset
 
     class Meta:
         model = MultisigTransaction

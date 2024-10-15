@@ -7,12 +7,12 @@ from django.db.models import Min, Q
 
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
-
-from gnosis.eth import EthereumClient, EthereumClientProvider
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
 
 from ..models import EthereumBlock, EthereumTx
 from ..models import IndexingStatus as IndexingStatusDb
 from ..models import (
+    InternalTx,
     InternalTxDecoded,
     ModuleTransaction,
     MultisigConfirmation,
@@ -28,9 +28,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IndexingStatus:
     current_block_number: int
+    current_block_timestamp: int
     erc20_block_number: int
+    erc20_block_timestamp: int
     erc20_synced: bool
     master_copies_block_number: int
+    master_copies_block_timestamp: int
     master_copies_synced: bool
     synced: bool
 
@@ -64,9 +67,10 @@ class IndexServiceProvider:
             from django.conf import settings
 
             cls.instance = IndexService(
-                EthereumClientProvider(),
+                get_auto_ethereum_client(),
                 settings.ETH_REORG_BLOCKS,
                 settings.ETH_L2_NETWORK,
+                settings.ETH_INTERNAL_TX_DECODED_PROCESS_BATCH,
             )
         return cls.instance
 
@@ -76,17 +80,25 @@ class IndexServiceProvider:
             del cls.instance
 
 
-# TODO Test IndexService
 class IndexService:
     def __init__(
         self,
         ethereum_client: EthereumClient,
         eth_reorg_blocks: int,
         eth_l2_network: bool,
+        eth_internal_tx_decoded_process_batch: int,
     ):
         self.ethereum_client = ethereum_client
         self.eth_reorg_blocks = eth_reorg_blocks
         self.eth_l2_network = eth_l2_network
+        self.eth_internal_tx_decoded_process_batch = (
+            eth_internal_tx_decoded_process_batch
+        )
+
+        # Prevent circular import
+        from ..indexers.tx_processor import SafeTxProcessor, SafeTxProcessorProvider
+
+        self.tx_processor: SafeTxProcessor = SafeTxProcessorProvider()
 
     def block_get_or_create_from_block_hash(self, block_hash: int):
         try:
@@ -137,11 +149,21 @@ class IndexService:
             current_block_number - master_copies_block_number <= self.eth_reorg_blocks
         )
 
+        blocks = self.ethereum_client.get_blocks(
+            [current_block_number, erc20_block_number, master_copies_block_number]
+        )
+        current_block_timestamp = blocks[0]["timestamp"]
+        erc20_block_timestamp = blocks[1]["timestamp"]
+        master_copies_block_timestamp = blocks[2]["timestamp"]
+
         return IndexingStatus(
             current_block_number=current_block_number,
+            current_block_timestamp=current_block_timestamp,
             erc20_block_number=erc20_block_number,
+            erc20_block_timestamp=erc20_block_timestamp,
             erc20_synced=erc20_synced,
             master_copies_block_number=master_copies_block_number,
+            master_copies_block_timestamp=master_copies_block_timestamp,
             master_copies_synced=master_copies_synced,
             synced=erc20_synced and master_copies_synced,
         )
@@ -151,10 +173,14 @@ class IndexService:
         :return: `True` if master copies and ERC20/721 are synced, `False` otherwise
         """
 
+        try:
+            current_block_number = self.ethereum_client.current_block_number
+        except (IOError, ValueError):
+            # If there's an error connecting to the node or invalid response we consider the service as out of sync
+            return False
+
         # Use number of reorg blocks to consider as not synced
-        reference_block_number = (
-            self.ethereum_client.current_block_number - self.eth_reorg_blocks
-        )
+        reference_block_number = current_block_number - self.eth_reorg_blocks
         synced: bool = True
         for safe_master_copy in SafeMasterCopy.objects.relevant().filter(
             tx_block_number__lt=reference_block_number
@@ -192,7 +218,6 @@ class IndexService:
     def txs_create_or_update_from_tx_hashes(
         self, tx_hashes: Collection[Union[str, bytes]]
     ) -> List["EthereumTx"]:
-
         logger.debug("Don't retrieve existing txs on DB. Find them first")
         # Search first in database
         ethereum_txs_dict = OrderedDict.fromkeys(
@@ -350,7 +375,76 @@ class IndexService:
             queryset = queryset.filter(internal_tx___from__in=addresses)
         queryset.update(processed=False)
 
-    def reprocess_addresses(self, addresses: List[str]):
+    @transaction.atomic
+    def fix_out_of_order(
+        self, address: ChecksumAddress, internal_tx: InternalTx
+    ) -> None:
+        """
+        Fix a Safe that has transactions out of order (not processed transactions
+        in between processed ones, usually due a reindex), by marking
+        them as not processed from the `internal_tx` where the issue was detected.
+
+        :param address: Safe to fix
+        :param internal_tx: Only reprocess transactions from `internal_tx` and newer
+        :return:
+        """
+
+        timestamp = internal_tx.timestamp
+        tx_hash_hex = HexBytes(internal_tx.ethereum_tx_id).hex()
+        logger.info(
+            "[%s] Fixing out of order from tx %s with timestamp %s",
+            address,
+            tx_hash_hex,
+            timestamp,
+        )
+        logger.info(
+            "[%s] Marking InternalTxDecoded newer than timestamp as not processed",
+            address,
+        )
+        InternalTxDecoded.objects.filter(
+            internal_tx___from=address, internal_tx__timestamp__gte=timestamp
+        ).update(processed=False)
+        logger.info("[%s] Removing SafeStatus newer than timestamp", address)
+        SafeStatus.objects.filter(
+            address=address, internal_tx__timestamp__gte=timestamp
+        ).delete()
+        logger.info("[%s] Removing SafeLastStatus", address)
+        SafeLastStatus.objects.filter(address=address).delete()
+        logger.info("[%s] Ended fixing out of order", address)
+
+    def process_decoded_txs(self, safe_address: ChecksumAddress) -> int:
+        """
+        Process all the pending `InternalTxDecoded` for a Safe
+
+        :param safe_address:
+        :return: Number of `InternalTxDecoded` processed
+        """
+
+        # Check if a new decoded tx appeared before other already processed (due to a reindex)
+        if InternalTxDecoded.objects.out_of_order_for_safe(safe_address):
+            logger.error("[%s] Found out of order transactions", safe_address)
+            self.fix_out_of_order(
+                safe_address,
+                InternalTxDecoded.objects.pending_for_safe(safe_address)[0].internal_tx,
+            )
+            self.tx_processor.clear_cache(safe_address)
+
+        # Use chunks for memory issues
+        total_processed_txs = 0
+        while True:
+            internal_txs_decoded_queryset = InternalTxDecoded.objects.pending_for_safe(
+                safe_address
+            )[: self.eth_internal_tx_decoded_process_batch]
+            if not internal_txs_decoded_queryset:
+                break
+            total_processed_txs += len(
+                self.tx_processor.process_decoded_transactions(
+                    internal_txs_decoded_queryset
+                )
+            )
+        return total_processed_txs
+
+    def reprocess_addresses(self, addresses: List[ChecksumAddress]):
         """
         Given a list of safe addresses it will delete all `SafeStatus`, conflicting `MultisigTxs` and will mark
         every `InternalTxDecoded` not processed to be processed again
@@ -364,7 +458,7 @@ class IndexService:
         return self._reprocess(addresses)
 
     def reprocess_all(self):
-        return self._reprocess(None)
+        return self._reprocess([])
 
     def _reindex(
         self,
@@ -389,17 +483,18 @@ class IndexService:
             # No issues on modifying the indexer as we should be provided with a new instance
             indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = False
         else:
-            addresses = list(
-                indexer.database_queryset.values_list("address", flat=True)
-            )
+            addresses = set(indexer.database_queryset.values_list("address", flat=True))
 
         element_number: int = 0
         if not addresses:
             logger.warning("No addresses to process")
         else:
             # Don't log all the addresses
+            addresses_len = len(addresses)
             addresses_str = (
-                str(addresses) if len(addresses) < 10 else f"{addresses[:10]}..."
+                str(addresses)
+                if addresses_len < 10
+                else f"{addresses_len} addresses..."
             )
             logger.info("Start reindexing addresses %s", addresses_str)
             current_block_number = self.ethereum_client.current_block_number
@@ -409,7 +504,7 @@ class IndexService:
                 else current_block_number
             )
             for block_number in range(
-                from_block_number, stop_block_number, block_process_limit
+                from_block_number, stop_block_number + 1, block_process_limit
             ):
                 elements = indexer.find_relevant_elements(
                     addresses,
@@ -436,7 +531,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        Reindexes master copies in parallel with the current running indexer, so service will have no missing txs
+        Reindex master copies in parallel with the current running indexer, so service will have no missing txs
         while reindexing
 
         :param from_block_number: Block number to start indexing from
@@ -471,7 +566,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        Reindexes erc20/721 events parallel with the current running indexer, so service will have no missing
+        Reindex erc20/721 events parallel with the current running indexer, so service will have no missing
         events while reindexing
 
         :param from_block_number: Block number to start indexing from

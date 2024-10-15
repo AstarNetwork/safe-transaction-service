@@ -2,11 +2,10 @@
 
 from django.db import migrations
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0037_fix_failed_module_transactions"),
     ]
@@ -15,7 +14,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="safestatus",
             name="guard",
-            field=gnosis.eth.django.models.EthereumAddressField(
+            field=safe_eth.eth.django.models.EthereumAddressField(
                 default=None, null=True
             ),
         ),

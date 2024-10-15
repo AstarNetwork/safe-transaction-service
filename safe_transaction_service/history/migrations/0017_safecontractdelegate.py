@@ -3,11 +3,10 @@
 import django.db.models.deletion
 from django.db import migrations, models
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0016_multisigconfirmation_signature_type"),
     ]
@@ -25,8 +24,8 @@ class Migration(migrations.Migration):
                         verbose_name="ID",
                     ),
                 ),
-                ("delegate", gnosis.eth.django.models.EthereumAddressField()),
-                ("delegator", gnosis.eth.django.models.EthereumAddressField()),
+                ("delegate", safe_eth.eth.django.models.EthereumAddressField()),
+                ("delegator", safe_eth.eth.django.models.EthereumAddressField()),
                 ("label", models.CharField(max_length=50)),
                 ("read", models.BooleanField(default=True)),
                 ("write", models.BooleanField(default=True)),

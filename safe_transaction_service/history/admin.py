@@ -9,10 +9,9 @@ from django.http import HttpRequest
 
 from hexbytes import HexBytes
 from rest_framework.authtoken.admin import TokenAdmin
-
-from gnosis.eth import EthereumClientProvider
-from gnosis.eth.django.admin import BinarySearchAdmin
-from gnosis.safe import SafeTx
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.eth.django.admin import AdvancedAdminSearchMixin
+from safe_eth.safe import SafeTx
 
 from .models import (
     Chain,
@@ -32,7 +31,6 @@ from .models import (
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
-    WebHook,
 )
 from .services import IndexServiceProvider
 from .utils import HexField
@@ -90,6 +88,9 @@ class SafeContractDelegateInline(admin.TabularInline):
 # Admin models ------------------------------
 @admin.register(IndexingStatus)
 class IndexingStatusAdmin(admin.ModelAdmin):
+    class Meta:
+        verbose_name_plural = "Indexing Status"
+
     list_display = (
         "indexing_type",
         "block_number",
@@ -107,7 +108,7 @@ class ChainAdmin(admin.ModelAdmin):
 
 
 @admin.register(EthereumBlock)
-class EthereumBlockAdmin(admin.ModelAdmin):
+class EthereumBlockAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     date_hierarchy = "timestamp"
     inlines = (EthereumTxInline,)
     list_display = (
@@ -120,13 +121,13 @@ class EthereumBlockAdmin(admin.ModelAdmin):
     )
     list_filter = ("confirmed",)
     search_fields = [
-        "number",
-        "=block_hash",
+        "==number",
+        "==block_hash",
     ]
     ordering = ["-number"]
 
 
-class TokenTransferAdmin(BinarySearchAdmin):
+class TokenTransferAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     date_hierarchy = "timestamp"
     list_display = (
         "timestamp",
@@ -140,7 +141,7 @@ class TokenTransferAdmin(BinarySearchAdmin):
     )
     list_select_related = ("ethereum_tx",)
     ordering = ["-timestamp"]
-    search_fields = ["=_from", "=to", "=address", "=ethereum_tx__tx_hash"]
+    search_fields = ["==_from", "==to", "==address", "==ethereum_tx__tx_hash"]
     raw_id_fields = ("ethereum_tx",)
 
 
@@ -169,7 +170,7 @@ class ERC721TransferAdmin(TokenTransferAdmin):
 
 
 @admin.register(EthereumTx)
-class EthereumTxAdmin(BinarySearchAdmin):
+class EthereumTxAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     inlines = (
         ERC20TransferInline,
         ERC721TransferInline,
@@ -179,13 +180,13 @@ class EthereumTxAdmin(BinarySearchAdmin):
     )
     list_display = ("block_id", "tx_hash", "nonce", "_from", "to")
     list_filter = ("status", "type")
-    search_fields = ["=tx_hash", "=_from", "=to"]
+    search_fields = ["==block_id", "==tx_hash", "==_from", "==to"]
     ordering = ["-block_id"]
     raw_id_fields = ("block",)
 
 
 @admin.register(InternalTx)
-class InternalTxAdmin(BinarySearchAdmin):
+class InternalTxAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     date_hierarchy = "timestamp"
     inlines = (InternalTxDecodedInline,)
     list_display = (
@@ -207,16 +208,16 @@ class InternalTxAdmin(BinarySearchAdmin):
     ]
     raw_id_fields = ("ethereum_tx",)
     search_fields = [
-        "block_number",
-        "=_from",
-        "=to",
-        "=ethereum_tx__tx_hash",
-        "=contract_address",
+        "==block_number",
+        "==_from",
+        "==to",
+        "==ethereum_tx__tx_hash",
+        "==contract_address",
     ]
 
 
 class InternalTxDecodedOfficialListFilter(admin.SimpleListFilter):
-    title = "Gnosis official Safes"
+    title = "Official Safes"
     parameter_name = "official_safes"
 
     def lookups(self, request, model_admin):
@@ -237,7 +238,7 @@ class InternalTxDecodedOfficialListFilter(admin.SimpleListFilter):
 
 
 @admin.register(InternalTxDecoded)
-class InternalTxDecodedAdmin(BinarySearchAdmin):
+class InternalTxDecodedAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     actions = ["process_again"]
     list_display = (
         "block_number",
@@ -257,11 +258,11 @@ class InternalTxDecodedAdmin(BinarySearchAdmin):
     ]
     raw_id_fields = ("internal_tx",)
     search_fields = [
-        "=function_name",
-        "=internal_tx__to",
-        "=internal_tx___from",
-        "=internal_tx__ethereum_tx__tx_hash",
-        "=internal_tx__block_number",
+        "==function_name",
+        "==internal_tx__to",
+        "==internal_tx___from",
+        "==internal_tx__ethereum_tx__tx_hash",
+        "==internal_tx__block_number",
     ]
 
     @admin.action(description="Process internal tx again")
@@ -287,7 +288,7 @@ class MultisigConfirmationListFilter(admin.SimpleListFilter):
 
 
 @admin.register(MultisigConfirmation)
-class MultisigConfirmationAdmin(BinarySearchAdmin):
+class MultisigConfirmationAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     list_display = (
         "block_number",
         "multisig_transaction_hash",
@@ -301,10 +302,10 @@ class MultisigConfirmationAdmin(BinarySearchAdmin):
     ordering = ["-created"]
     raw_id_fields = ("ethereum_tx", "multisig_transaction")
     search_fields = [
-        "=multisig_transaction__safe",
-        "=ethereum_tx__tx_hash",
-        "=multisig_transaction_hash",
-        "=owner",
+        "==multisig_transaction__safe",
+        "==ethereum_tx__tx_hash",
+        "==multisig_transaction_hash",
+        "==owner",
     ]
 
     @admin.display()
@@ -356,7 +357,7 @@ class MultisigTransactionAdminForm(forms.ModelForm):
 
 
 @admin.register(MultisigTransaction)
-class MultisigTransactionAdmin(BinarySearchAdmin):
+class MultisigTransactionAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     date_hierarchy = "created"
     form = MultisigTransactionAdminForm
     inlines = (MultisigConfirmationInline,)
@@ -382,7 +383,7 @@ class MultisigTransactionAdmin(BinarySearchAdmin):
     ordering = ["-created"]
     raw_id_fields = ("ethereum_tx",)
     readonly_fields = ("safe_tx_hash",)
-    search_fields = ["=ethereum_tx__tx_hash", "=safe", "=to", "=safe_tx_hash"]
+    search_fields = ["==ethereum_tx__tx_hash", "==safe", "==to", "==safe_tx_hash"]
 
     @admin.display(boolean=True)
     def executed(self, obj: MultisigTransaction):
@@ -404,7 +405,7 @@ class MultisigTransactionAdmin(BinarySearchAdmin):
         # Calculate new tx hash
         # All the numbers are decimals, they need to be parsed as integers for SafeTx
         safe_tx = SafeTx(
-            EthereumClientProvider(),
+            get_auto_ethereum_client(),
             obj.safe,
             obj.to,
             int(obj.value),
@@ -423,7 +424,7 @@ class MultisigTransactionAdmin(BinarySearchAdmin):
 
 
 @admin.register(ModuleTransaction)
-class ModuleTransactionAdmin(BinarySearchAdmin):
+class ModuleTransactionAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     date_hierarchy = "created"
     list_display = (
         "created",
@@ -440,7 +441,7 @@ class ModuleTransactionAdmin(BinarySearchAdmin):
     list_select_related = ("internal_tx",)
     ordering = ["-created"]
     raw_id_fields = ("internal_tx",)
-    search_fields = ["=safe", "=module", "=to"]
+    search_fields = ["==safe", "==module", "==to"]
 
     def data_hex(self, o: ModuleTransaction):
         return HexBytes(o.data.tobytes()).hex() if o.data else None
@@ -449,11 +450,10 @@ class ModuleTransactionAdmin(BinarySearchAdmin):
         return o.internal_tx.ethereum_tx_id
 
 
-class MonitoredAddressAdmin(BinarySearchAdmin):
+class MonitoredAddressAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     actions = ["reindex", "reindex_last_day", "reindex_last_week", "reindex_last_month"]
     list_display = ("address", "initial_block_number", "tx_block_number")
-    readonly_fields = ["initial_block_number"]
-    search_fields = ["=address"]
+    search_fields = ["==address"]
 
     @admin.action(description="Reindex from initial block")
     def reindex(self, request, queryset):
@@ -517,7 +517,7 @@ class SafeContractERC20ListFilter(admin.SimpleListFilter):
         )
 
     def queryset(self, request, queryset):
-        current_block_number = EthereumClientProvider().current_block_number
+        current_block_number = get_auto_ethereum_client().current_block_number
         condition = {"erc20_block_number__gte": current_block_number - 200}
         if self.value() == "YES":
             return queryset.filter(**condition)
@@ -526,27 +526,32 @@ class SafeContractERC20ListFilter(admin.SimpleListFilter):
 
 
 @admin.register(SafeContract)
-class SafeContractAdmin(BinarySearchAdmin):
+class SafeContractAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     inlines = (SafeContractDelegateInline,)
     list_display = (
         "created_block_number",
+        "banned",
         "address",
         "ethereum_tx_id",
     )
-    list_filter = (SafeContractERC20ListFilter,)
+    list_filter = (SafeContractERC20ListFilter, "banned")
     list_select_related = ("ethereum_tx",)
     ordering = ["-ethereum_tx__block_id"]
     raw_id_fields = ("ethereum_tx",)
-    search_fields = ["=address", "=ethereum_tx__tx_hash"]
+    search_fields = [
+        "==address",
+        "==ethereum_tx__tx_hash",
+        "==ethereum_tx__block_id",
+    ]
 
 
 @admin.register(SafeContractDelegate)
-class SafeContractDelegateAdmin(BinarySearchAdmin):
+class SafeContractDelegateAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     list_display = ("safe_contract", "read", "write", "delegate", "delegator")
     list_filter = ("read", "write")
     ordering = ["safe_contract_id"]
     raw_id_fields = ("safe_contract",)
-    search_fields = ["=safe_contract__address", "=delegate", "=delegator"]
+    search_fields = ["==safe_contract__address", "==delegate", "==delegator"]
 
 
 class SafeStatusModulesListFilter(admin.SimpleListFilter):
@@ -568,7 +573,7 @@ class SafeStatusModulesListFilter(admin.SimpleListFilter):
 
 
 @admin.register(SafeLastStatus)
-class SafeLastStatusAdmin(BinarySearchAdmin):
+class SafeLastStatusAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     actions = ["remove_and_index"]
     fields = (
         "internal_tx",
@@ -607,9 +612,9 @@ class SafeLastStatusAdmin(BinarySearchAdmin):
     ordering = ["-internal_tx__ethereum_tx__block_id", "-internal_tx_id"]
     raw_id_fields = ("internal_tx",)
     search_fields = [
-        "=address",
+        "==address",
         "owners__icontains",
-        "=internal_tx__ethereum_tx__tx_hash",
+        "==internal_tx__ethereum_tx__tx_hash",
         "enabled_modules__icontains",
     ]
 
@@ -631,31 +636,3 @@ class SafeLastStatusAdmin(BinarySearchAdmin):
 @admin.register(SafeStatus)
 class SafeStatusAdmin(SafeLastStatusAdmin):
     pass
-
-
-@admin.register(WebHook)
-class WebHookAdmin(BinarySearchAdmin):
-    list_display = (
-        "pk",
-        "url",
-        "authorization",
-        "address",
-        "pending_multisig_transaction",
-        "new_confirmation",
-        "new_executed_multisig_transaction",
-        "new_incoming_transaction",
-        "new_safe",
-        "new_module_transaction",
-        "new_outgoing_transaction",
-    )
-    list_filter = (
-        "pending_multisig_transaction",
-        "new_confirmation",
-        "new_executed_multisig_transaction",
-        "new_incoming_transaction",
-        "new_safe",
-        "new_module_transaction",
-        "new_outgoing_transaction",
-    )
-    ordering = ["-pk"]
-    search_fields = ["=address", "url"]

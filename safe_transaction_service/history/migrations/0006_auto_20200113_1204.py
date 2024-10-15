@@ -2,11 +2,10 @@
 
 from django.db import migrations
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0005_multisigtransaction_failed"),
     ]
@@ -15,11 +14,11 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name="multisigtransaction",
             name="nonce",
-            field=gnosis.eth.django.models.Uint256Field(db_index=True),
+            field=safe_eth.eth.django.models.Uint256Field(db_index=True),
         ),
         migrations.AlterField(
             model_name="multisigtransaction",
             name="safe",
-            field=gnosis.eth.django.models.EthereumAddressField(db_index=True),
+            field=safe_eth.eth.django.models.EthereumAddressField(db_index=True),
         ),
     ]

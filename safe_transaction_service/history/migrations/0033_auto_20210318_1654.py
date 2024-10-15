@@ -4,11 +4,10 @@ import django.contrib.postgres.fields
 import django.contrib.postgres.indexes
 from django.db import migrations
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0032_webhook_new_module_transaction"),
     ]
@@ -18,7 +17,7 @@ class Migration(migrations.Migration):
             model_name="safestatus",
             name="owners",
             field=django.contrib.postgres.fields.ArrayField(
-                base_field=gnosis.eth.django.models.EthereumAddressField(), size=None
+                base_field=safe_eth.eth.django.models.EthereumAddressField(), size=None
             ),
         ),
         migrations.AddIndex(

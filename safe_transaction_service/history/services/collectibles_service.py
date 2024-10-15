@@ -16,8 +16,8 @@ from cache_memoize import cache_memoize
 from cachetools import TTLCache, cachedmethod
 from eth_typing import ChecksumAddress
 from redis import Redis
-
-from gnosis.eth import EthereumClient, EthereumClientProvider
+from safe_eth.eth import EthereumClient, EthereumNetwork, get_auto_ethereum_client
+from safe_eth.eth.clients import EnsClient
 
 from safe_transaction_service.tokens.constants import (
     CRYPTO_KITTIES_CONTRACT_ADDRESSES,
@@ -27,7 +27,6 @@ from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.utils import chunks
 
-from ..clients import EnsClient
 from ..exceptions import NodeConnectionException
 from ..models import ERC721Transfer
 
@@ -138,7 +137,7 @@ class CollectibleWithMetadata(Collectible):
 class CollectiblesServiceProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            cls.instance = CollectiblesService(EthereumClientProvider(), get_redis())
+            cls.instance = CollectiblesService(get_auto_ethereum_client(), get_redis())
 
         return cls.instance
 
@@ -161,12 +160,46 @@ class CollectiblesService:
         self.ethereum_client = ethereum_client
         self.ethereum_network = ethereum_client.get_network()
         self.redis = redis
-        self.ens_service: EnsClient = EnsClient(self.ethereum_network.value)
+
+        base_url = settings.ENS_SUBGRAPH_URL
+        api_key = settings.ENS_SUBGRAPH_API_KEY
+        subgraph_id = settings.ENS_SUBGRAPH_ID
+
+        # If the ENS subgraph is configured, always use it
+        if base_url and api_key and subgraph_id:
+            config = EnsClient.SubgraphConfig(
+                base_url=base_url,
+                api_key=api_key,
+                subgraph_id=subgraph_id,
+            )
+        # Else, provide fallback for Sepolia, Holesky and Mainnet
+        else:
+            logger.warning(
+                "Using fallback EnsClient configuration. This configuration is not suitable for production and it is "
+                "recommended to setup a Subgraph API key. See https://docs.ens.domains/web/subgraph"
+            )
+            config = self.fallback_ens_client()
+
+        self.ens_service: EnsClient = EnsClient(config=config)
 
         self.cache_token_info: TTLCache[ChecksumAddress, Erc721InfoWithLogo] = TTLCache(
             maxsize=4096, ttl=self.TOKEN_EXPIRATION
         )
         self.ens_image_url = settings.TOKENS_ENS_IMAGE_URL
+
+    def fallback_ens_client(self) -> EnsClient.Config:
+        if self.ethereum_network == EthereumNetwork.SEPOLIA:
+            return EnsClient.Config(
+                "https://api.studio.thegraph.com/query/49574/enssepolia/version/latest",
+            )
+        elif self.ethereum_network == EthereumNetwork.HOLESKY:
+            return EnsClient.Config(
+                "https://api.studio.thegraph.com/query/49574/ensholesky/version/latest",
+            )
+        else:
+            return EnsClient.Config(
+                "https://api.thegraph.com/subgraphs/name/ensdomains/ens/",
+            )
 
     def get_metadata_cache_key(self, address: str, token_id: int):
         return f"metadata:{address}:{token_id}"
@@ -489,9 +522,9 @@ class CollectiblesService:
         # Creates a collectibles metadata keeping the initial order
         for collectible_metadata_cached_index in range(len(collectibles_with_metadata)):
             if collectibles_with_metadata[collectible_metadata_cached_index] is None:
-                collectibles_with_metadata[
-                    collectible_metadata_cached_index
-                ] = collectibles_with_metadata_not_cached.pop(0)
+                collectibles_with_metadata[collectible_metadata_cached_index] = (
+                    collectibles_with_metadata_not_cached.pop(0)
+                )
 
         return collectibles_with_metadata, count
 
@@ -607,9 +640,9 @@ class CollectiblesService:
         if blockchain_token_uris:
             pipe = self.redis.pipeline()
             redis_map_to_store = {
-                get_redis_key(address_with_token_id): token_uri
-                if token_uri is not None
-                else ""
+                get_redis_key(address_with_token_id): (
+                    token_uri if token_uri is not None else ""
+                )
                 for address_with_token_id, token_uri in blockchain_token_uris.items()
             }
             pipe.mset(redis_map_to_store)

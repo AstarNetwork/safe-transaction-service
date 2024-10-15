@@ -6,7 +6,6 @@ import safe_transaction_service.history.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0057_alter_webhook_authorization"),
     ]
@@ -17,9 +16,7 @@ class Migration(migrations.Migration):
             name="url",
             field=models.CharField(
                 max_length=255,
-                validators=[
-                    safe_transaction_service.history.models._validate_webhook_url
-                ],
+                validators=[safe_transaction_service.history.utils.validate_url],
             ),
         ),
     ]

@@ -2,6 +2,7 @@ import itertools
 import operator
 from functools import cache, cached_property
 from logging import getLogger
+from threading import Lock
 from typing import (
     Any,
     Dict,
@@ -23,24 +24,25 @@ from eth_abi.exceptions import DecodingError
 from eth_typing import ChecksumAddress, HexStr
 from eth_utils import function_abi_to_4byte_selector
 from hexbytes import HexBytes
+from safe_eth.eth.contracts import (
+    get_erc20_contract,
+    get_erc721_contract,
+    get_kyber_network_proxy_contract,
+    get_multi_send_contract,
+    get_safe_to_l2_migration_contract,
+    get_safe_V0_0_1_contract,
+    get_safe_V1_0_0_contract,
+    get_safe_V1_1_1_contract,
+    get_safe_V1_3_0_contract,
+    get_safe_V1_4_1_contract,
+    get_uniswap_exchange_contract,
+)
+from safe_eth.safe.multi_send import MultiSend
 from web3 import Web3
 from web3._utils.abi import get_abi_input_names, get_abi_input_types, map_abi_data
 from web3._utils.normalizers import BASE_RETURN_NORMALIZERS
 from web3.contract import Contract
 from web3.types import ABIFunction
-
-from gnosis.eth.contracts import (
-    get_erc20_contract,
-    get_erc721_contract,
-    get_kyber_network_proxy_contract,
-    get_multi_send_contract,
-    get_safe_V0_0_1_contract,
-    get_safe_V1_0_0_contract,
-    get_safe_V1_1_1_contract,
-    get_safe_V1_3_0_contract,
-    get_uniswap_exchange_contract,
-)
-from gnosis.safe.multi_send import MultiSend
 
 from safe_transaction_service.contracts.models import ContractAbi
 from safe_transaction_service.utils.utils import running_on_gevent
@@ -117,6 +119,9 @@ class MultisendDecoded(TypedDict):
     data_decoded: Optional[DataDecoded]
 
 
+mutex = Lock()
+
+
 @cache
 def get_db_tx_decoder() -> "DbTxDecoder":
     """
@@ -126,16 +131,19 @@ def get_db_tx_decoder() -> "DbTxDecoder":
         the ``DbTxDecoder`` multiple times, and depending on the number of Contracts in the database it could
         take a lot.
     """
+    with mutex:
+        if is_db_tx_decoder_loaded():
+            return get_db_tx_decoder()
 
-    def _get_db_tx_decoder() -> "DbTxDecoder":
-        return DbTxDecoder()
+        def _get_db_tx_decoder() -> "DbTxDecoder":
+            return DbTxDecoder()
 
-    if running_on_gevent():
-        # It's a very intensive CPU task, so to prevent blocking
-        # http://www.gevent.org/api/gevent.threadpool.html
-        pool = gevent.get_hub().threadpool
-        return pool.spawn(_get_db_tx_decoder).get()
-    return _get_db_tx_decoder()
+        if running_on_gevent():
+            # It's a very intensive CPU task, so to prevent blocking
+            # http://www.gevent.org/api/gevent.threadpool.html
+            pool = gevent.get_hub().threadpool
+            return pool.spawn(_get_db_tx_decoder).get()
+        return _get_db_tx_decoder()
 
 
 def is_db_tx_decoder_loaded() -> bool:
@@ -163,9 +171,9 @@ class SafeTxDecoder:
 
     def __init__(self):
         logger.info("%s: Loading contract ABIs for decoding", self.__class__.__name__)
-        self.fn_selectors_with_abis: Dict[
-            bytes, ABIFunction
-        ] = self._generate_selectors_with_abis_from_abis(self.get_supported_abis())
+        self.fn_selectors_with_abis: Dict[bytes, ABIFunction] = (
+            self._generate_selectors_with_abis_from_abis(self.get_supported_abis())
+        )
         logger.info(
             "%s: Contract ABIs for decoding were loaded", self.__class__.__name__
         )
@@ -334,6 +342,7 @@ class SafeTxDecoder:
             get_safe_V1_0_0_contract(self.dummy_w3).abi,
             get_safe_V1_1_1_contract(self.dummy_w3).abi,
             get_safe_V1_3_0_contract(self.dummy_w3).abi,
+            get_safe_V1_4_1_contract(self.dummy_w3).abi,
         ]
 
         # Order is important. If signature is the same (e.g. renaming of `baseGas`) last elements in the list
@@ -468,6 +477,9 @@ class TxDecoder(SafeTxDecoder):
         ]
 
         gnosis_safe = [gnosis_safe_allowance_module_abi]
+
+        safe_to_l2_migration = [get_safe_to_l2_migration_contract(self.dummy_w3).abi]
+
         erc_contracts = [
             get_erc721_contract(self.dummy_w3).abi,
             get_erc20_contract(self.dummy_w3).abi,
@@ -494,6 +506,7 @@ class TxDecoder(SafeTxDecoder):
             + sight_contracts
             + gnosis_protocol
             + gnosis_safe
+            + safe_to_l2_migration
             + erc_contracts
             + self.multisend_abis
             + supported_abis

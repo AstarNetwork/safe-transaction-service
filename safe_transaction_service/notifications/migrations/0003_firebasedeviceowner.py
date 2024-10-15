@@ -3,11 +3,10 @@
 import django.db.models.deletion
 from django.db import migrations, models
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("notifications", "0002_auto_20200806_1534"),
     ]
@@ -25,7 +24,10 @@ class Migration(migrations.Migration):
                         verbose_name="ID",
                     ),
                 ),
-                ("owner", gnosis.eth.django.models.EthereumAddressField(db_index=True)),
+                (
+                    "owner",
+                    safe_eth.eth.django.models.EthereumAddressField(db_index=True),
+                ),
                 (
                     "firebase_device",
                     models.ForeignKey(

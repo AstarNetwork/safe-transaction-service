@@ -7,19 +7,20 @@ from unittest.mock import MagicMock, patch
 from django.test import TestCase
 from django.utils import timezone
 
-import requests
 from eth_account import Account
 
-from gnosis.eth import EthereumClient, EthereumNetwork
-
 from ...utils.redis import get_redis
+from ..indexers import (
+    Erc20EventsIndexerProvider,
+    InternalTxIndexerProvider,
+    SafeEventsIndexerProvider,
+)
 from ..models import MultisigTransaction, SafeContract, SafeLastStatus, SafeStatus
 from ..services import CollectiblesService, CollectiblesServiceProvider, IndexService
 from ..services.collectibles_service import CollectibleWithMetadata
 from ..tasks import (
     check_reorgs_task,
     check_sync_status_task,
-    get_webhook_http_session,
     index_erc20_events_out_of_sync_task,
     index_erc20_events_task,
     index_internal_txs_task,
@@ -36,20 +37,28 @@ from ..tasks import (
     retry_get_metadata_task,
 )
 from .factories import (
-    ERC20TransferFactory,
     EthereumBlockFactory,
     InternalTxDecodedFactory,
-    InternalTxFactory,
     MultisigTransactionFactory,
     SafeContractFactory,
     SafeStatusFactory,
-    WebHookFactory,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class TestTasks(TestCase):
+    def _delete_singletons(self):
+        Erc20EventsIndexerProvider.del_singleton()
+        InternalTxIndexerProvider.del_singleton()
+        SafeEventsIndexerProvider.del_singleton()
+
+    def setUp(self):
+        self._delete_singletons()
+
+    def tearDown(self):
+        self._delete_singletons()
+
     def test_check_reorgs_task(self):
         self.assertIsNone(check_reorgs_task.delay().result, 0)
 
@@ -67,8 +76,9 @@ class TestTasks(TestCase):
         with self.assertLogs(logger=task_logger) as cm:
             safe_contract = SafeContractFactory()
             index_erc20_events_out_of_sync_task.delay()
+            addresses = {safe_contract.address}
             self.assertIn(
-                f"Start indexing of erc20/721 events for out of sync addresses {[safe_contract.address]}",
+                f"Start indexing of erc20/721 events for out of sync addresses {addresses}",
                 cm.output[0],
             )
             self.assertIn(
@@ -133,31 +143,6 @@ class TestTasks(TestCase):
             addresses=None,
         )
 
-    @patch.object(EthereumClient, "get_network", return_value=EthereumNetwork.GANACHE)
-    @patch.object(requests.Session, "post")
-    def test_send_webhook_task(self, mock_post: MagicMock, get_network_mock: MagicMock):
-        ERC20TransferFactory()
-
-        with self.assertRaises(AssertionError):
-            mock_post.assert_called()
-
-        to = Account.create().address
-        WebHookFactory(address="")
-        WebHookFactory(address=Account.create().address)
-        WebHookFactory(address=to)
-        InternalTxFactory(to=to)
-        # 3 webhooks: INCOMING_ETHER for Webhook with `to`, and then `INCOMING_ETHER` and `OUTGOING_ETHER`
-        # for the WebHook without address set
-        self.assertEqual(mock_post.call_count, 3)
-
-    def test_get_webhook_http_session(self):
-        session = get_webhook_http_session("http://random-url", None)
-        self.assertNotIn("Authorization", session.headers)
-
-        secret_token = "IDDQD"
-        session = get_webhook_http_session("http://random-url", secret_token)
-        self.assertEqual(session.headers["Authorization"], secret_token)
-
     def test_process_decoded_internal_txs_task(self):
         owner = Account.create().address
         safe_address = Account.create().address
@@ -187,7 +172,7 @@ class TestTasks(TestCase):
         fallback_handler = Account.create().address
         master_copy = Account.create().address
         threshold = 1
-        InternalTxDecodedFactory(
+        internal_tx_decoded = InternalTxDecodedFactory(
             function_name="setup",
             owner=owner,
             threshold=threshold,
@@ -197,50 +182,30 @@ class TestTasks(TestCase):
         )
         SafeContractFactory(address=safe_address, banned=True)
         self.assertTrue(SafeContract.objects.get(address=safe_address).banned)
+        self.assertFalse(internal_tx_decoded.processed)
         process_decoded_internal_txs_task.delay()
+        internal_tx_decoded.refresh_from_db()
+        self.assertTrue(internal_tx_decoded.processed)
         self.assertEqual(SafeStatus.objects.filter(address=safe_address).count(), 0)
 
     def test_process_decoded_internal_txs_for_safe_task(self):
-        # Test corrupted SafeStatus
         safe_status_0 = SafeStatusFactory(nonce=0)
         safe_address = safe_status_0.address
-        safe_status_2 = SafeStatusFactory(nonce=2, address=safe_address)
-        safe_status_5 = SafeStatusFactory(nonce=5, address=safe_address)
-        SafeLastStatus.objects.update_or_create_from_safe_status(safe_status_5)
-        with patch.object(IndexService, "reindex_master_copies") as reindex_mock:
-            with patch.object(IndexService, "reprocess_addresses") as reprocess_mock:
-                with self.assertLogs(logger=task_logger) as cm:
-                    process_decoded_internal_txs_for_safe_task.delay(safe_address)
-                    reprocess_mock.assert_called_with([safe_address])
-                    reindex_mock.assert_called_with(
-                        safe_status_0.block_number,
-                        to_block_number=safe_status_5.block_number,
-                        addresses=[safe_address],
-                    )
-                    self.assertIn(
-                        f"Safe-address={safe_address} A problem was found in SafeStatus "
-                        f"with nonce=2 on internal-tx-id={safe_status_2.internal_tx_id}",
-                        cm.output[1],
-                    )
-                    self.assertIn(
-                        f"Safe-address={safe_address} Processing traces again",
-                        cm.output[2],
-                    )
-                    self.assertIn(
-                        f"Safe-address={safe_address} Last known not corrupted SafeStatus with nonce=0 on "
-                        f"block={safe_status_0.internal_tx.ethereum_tx.block_id} , "
-                        f"reindexing until block={safe_status_5.block_number}",
-                        cm.output[3],
-                    )
-                    self.assertIn(
-                        f"Reindexing master copies from-block={safe_status_0.internal_tx.ethereum_tx.block_id} "
-                        f"to-block={safe_status_5.block_number} addresses={[safe_address]}",
-                        cm.output[4],
-                    )
-                    self.assertIn(
-                        f"Safe-address={safe_address} Processing traces again after reindexing",
-                        cm.output[5],
-                    )
+        SafeLastStatus.objects.update_or_create_from_safe_status(safe_status_0)
+        with self.assertLogs(logger=task_logger) as cm:
+            with patch.object(
+                IndexService, "process_decoded_txs", return_value=5
+            ) as process_decoded_txs_mock:
+                process_decoded_internal_txs_for_safe_task.delay(safe_address)
+                process_decoded_txs_mock.assert_called_with(safe_address)
+                self.assertIn(
+                    f"[{safe_address}] Start processing decoded internal txs",
+                    cm.output[0],
+                )
+                self.assertIn(
+                    f"[{safe_address}] Processed 5 decoded transactions",
+                    cm.output[1],
+                )
 
     @patch.object(CollectiblesService, "get_metadata", autospec=True, return_value={})
     def test_retry_get_metadata_task(self, get_metadata_mock: MagicMock):
@@ -323,13 +288,20 @@ class TestTasks(TestCase):
 
         self.assertEqual(remove_not_trusted_multisig_txs_task.delay().result, 0)
 
-        multisig_tx_expected_to_be_deleted = MultisigTransactionFactory(
-            trusted=False, modified=timezone.now() - datetime.timedelta(days=32)
-        )
-        MultisigTransactionFactory(
+        multisig_tx_expected_to_be_deleted = MultisigTransactionFactory(trusted=False)
+        multisig_tx_not_expected_to_be_deleted = MultisigTransactionFactory(
             trusted=True, modified=timezone.now() - datetime.timedelta(days=32)
         )
+        for multisig_tx in (
+            multisig_tx_expected_to_be_deleted,
+            multisig_tx_not_expected_to_be_deleted,
+        ):
+            # Modified is updated by the factory when saved on PostGeneration
+            MultisigTransaction.objects.filter(
+                safe_tx_hash=multisig_tx.safe_tx_hash
+            ).update(modified=timezone.now() - datetime.timedelta(days=32))
 
+        self.assertEqual(MultisigTransaction.objects.count(), 4)
         self.assertEqual(remove_not_trusted_multisig_txs_task.delay().result, 1)
 
         self.assertFalse(

@@ -6,10 +6,9 @@ from django.core.management import call_command
 from django.test import TestCase
 
 from eth_account import Account
-
-from gnosis.eth import EthereumClientProvider
-from gnosis.eth.ethereum_client import Erc20Info, Erc20Manager
-from gnosis.eth.tests.utils import deploy_example_erc20
+from safe_eth.eth.ethereum_client import Erc20Info, Erc20Manager
+from safe_eth.eth.tests.ethereum_test_case import EthereumTestCaseMixin
+from safe_eth.eth.tests.utils import deploy_erc20
 
 from ..clients import CoinMarketCapClient, CoinMarketCapToken
 from ..models import Token
@@ -34,7 +33,7 @@ relay_token_client_mock = [
         "symbol": "GNO",
         "description": "Crowd Sourced Wisdom - The next generation blockchain network. Speculate on anything with an easy-to-use prediction market",
         "decimals": 18,
-        "websiteUri": "https://gnosis.pm",
+        "websiteUri": "https://safe.global",
         "gas": False,
     },
     {
@@ -45,13 +44,13 @@ relay_token_client_mock = [
         "symbol": "OWL",
         "description": "",
         "decimals": 18,
-        "websiteUri": "https://owl.gnosis.io/",
+        "websiteUri": "https://owl.safe_eth.io/",
         "gas": True,
     },
 ]
 
 
-class TestCommands(TestCase):
+class TestCommands(EthereumTestCaseMixin, TestCase):
     def test_add_token(self):
         command = "add_token"
         buf = StringIO()
@@ -63,8 +62,14 @@ class TestCommands(TestCase):
         token.refresh_from_db()
         self.assertTrue(token.trusted)
 
-        ethereum_client = EthereumClientProvider()
-        erc20 = deploy_example_erc20(ethereum_client.w3, 10, Account.create().address)
+        erc20 = deploy_erc20(
+            self.ethereum_client.w3,
+            self.ethereum_test_account,
+            "Uxio",
+            "UXI",
+            Account.create().address,
+            10,
+        )
         call_command(command, erc20.address, "--no-prompt", stdout=buf)
         self.assertIn("Created token", buf.getvalue())
         self.assertTrue(Token.objects.get(address=erc20.address).trusted)

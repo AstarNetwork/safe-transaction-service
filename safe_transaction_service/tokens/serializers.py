@@ -1,8 +1,7 @@
 from enum import Enum
 
 from rest_framework import serializers
-
-from gnosis.eth.django.serializers import EthereumAddressField
+from safe_eth.eth.django.serializers import EthereumAddressField
 
 from .models import Token
 
@@ -20,6 +19,7 @@ class TokenInfoResponseSerializer(serializers.Serializer):
     symbol = serializers.CharField()
     decimals = serializers.IntegerField()
     logo_uri = serializers.SerializerMethodField()
+    trusted = serializers.BooleanField()
 
     def get_type(self, obj: Token) -> str:
         if obj.is_erc20():

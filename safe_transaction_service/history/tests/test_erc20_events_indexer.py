@@ -1,9 +1,9 @@
 from django.test import TestCase
 
-from gnosis.eth.tests.ethereum_test_case import EthereumTestCaseMixin
+from safe_eth.eth.tests.ethereum_test_case import EthereumTestCaseMixin
 
 from ..indexers import Erc20EventsIndexerProvider
-from ..models import ERC20Transfer, EthereumTx, IndexingStatus
+from ..models import ERC20Transfer, EthereumTx, IndexingStatus, SafeRelevantTransaction
 from .factories import EthereumTxFactory, SafeContractFactory
 from .mocks.mocks_erc20_events_indexer import log_receipt_mock
 
@@ -35,9 +35,19 @@ class TestErc20EventsIndexer(EthereumTestCaseMixin, TestCase):
         self.assertFalse(
             ERC20Transfer.objects.tokens_used_by_address(safe_contract.address)
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 0)
         self.assertEqual(
             erc20_events_indexer.start(),
             (1, self.ethereum_client.current_block_number + 1),
+        )
+
+        # Store one entry for the sender and other for the receiver
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 2)
+        self.assertEqual(
+            SafeRelevantTransaction.objects.filter(
+                safe=safe_contract.address, ethereum_tx_id=tx_hash
+            ).count(),
+            1,
         )
 
         # Erc20/721 last indexed block number is stored on IndexingStatus
@@ -95,4 +105,61 @@ class TestErc20EventsIndexer(EthereumTestCaseMixin, TestCase):
         self.erc20_events_indexer.element_already_processed_checker.clear()
         self.assertEqual(
             len(self.erc20_events_indexer.process_elements(log_receipt_mock)), 1
+        )
+
+    def test_get_almost_updated_addresses(self):
+        self.assertIsNone(self.erc20_events_indexer.addresses_cache)
+        self.assertEqual(
+            self.erc20_events_indexer.get_almost_updated_addresses(0), set()
+        )
+        self.assertIsNone(self.erc20_events_indexer.addresses_cache)
+
+        safe_contract_1 = SafeContractFactory()
+        safe_contract_2 = SafeContractFactory()
+        self.assertGreaterEqual(safe_contract_2.created, safe_contract_1.created)
+
+        expected_addresses = {safe_contract_1.address, safe_contract_2.address}
+        self.assertEqual(
+            self.erc20_events_indexer.get_almost_updated_addresses(0),
+            expected_addresses,
+        )
+        self.assertIsNotNone(self.erc20_events_indexer.addresses_cache)
+        self.assertEqual(
+            self.erc20_events_indexer.addresses_cache.last_checked,
+            safe_contract_2.created,
+        )
+        self.assertEqual(
+            self.erc20_events_indexer.addresses_cache.addresses, expected_addresses
+        )
+
+        # Add a new address to the database
+        safe_contract_3 = SafeContractFactory()
+        self.assertGreater(safe_contract_3.created, safe_contract_2.created)
+
+        expected_addresses.add(safe_contract_3.address)
+        self.assertEqual(
+            self.erc20_events_indexer.get_almost_updated_addresses(0),
+            expected_addresses,
+        )
+        self.assertIsNotNone(self.erc20_events_indexer.addresses_cache)
+        self.assertEqual(
+            self.erc20_events_indexer.addresses_cache.last_checked,
+            safe_contract_3.created,
+        )
+        self.assertEqual(
+            self.erc20_events_indexer.addresses_cache.addresses, expected_addresses
+        )
+
+        # Calling the function again, without adding a new address to the DB, should yield the same results
+        self.assertEqual(
+            self.erc20_events_indexer.get_almost_updated_addresses(0),
+            expected_addresses,
+        )
+        self.assertIsNotNone(self.erc20_events_indexer.addresses_cache)
+        self.assertEqual(
+            self.erc20_events_indexer.addresses_cache.last_checked,
+            safe_contract_3.created,
+        )
+        self.assertEqual(
+            self.erc20_events_indexer.addresses_cache.addresses, expected_addresses
         )

@@ -2,11 +2,10 @@
 
 from django.db import migrations
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0062_add_safe_last_status_20220429_0922"),
     ]
@@ -15,7 +14,7 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name="internaltx",
             name="_from",
-            field=gnosis.eth.django.models.EthereumAddressV2Field(
+            field=safe_eth.eth.django.models.EthereumAddressV2Field(
                 db_index=True, null=True
             ),
         ),

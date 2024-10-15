@@ -1,11 +1,8 @@
-from functools import cache
-
-from gnosis.eth import EthereumClientProvider, EthereumNetwork
+from safe_eth.eth import EthereumNetwork, get_auto_ethereum_client
 
 
-@cache
 def get_chain_id() -> int:
-    return EthereumClientProvider().get_chain_id()
+    return get_auto_ethereum_client().get_chain_id()
 
 
 def get_ethereum_network() -> EthereumNetwork:

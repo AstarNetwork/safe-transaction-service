@@ -2,11 +2,10 @@
 
 from django.db import migrations
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0052_keccak256_field_20211209_1628"),
     ]
@@ -15,7 +14,7 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name="webhook",
             name="address",
-            field=gnosis.eth.django.models.EthereumAddressV2Field(
+            field=safe_eth.eth.django.models.EthereumAddressV2Field(
                 blank=True, db_index=True, null=True
             ),
         ),

@@ -3,11 +3,10 @@
 import django.utils.timezone
 from django.db import migrations, models
 
-import gnosis.eth.django.models
+import safe_eth.eth.django.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("history", "0048_block_number_token_transfers_20211126_1443"),
     ]
@@ -30,12 +29,12 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name="internaltx",
             name="_from",
-            field=gnosis.eth.django.models.EthereumAddressField(null=True),
+            field=safe_eth.eth.django.models.EthereumAddressField(null=True),
         ),
         migrations.AlterField(
             model_name="internaltx",
             name="to",
-            field=gnosis.eth.django.models.EthereumAddressField(null=True),
+            field=safe_eth.eth.django.models.EthereumAddressField(null=True),
         ),
         migrations.AddIndex(
             model_name="internaltx",

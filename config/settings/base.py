@@ -40,8 +40,6 @@ LANGUAGE_CODE = "en-us"
 SITE_ID = 1
 # https://docs.djangoproject.com/en/dev/ref/settings/#use-i18n
 USE_I18N = True
-# https://docs.djangoproject.com/en/dev/ref/settings/#use-l10n
-USE_L10N = True
 # https://docs.djangoproject.com/en/dev/ref/settings/#use-tz
 USE_TZ = True
 # https://docs.djangoproject.com/en/3.2/ref/settings/#force-script-name
@@ -106,13 +104,14 @@ THIRD_PARTY_APPS = [
     "rest_framework.authtoken",
 ]
 LOCAL_APPS = [
+    "safe_transaction_service.account_abstraction.apps.AccountAbstractionConfig",
     "safe_transaction_service.analytics.apps.AnalyticsConfig",
     "safe_transaction_service.contracts.apps.ContractsConfig",
+    "safe_transaction_service.events.apps.EventsConfig",
     "safe_transaction_service.history.apps.HistoryConfig",
     "safe_transaction_service.notifications.apps.NotificationsConfig",
     "safe_transaction_service.safe_messages.apps.SafeMessagesConfig",
     "safe_transaction_service.tokens.apps.TokensConfig",
-    "safe_transaction_service.events.apps.EventsConfig",
 ]
 # https://docs.djangoproject.com/en/dev/ref/settings/#installed-apps
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -229,15 +228,21 @@ CELERY_BROKER_POOL_LIMIT = env.int("CELERY_BROKER_POOL_LIMIT", default=0)
 CELERY_BROKER_HEARTBEAT = env.int("CELERY_BROKER_HEARTBEAT", default=0)
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-broker_connection_max_retries
-CELERY_BROKER_CONNECTION_MAX_RETRIES = env.int(
-    "CELERY_BROKER_CONNECTION_MAX_RETRIES", default=0
+CELERY_BROKER_CONNECTION_MAX_RETRIES = (
+    value
+    if (value := env.int("CELERY_BROKER_CONNECTION_MAX_RETRIES", default=-1)) > 0
+    else None
 )
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#broker-channel-error-retry
 CELERY_BROKER_CHANNEL_ERROR_RETRY = env.bool(
     "CELERY_BROKER_CHANNEL_ERROR_RETRY", default=True
 )
-# http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-result_backend
-CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default="redis://")
+# https://docs.celeryq.dev/en/stable/userguide/configuration.html#broker-connection-retry-on-startup
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = env.bool(
+    "CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP", default=True
+)
+# https://docs.celeryq.dev/en/latest/userguide/configuration.html#task-result-backend-settings
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=None)
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-accept_content
 CELERY_ACCEPT_CONTENT = ["json"]
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-task_serializer
@@ -262,10 +267,6 @@ CELERY_ROUTES = (
         (
             "safe_transaction_service.history.tasks.retry_get_metadata_task",
             {"queue": "tokens", "delivery_mode": "transient"},
-        ),
-        (
-            "safe_transaction_service.history.tasks.send_webhook_task",
-            {"queue": "webhooks", "delivery_mode": "transient"},
         ),
         (
             "safe_transaction_service.events.tasks.send_event_to_queue_task",
@@ -421,6 +422,9 @@ LOGGING = {
             "handlers": ["console", "mail_admins"],
             "propagate": True,
         },
+        "pika": {
+            "propagate": True if DEBUG else False,
+        },
     },
 }
 
@@ -430,6 +434,18 @@ REDIS_URL = env("REDIS_URL", default="redis://localhost:6379/0")
 # ------------------------------------------------------------------------------
 ETHEREUM_NODE_URL = env("ETHEREUM_NODE_URL", default=None)
 
+# Ethereum 4337 Bundler RPC
+# ------------------------------------------------------------------------------
+ETHEREUM_4337_BUNDLER_URL = env("ETHEREUM_4337_BUNDLER_URL", default=None)
+ETHEREUM_4337_SUPPORTED_ENTRY_POINTS = env.list(
+    "ETHEREUM_4337_SUPPORTED_ENTRY_POINTS",
+    default=["0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789"],
+)
+ETHEREUM_4337_SUPPORTED_SAFE_MODULES = env.list(
+    "ETHEREUM_4337_SUPPORTED_SAFE_MODULES",
+    default=["0xa581c4A4DB7175302464fF3C06380BC3270b4037"],
+)
+
 # Tracing indexing configuration (not useful for L2 indexing)
 # ------------------------------------------------------------------------------
 ETHEREUM_TRACING_NODE_URL = env("ETHEREUM_TRACING_NODE_URL", default=None)
@@ -437,7 +453,7 @@ ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT = env.int(
     "ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT", default=10_000
 )
 ETH_INTERNAL_TXS_BLOCKS_TO_REINDEX_AGAIN = env.int(
-    "ETH_INTERNAL_TXS_BLOCKS_TO_REINDEX_AGAIN", default=10
+    "ETH_INTERNAL_TXS_BLOCKS_TO_REINDEX_AGAIN", default=1
 )
 ETH_INTERNAL_TXS_NUMBER_TRACE_BLOCKS = env.int(
     "ETH_INTERNAL_TXS_NUMBER_TRACE_BLOCKS", default=10
@@ -464,7 +480,7 @@ ETH_EVENTS_BLOCK_PROCESS_LIMIT_MAX = env.int(
     "ETH_EVENTS_BLOCK_PROCESS_LIMIT_MAX", default=0
 )  # Maximum number of blocks to process together when searching for events. 0 == no limit.
 ETH_EVENTS_BLOCKS_TO_REINDEX_AGAIN = env.int(
-    "ETH_EVENTS_BLOCKS_TO_REINDEX_AGAIN", default=20
+    "ETH_EVENTS_BLOCKS_TO_REINDEX_AGAIN", default=2
 )  # Blocks to reindex again every indexer run when service is synced. Useful for RPCs not reliable
 ETH_EVENTS_GET_LOGS_CONCURRENCY = env.int(
     "ETH_EVENTS_GET_LOGS_CONCURRENCY", default=20
@@ -496,9 +512,13 @@ TOKENS_ERC20_GET_BALANCES_BATCH = env.int(
     "TOKENS_ERC20_GET_BALANCES_BATCH", default=2_000
 )  # Number of tokens to get balances from in the same request. From 2_500 some nodes raise HTTP 413
 
-TOKEN_ETH_PRICE_TTL = env.int(
-    "TOKEN_ETH_PRICE_TTL", default=60 * 30  # 30 minutes
-)  # Expiration time for token eth price
+# ENS
+# ------------------------------------------------------------------------------
+# See https://docs.ens.domains/web/subgraph for more details
+
+ENS_SUBGRAPH_URL = env.str("ENS_SUBGRAPH_URL", default=None)
+ENS_SUBGRAPH_API_KEY = env.str("ENS_SUBGRAPH_API_KEY", default=None)
+ENS_SUBGRAPH_ID = env.str("ENS_SUBGRAPH_ID", default=None)
 
 # Notifications
 # ------------------------------------------------------------------------------
@@ -524,8 +544,10 @@ if NOTIFICATIONS_FIREBASE_CREDENTIALS_PATH:
 # Events
 # ------------------------------------------------------------------------------
 EVENTS_QUEUE_URL = env("EVENTS_QUEUE_URL", default=None)
-EVENTS_QUEUE_ASYNC_CONNECTION = env("EVENTS_QUEUE_ASYNC_CONNECTION", default=False)
 EVENTS_QUEUE_EXCHANGE_NAME = env("EVENTS_QUEUE_EXCHANGE_NAME", default="amq.fanout")
+EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT = env.int(
+    "EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT", default=0
+)
 
 # Cache
 CACHE_ALL_TXS_VIEW = env.int(
@@ -554,4 +576,17 @@ SWAGGER_SETTINGS = {
     "SECURITY_DEFINITIONS": {
         "api_key": {"type": "apiKey", "in": "header", "name": "Authorization"}
     },
+    "DEFAULT_AUTO_SCHEMA_CLASS": "safe_transaction_service.utils.swagger.CustomSwaggerSchema",
 }
+
+# Shell Plus
+# ------------------------------------------------------------------------------
+SHELL_PLUS_PRINT_SQL_TRUNCATE = env.int("SHELL_PLUS_PRINT_SQL_TRUNCATE", default=10_000)
+
+# Endpoints
+TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS = env.int(
+    "TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS", default=1_000
+)  # Don't return more than 1_000 transfers
+
+# Compression level – an integer from 0 to 9. 0 means not compression
+CACHE_ALL_TXS_COMPRESSION_LEVEL = env.int("CACHE_ALL_TXS_COMPRESSION_LEVEL", default=0)
