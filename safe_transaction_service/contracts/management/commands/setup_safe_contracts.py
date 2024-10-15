@@ -1,13 +1,13 @@
 from django.core.files import File
 from django.core.management import BaseCommand, CommandError
 
-from gnosis.eth import get_auto_ethereum_client
-from gnosis.safe.safe_deployments import safe_deployments
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.safe.safe_deployments import safe_deployments
 
 from config.settings.base import STATICFILES_DIRS
 from safe_transaction_service.contracts.models import Contract
 
-TRUSTED_FOR_DELEGATE_CALL = ["MultiSendCallOnly"]
+TRUSTED_FOR_DELEGATE_CALL = ["MultiSendCallOnly", "MultiSend"]
 
 
 def generate_safe_contract_display_name(contract_name: str, version: str) -> str:
@@ -28,7 +28,7 @@ def generate_safe_contract_display_name(contract_name: str, version: str) -> str
 
 
 class Command(BaseCommand):
-    help = "Update or create Safe contracts with provided logo"
+    help = "Create or update the Safe contracts with default data. A different logo can be provided"
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -50,7 +50,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         """
-        Command to create or update Safe contracts with provided logo.
+        Command to create or update Safe contracts with default data. A different contract logo can be provided.
 
         :param args:
         :param options: Safe version and logo path
@@ -80,7 +80,7 @@ class Command(BaseCommand):
 
         for version in versions:
             for contract_name, addresses in safe_deployments[version].items():
-                if (contract_address := addresses.get(str(chain_id))) is not None:
+                for contract_address in addresses.get(str(chain_id), []):
                     display_name = generate_safe_contract_display_name(
                         contract_name, version
                     )

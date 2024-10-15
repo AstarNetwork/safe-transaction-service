@@ -36,19 +36,18 @@ from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
 from model_utils.models import TimeStampedModel
 from packaging.version import Version
-from web3.types import EventData
-
-from gnosis.eth.constants import ERC20_721_TRANSFER_TOPIC, NULL_ADDRESS
-from gnosis.eth.django.models import (
+from safe_eth.eth.constants import ERC20_721_TRANSFER_TOPIC, NULL_ADDRESS
+from safe_eth.eth.django.models import (
     EthereumAddressBinaryField,
     HexV2Field,
     Keccak256Field,
     Uint256Field,
 )
-from gnosis.eth.utils import fast_to_checksum_address
-from gnosis.safe import SafeOperationEnum
-from gnosis.safe.safe import SafeInfo
-from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.eth.utils import fast_to_checksum_address
+from safe_eth.safe import SafeOperationEnum
+from safe_eth.safe.safe import SafeInfo
+from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
+from web3.types import EventData
 
 from safe_transaction_service.account_abstraction.constants import (
     USER_OPERATION_EVENT_TOPIC,
@@ -492,10 +491,24 @@ class TokenTransferQuerySet(models.QuerySet):
 
 
 class TokenTransferManager(BulkCreateSignalMixin, models.Manager):
-    def tokens_used_by_address(self, address: ChecksumAddress) -> Set[ChecksumAddress]:
-        return set(
-            self.to_or_from(address).values_list("address", flat=True).distinct()
-        )
+    def tokens_used_by_address(self, address: ChecksumAddress) -> list[ChecksumAddress]:
+        """
+        :param address:
+        :return: All the token addresses an `address` has sent or received
+        """
+        q1 = self.filter(_from=address).distinct()
+        q2 = self.filter(to=address).distinct()
+        return q1.union(q2).values_list("address", flat=True)
+
+    def fast_count(self, address: ChecksumAddress) -> int:
+        """
+        :param address:
+        :return: Optimized count using database indexes for the number of transfers for an address.
+                 Transfers sent from an address to itself (not really common) will be counted twice
+        """
+        q1 = self.filter(_from=address)
+        q2 = self.filter(to=address)
+        return q1.union(q2, all=True).count()
 
 
 class TokenTransfer(models.Model):
@@ -514,6 +527,8 @@ class TokenTransfer(models.Model):
             Index(fields=["address"]),
             Index(fields=["_from", "timestamp"]),
             Index(fields=["to", "timestamp"]),
+            Index(fields=["_from", "address"]),  # Get token addresses used by a sender
+            Index(fields=["to", "address"]),  # Get token addresses used by a receiver
         ]
         constraints = [
             models.UniqueConstraint(
@@ -1912,7 +1927,11 @@ class SafeStatusBase(models.Model):
         """
         SafeStatus nonce must be incremental. If current nonce is bigger than the number of SafeStatus for that Safe
         something is wrong. There could be more SafeStatus than nonce (e.g. a call to a MultiSend
-        adding owners and enabling a Module in the same contract `execTransaction`)
+        adding owners and enabling a Module in the same contract `execTransaction`), but never less.
+
+        However, there's the possibility that there isn't a problem in the indexer. For example,
+        in a L2 network a Safe could be migrated from L1 to L2 and some transactions will never be detected
+        by the indexer.
 
         :return: `True` if corrupted, `False` otherwise
         """

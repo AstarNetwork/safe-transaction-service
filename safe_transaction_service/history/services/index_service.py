@@ -7,8 +7,7 @@ from django.db.models import Min, Q
 
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
-
-from gnosis.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
 
 from ..models import EthereumBlock, EthereumTx
 from ..models import IndexingStatus as IndexingStatusDb
@@ -68,6 +67,7 @@ class IndexServiceProvider:
                 get_auto_ethereum_client(),
                 settings.ETH_REORG_BLOCKS,
                 settings.ETH_L2_NETWORK,
+                settings.ETH_INTERNAL_TX_DECODED_PROCESS_BATCH,
             )
         return cls.instance
 
@@ -83,10 +83,19 @@ class IndexService:
         ethereum_client: EthereumClient,
         eth_reorg_blocks: int,
         eth_l2_network: bool,
+        eth_internal_tx_decoded_process_batch: int,
     ):
         self.ethereum_client = ethereum_client
         self.eth_reorg_blocks = eth_reorg_blocks
         self.eth_l2_network = eth_l2_network
+        self.eth_internal_tx_decoded_process_batch = (
+            eth_internal_tx_decoded_process_batch
+        )
+
+        # Prevent circular import
+        from ..indexers.tx_processor import SafeTxProcessor, SafeTxProcessorProvider
+
+        self.tx_processor: SafeTxProcessor = SafeTxProcessorProvider()
 
     def block_get_or_create_from_block_hash(self, block_hash: int):
         try:
@@ -359,7 +368,8 @@ class IndexService:
     ) -> None:
         """
         Fix a Safe that has transactions out of order (not processed transactions
-        in between processed ones, usually due a reindex), by reprocessing all of them
+        in between processed ones, usually due a reindex), by marking
+        them as not processed from the `internal_tx` where the issue was detected.
 
         :param address: Safe to fix
         :param internal_tx: Only reprocess transactions from `internal_tx` and newer
@@ -388,6 +398,38 @@ class IndexService:
         logger.info("[%s] Removing SafeLastStatus", address)
         SafeLastStatus.objects.filter(address=address).delete()
         logger.info("[%s] Ended fixing out of order", address)
+
+    def process_decoded_txs(self, safe_address: ChecksumAddress) -> int:
+        """
+        Process all the pending `InternalTxDecoded` for a Safe
+
+        :param safe_address:
+        :return: Number of `InternalTxDecoded` processed
+        """
+
+        # Check if a new decoded tx appeared before other already processed (due to a reindex)
+        if InternalTxDecoded.objects.out_of_order_for_safe(safe_address):
+            logger.error("[%s] Found out of order transactions", safe_address)
+            self.fix_out_of_order(
+                safe_address,
+                InternalTxDecoded.objects.pending_for_safe(safe_address)[0].internal_tx,
+            )
+            self.tx_processor.clear_cache(safe_address)
+
+        # Use chunks for memory issues
+        total_processed_txs = 0
+        while True:
+            internal_txs_decoded_queryset = InternalTxDecoded.objects.pending_for_safe(
+                safe_address
+            )[: self.eth_internal_tx_decoded_process_batch]
+            if not internal_txs_decoded_queryset:
+                break
+            total_processed_txs += len(
+                self.tx_processor.process_decoded_transactions(
+                    internal_txs_decoded_queryset
+                )
+            )
+        return total_processed_txs
 
     def reprocess_addresses(self, addresses: List[ChecksumAddress]):
         """
@@ -476,7 +518,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        Reindexes master copies in parallel with the current running indexer, so service will have no missing txs
+        Reindex master copies in parallel with the current running indexer, so service will have no missing txs
         while reindexing
 
         :param from_block_number: Block number to start indexing from
@@ -511,7 +553,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        Reindexes erc20/721 events parallel with the current running indexer, so service will have no missing
+        Reindex erc20/721 events parallel with the current running indexer, so service will have no missing
         events while reindexing
 
         :param from_block_number: Block number to start indexing from

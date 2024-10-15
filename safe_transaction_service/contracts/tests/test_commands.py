@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 from django.core.management import call_command
 from django.test import TestCase
 
-from gnosis.eth import EthereumClient
+from safe_eth.eth import EthereumClient
 
 from safe_transaction_service.contracts.models import Contract
 from safe_transaction_service.contracts.tests.factories import ContractFactory
@@ -30,7 +30,7 @@ class TestCommands(TestCase):
 
     @patch.object(EthereumClient, "get_chain_id", autospec=True, return_value=137)
     def test_update_safe_contracts_logo(self, mock_chain_id: MagicMock):
-        command = "update_safe_contracts_logo"
+        command = "setup_safe_contracts"
         buf = StringIO()
         random_contract = ContractFactory()
         previous_random_contract_logo = random_contract.logo.read()

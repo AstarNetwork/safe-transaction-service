@@ -248,6 +248,13 @@ class EventsIndexer(EthereumIndexer):
                 decoded_elements.append(decoded_element)
         return decoded_elements
 
+    def _process_decoded_elements(self, decoded_elements: List[EventData]) -> List[Any]:
+        processed_elements = []
+        for decoded_element in decoded_elements:
+            if processed_element := self._process_decoded_element(decoded_element):
+                processed_elements.append(processed_element)
+        return processed_elements
+
     def process_elements(self, log_receipts: Sequence[LogReceipt]) -> List[Any]:
         """
         Process all events found by `find_relevant_elements`
@@ -258,6 +265,7 @@ class EventsIndexer(EthereumIndexer):
         if not log_receipts:
             return []
 
+        logger.debug("Excluding events processed recently")
         # Ignore already processed events
         not_processed_log_receipts = [
             log_receipt
@@ -268,9 +276,11 @@ class EventsIndexer(EthereumIndexer):
                 log_receipt["logIndex"],
             )
         ]
+        logger.debug("Decoding `log_receipts` of the events")
         decoded_elements: List[EventData] = self.decode_elements(
             not_processed_log_receipts
         )
+        logger.debug("Decoded `log_receipts` of the events")
         tx_hashes = OrderedDict.fromkeys(
             [event["transactionHash"] for event in not_processed_log_receipts]
         ).keys()
@@ -278,10 +288,7 @@ class EventsIndexer(EthereumIndexer):
         self.index_service.txs_create_or_update_from_tx_hashes(tx_hashes)
         logger.debug("End prefetching and storing of ethereum txs")
         logger.debug("Processing %d decoded events", len(decoded_elements))
-        processed_elements = []
-        for decoded_element in decoded_elements:
-            if processed_element := self._process_decoded_element(decoded_element):
-                processed_elements.append(processed_element)
+        processed_elements = self._process_decoded_elements(decoded_elements)
         logger.debug("End processing %d decoded events", len(decoded_elements))
 
         logger.debug("Marking events as processed")

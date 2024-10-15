@@ -7,9 +7,8 @@ from django.db import transaction
 
 from eth_typing import ChecksumAddress, HexStr
 from hexbytes import HexBytes
+from safe_eth.eth import EthereumClient
 from web3.types import BlockTrace, FilterTrace
-
-from gnosis.eth import EthereumClient
 
 from safe_transaction_service.contracts.tx_decoder import (
     CannotDecode,
@@ -283,7 +282,7 @@ class InternalTxIndexer(EthereumIndexer):
                 if internal_tx.is_ether_transfer:
                     SafeRelevantTransaction.objects.get_or_create(
                         ethereum_tx_id=internal_tx.ethereum_tx_id,
-                        safe=internal_tx._from,
+                        safe=internal_tx.to,
                         defaults={
                             "timestamp": internal_tx.timestamp,
                         },

@@ -9,9 +9,8 @@ from django.test import TestCase
 from django.utils import timezone
 
 from eth_account import Account
-
-from gnosis.eth.utils import fast_keccak_text
-from gnosis.safe.safe_signature import SafeSignatureType
+from safe_eth.eth.utils import fast_keccak_text
+from safe_eth.safe.safe_signature import SafeSignatureType
 
 from safe_transaction_service.account_abstraction.tests.mocks import aa_tx_receipt_mock
 from safe_transaction_service.contracts.models import ContractQuerySet
@@ -379,6 +378,19 @@ class TestEthereumTx(TestCase):
 
 
 class TestTokenTransfer(TestCase):
+    def test_fast_count(self):
+        address = Account.create().address
+
+        ERC20TransferFactory(to=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 1)
+
+        ERC20TransferFactory(_from=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 2)
+
+        # Optimization uses a UNION, so it counts transfers with `from=to` twice
+        ERC20TransferFactory(_from=address, to=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 4)
+
     def test_transfer_to_erc721(self):
         erc20_transfer = ERC20TransferFactory()
         self.assertEqual(ERC721Transfer.objects.count(), 0)
@@ -410,9 +422,9 @@ class TestTokenTransfer(TestCase):
         ERC20TransferFactory()  # This event should not appear
         self.assertEqual(ERC20Transfer.objects.to_or_from(safe_address).count(), 2)
 
-        self.assertSetEqual(
+        self.assertCountEqual(
             ERC20Transfer.objects.tokens_used_by_address(safe_address),
-            {e1.address, e2.address},
+            [e1.address, e2.address],
         )
 
     def test_erc721_events(self):
@@ -422,9 +434,9 @@ class TestTokenTransfer(TestCase):
         ERC721TransferFactory()  # This event should not appear
         self.assertEqual(ERC721Transfer.objects.to_or_from(safe_address).count(), 2)
 
-        self.assertSetEqual(
+        self.assertCountEqual(
             ERC721Transfer.objects.tokens_used_by_address(safe_address),
-            {e1.address, e2.address},
+            [e1.address, e2.address],
         )
 
     def test_incoming_tokens(self):
