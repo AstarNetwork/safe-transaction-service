@@ -3,7 +3,7 @@ from django.shortcuts import get_object_or_404
 import django_filters
 from djangorestframework_camel_case.parser import CamelCaseJSONParser
 from djangorestframework_camel_case.render import CamelCaseJSONRenderer
-from drf_yasg.utils import swagger_auto_schema
+from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.filters import OrderingFilter
 from rest_framework.generics import CreateAPIView, ListCreateAPIView, RetrieveAPIView
@@ -46,8 +46,9 @@ class SafeMessageSignatureView(CreateAPIView):
         )
         return context
 
-    @swagger_auto_schema(
-        responses={201: "Created"},
+    @extend_schema(
+        tags=["messages"],
+        responses={201: OpenApiResponse(description="Created")},
     )
     def post(self, request, *args, **kwargs):
         """
@@ -70,11 +71,15 @@ class SafeMessagesView(ListCreateAPIView):
     parser_classes = (DisableCamelCaseForMessageParser,)
     renderer_classes = (DisableCamelCaseForMessageRenderer,)
 
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return SafeMessage.objects.none()
+
+        safe = self.kwargs["address"]
+        return SafeMessage.objects.filter(safe=safe).prefetch_related("confirmations")
+
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        if getattr(self, "swagger_fake_view", False):
-            return context
-
         context["safe_address"] = self.kwargs["address"]
         return context
 
@@ -84,6 +89,10 @@ class SafeMessagesView(ListCreateAPIView):
         elif self.request.method == "POST":
             return serializers.SafeMessageSerializer
 
+    @extend_schema(
+        tags=["messages"],
+        responses={200: serializers.SafeMessageResponseSerializer},
+    )
     def get(self, request, address, *args, **kwargs):
         """
         Returns the list of messages for a given Safe account
@@ -99,9 +108,10 @@ class SafeMessagesView(ListCreateAPIView):
             )
         return super().get(request, address, *args, **kwargs)
 
-    @swagger_auto_schema(
-        request_body=serializers.SafeMessageSerializer,
-        responses={201: "Created"},
+    @extend_schema(
+        tags=["messages"],
+        request=serializers.SafeMessageSerializer,
+        responses={201: OpenApiResponse(description="Created")},
     )
     def post(self, request, address, *args, **kwargs):
         """
@@ -126,7 +136,3 @@ class SafeMessagesView(ListCreateAPIView):
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
         return Response(status=status.HTTP_201_CREATED)
-
-    def get_queryset(self):
-        safe = self.kwargs["address"]
-        return SafeMessage.objects.filter(safe=safe).prefetch_related("confirmations")

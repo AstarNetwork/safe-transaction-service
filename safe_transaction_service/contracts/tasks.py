@@ -2,6 +2,7 @@ import datetime
 from enum import Enum
 from itertools import chain
 
+from django.conf import settings
 from django.utils import timezone
 
 from celery import app
@@ -16,6 +17,7 @@ from safe_transaction_service.history.models import (
 )
 from safe_transaction_service.utils.utils import close_gevent_db_connection_decorator
 
+from ..utils.celery import task_timeout
 from .models import Contract
 from .services.contract_metadata_service import get_contract_metadata_service
 
@@ -31,8 +33,9 @@ class ContractAction(Enum):
     NOT_MODIFIED = 2
 
 
-@app.shared_task(soft_time_limit=TASK_SOFT_TIME_LIMIT, time_limit=TASK_TIME_LIMIT)
+@app.shared_task()
 @close_gevent_db_connection_decorator
+@task_timeout(timeout_seconds=TASK_TIME_LIMIT)
 def create_missing_contracts_with_metadata_task() -> int:
     """
     Insert detected contracts the users are interacting with on database
@@ -54,8 +57,9 @@ def create_missing_contracts_with_metadata_task() -> int:
     return i
 
 
-@app.shared_task(soft_time_limit=TASK_SOFT_TIME_LIMIT, time_limit=TASK_TIME_LIMIT)
+@app.shared_task()
 @close_gevent_db_connection_decorator
+@task_timeout(timeout_seconds=TASK_TIME_LIMIT)
 def create_missing_multisend_contracts_with_metadata_task() -> int:
     """
     Insert detected contracts the users are interacting with using Multisend for the last day
@@ -86,34 +90,41 @@ def create_missing_multisend_contracts_with_metadata_task() -> int:
     return len(addresses)
 
 
-@app.shared_task(soft_time_limit=TASK_SOFT_TIME_LIMIT, time_limit=TASK_TIME_LIMIT)
+@app.shared_task()
 @close_gevent_db_connection_decorator
+@task_timeout(timeout_seconds=TASK_TIME_LIMIT)
 def reindex_contracts_without_metadata_task() -> int:
     """
     Try to reindex existing contracts without metadata
 
     :return: Number of contracts missing
     """
-    i = 0
+    batch_size = settings.REINDEX_CONTRACTS_METADATA_BATCH
+    countdown_increment = settings.REINDEX_CONTRACTS_METADATA_COUNTDOWN
+    total_addresses_reindexed = 0
+    countdown = 0
     for address in (
         Contract.objects.without_metadata().values_list("address", flat=True).iterator()
     ):
         logger.info("Reindexing contract %s", address)
         create_or_update_contract_with_metadata_task.apply_async(
-            (address,), priority=1
+            (address,), priority=1, countdown=countdown
         )  # Lowest priority
-        i += 1
-    return i
+        total_addresses_reindexed += 1
+        # Increment the countdown each time total_addresses_reindexed reaches a multiple of batch_size.
+        countdown += (
+            countdown_increment if total_addresses_reindexed % batch_size == 0 else 0
+        )
+    return total_addresses_reindexed
 
 
 @app.shared_task(
-    soft_time_limit=TASK_SOFT_TIME_LIMIT,
-    time_limit=TASK_TIME_LIMIT,
     autoretry_for=(EtherscanRateLimitError,),
     retry_backoff=10,
     retry_kwargs={"max_retries": 5},
 )
 @close_gevent_db_connection_decorator
+@task_timeout(timeout_seconds=TASK_TIME_LIMIT)
 def create_or_update_contract_with_metadata_task(
     address: ChecksumAddress,
 ) -> ContractAction:

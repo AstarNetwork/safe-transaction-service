@@ -5,6 +5,7 @@ from django.test import TestCase
 from hexbytes import HexBytes
 from safe_eth.eth.constants import NULL_ADDRESS
 from safe_eth.safe.multi_send import MultiSendOperation
+from safe_eth.util.util import to_0x_hex_str
 from web3 import Web3
 
 from safe_transaction_service.contracts.tests.factories import (
@@ -186,7 +187,7 @@ class TestTxDecoder(TestCase):
                 "operation": operation,
                 "to": safe_contract_address,
                 "value": value,
-                "data": change_master_copy_data.hex(),
+                "data": to_0x_hex_str(change_master_copy_data),
                 "data_decoded": {
                     "method": "changeMasterCopy",
                     "parameters": [
@@ -202,7 +203,7 @@ class TestTxDecoder(TestCase):
                 "operation": operation,
                 "to": safe_contract_address,
                 "value": value,
-                "data": change_fallback_manager_data.hex(),
+                "data": to_0x_hex_str(change_fallback_manager_data),
                 "data_decoded": {
                     "method": "setFallbackHandler",
                     "parameters": [
@@ -231,7 +232,7 @@ class TestTxDecoder(TestCase):
                             "operation": operation,
                             "to": safe_contract_address,
                             "value": value,
-                            "data": change_master_copy_data.hex(),
+                            "data": to_0x_hex_str(change_master_copy_data),
                             "data_decoded": {
                                 "method": "changeMasterCopy",
                                 "parameters": [
@@ -247,7 +248,7 @@ class TestTxDecoder(TestCase):
                             "operation": operation,
                             "to": safe_contract_address,
                             "value": value,
-                            "data": change_fallback_manager_data.hex(),
+                            "data": to_0x_hex_str(change_fallback_manager_data),
                             "data_decoded": {
                                 "method": "setFallbackHandler",
                                 "parameters": [
@@ -391,4 +392,40 @@ class TestTxDecoder(TestCase):
         )
         self.assertEqual(fn_name, "buyDroid")
         self.assertEqual(arguments, {"numberOfDroids": "4", "droidId": "10"})
+        self.assertIn((contract.address,), DbTxDecoder.cache_abis_by_address)
+        self.assertIn(
+            (contract.address,),
+            DbTxDecoder.cache_contract_abi_selectors_with_functions_by_address,
+        )
+
+    def test_decode_fallback_calls_db_tx_decoder(self):
+        example_not_matched_abi = [
+            {
+                "inputs": [],
+                "name": "claimOwner",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function",
+            },
+        ]
+
+        example_not_matched_data = (
+            Web3()
+            .eth.contract(abi=example_not_matched_abi)
+            .functions.claimOwner()
+            .build_transaction({"gas": 0, "gasPrice": 0, "to": NULL_ADDRESS})["data"]
+        )
+
+        fallback_abi = [
+            {"stateMutability": "payable", "type": "fallback"},
+        ]
+
+        db_tx_decoder = DbTxDecoder()
+        contract_fallback_abi = ContractAbiFactory(abi=fallback_abi)
+        contract = ContractFactory(contract_abi=contract_fallback_abi)
+        fn_name, arguments = db_tx_decoder.decode_transaction(
+            example_not_matched_data, address=contract.address
+        )
+        self.assertEqual(fn_name, "fallback")
+        self.assertEqual(arguments, {})
         self.assertIn((contract.address,), DbTxDecoder.cache_abis_by_address)

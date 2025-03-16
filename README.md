@@ -1,7 +1,7 @@
 [![CI/CD](https://github.com/safe-global/safe-transaction-service/actions/workflows/python.yml/badge.svg)](https://github.com/safe-global/safe-transaction-service/actions/workflows/python.yml)
 [![Coverage Status](https://coveralls.io/repos/github/safe-global/safe-transaction-service/badge.svg?branch=main)](https://coveralls.io/github/safe-global/safe-transaction-service?branch=main)
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
-![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)
+![Python 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)
 ![Django 5](https://img.shields.io/badge/Django-5-blue.svg)
 [![Docker Image Version (latest semver)](https://img.shields.io/docker/v/safeglobal/safe-transaction-service?label=Docker&sort=semver)](https://hub.docker.com/r/safeglobal/safe-transaction-service)
 
@@ -50,7 +50,7 @@ export ETHEREUM_4337_BUNDLER_URL="https://eth-sepolia.g.alchemy.com/v2/$API_KEY"
 
 ## Setup for development using docker
 ```bash
-docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+docker-compose --profile develop up
 ```
 
 ## Setup for production (event indexing)
@@ -199,6 +199,9 @@ https://docs.safe.global/api-supported-networks
 
 ### What means banned field in SafeContract model?
 The `banned` field in the `SafeContract` model is used to prevent indexing of certain Safes that have an unsupported `MasterCopy` or unverified proxies that have issues during indexing. This field does not remove the banned Safe and indexing can be resumed once the issue has been resolved.
+
+### Why is my ERC20 token not indexed?
+For an ERC20 token to be indexed it needs to have `name`, `symbol`, `decimals` and `balanceOf()`, otherwise the service will ignore it and add it to the `TokenNotValid` model.
 
 ## Troubleshooting
 

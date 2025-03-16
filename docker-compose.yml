@@ -34,7 +34,7 @@ services:
       retries: 3
 
   db:
-    image: postgres:14-alpine
+    image: postgres:16-alpine
     ports:
       - "5432:5432"
     environment:
@@ -69,7 +69,7 @@ services:
       - .env
     environment:
       RUN_MIGRATIONS: 1
-      WORKER_QUEUES: "default,indexing"
+      WORKER_QUEUES: "default,indexing,processing"
     depends_on:
       - db
       - redis
@@ -90,9 +90,21 @@ services:
     <<: *worker
     command: docker/web/celery/scheduler/run.sh
 
+  ganache:
+    image: trufflesuite/ganache:latest
+    ports:
+      - "8545:8545"
+    command: --defaultBalanceEther 10000 --gasLimit 10000000 -a 10 --chain.chainId 1337 --chain.networkId 1337 -d --host 0.0.0.0
+    healthcheck:
+      test: bash -c "echo 'hello' > /dev/tcp/localhost/8545"
+    profiles:
+      - develop
+
   flower:
     <<: *worker
     command: docker/web/celery/flower/run.sh
     ports:
       - "5555:5555"
+    profiles:
+      - debug
 

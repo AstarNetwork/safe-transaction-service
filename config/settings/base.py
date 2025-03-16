@@ -7,6 +7,8 @@ from pathlib import Path
 import environ
 from corsheaders.defaults import default_headers as default_cors_headers
 
+from safe_transaction_service import __version__
+
 from ..gunicorn import (
     gunicorn_request_timeout,
     gunicorn_worker_connections,
@@ -64,7 +66,7 @@ DATABASES = {
     "default": env.db("DATABASE_URL"),
 }
 DATABASES["default"]["ATOMIC_REQUESTS"] = False
-DATABASES["default"]["ENGINE"] = "django_db_geventpool.backends.postgresql_psycopg2"
+DATABASES["default"]["ENGINE"] = "django_db_geventpool.backends.postgresql_psycopg3"
 DATABASES["default"]["CONN_MAX_AGE"] = 0
 DB_MAX_CONNS = env.int("DB_MAX_CONNS", default=50)
 DATABASES["default"]["OPTIONS"] = {
@@ -99,9 +101,9 @@ THIRD_PARTY_APPS = [
     "django_extensions",
     "corsheaders",
     "rest_framework",
-    "drf_yasg",
     "django_s3_storage",
     "rest_framework.authtoken",
+    "drf_spectacular",
 ]
 LOCAL_APPS = [
     "safe_transaction_service.account_abstraction.apps.AccountAbstractionConfig",
@@ -225,7 +227,7 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="django://")
 # Configured to 0 due to connection issues https://github.com/celery/celery/issues/4355
 CELERY_BROKER_POOL_LIMIT = env.int("CELERY_BROKER_POOL_LIMIT", default=0)
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#broker-heartbeat
-CELERY_BROKER_HEARTBEAT = env.int("CELERY_BROKER_HEARTBEAT", default=0)
+CELERY_BROKER_HEARTBEAT = env.int("CELERY_BROKER_HEARTBEAT", default=120)
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-broker_connection_max_retries
 CELERY_BROKER_CONNECTION_MAX_RETRIES = (
@@ -281,6 +283,14 @@ CELERY_ROUTES = (
             {"queue": "indexing"},
         ),
         (
+            "safe_transaction_service.history.tasks.process_decoded_internal_txs_for_safe_task",
+            {"queue": "processing", "delivery_mode": "transient"},
+        ),
+        (
+            "safe_transaction_service.history.tasks.process_decoded_internal_txs_task",
+            {"queue": "processing", "delivery_mode": "transient"},
+        ),
+        (
             "safe_transaction_service.history.tasks.*",
             {"queue": "indexing", "delivery_mode": "transient"},
         ),
@@ -322,8 +332,39 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.TokenAuthentication",
     ),
     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.NamespaceVersioning",
+    "ALLOWED_VERSIONS": ["v1", "v2"],
     "EXCEPTION_HANDLER": "safe_transaction_service.history.exceptions.custom_exception_handler",
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
+
+# INDEXER LOG LEVEL
+ERC20_721_INDEXER_LOG_LEVEL = (
+    env("ERC20_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+PROXY_FACTORY_INDEXER_LOG_LEVEL = (
+    env("PROXY_FACTORY_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+SAFE_EVENTS_INDEXER_LOG_LEVEL = (
+    env("SAFE_EVENTS_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+INTERNAL_TX_INDEXER_LOG_LEVEL = (
+    env("INTERNAL_TX_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+# API LOG LEVEL
+API_LOG_LEVEL = env("API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+BALANCES_API_LOG_LEVEL = (
+    env("BALANCES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
+)
+MESSAGES_API_LOG_LEVEL = (
+    env("MESSAGES_API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+ALL_TRANSACTIONS_API_LOG_LEVEL = (
+    env("ALL_TRANSACTIONS_API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+COLLECTIBLES_API_LOG_LEVEL = (
+    env("COLLECTIBLES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
+)
+
 
 # LOGGING
 # ------------------------------------------------------------------------------
@@ -396,11 +437,58 @@ LOGGING = {
             "handlers": ["console"],
             "propagate": False,
         },
+        # BALANCES LOG
+        "safe_transaction_service.history.views.SafeBalanceView": {
+            "level": BALANCES_API_LOG_LEVEL,
+        },
         "safe_transaction_service.history.services.balance_service": {
-            "level": "DEBUG" if DEBUG else "WARNING",
+            "level": BALANCES_API_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.views_v2.SafeBalanceView": {
+            "level": BALANCES_API_LOG_LEVEL,
+        },
+        # COLLECTIBLES LOG
+        "safe_transaction_service.history.views_v2.SafeCollectiblesView": {
+            "level": COLLECTIBLES_API_LOG_LEVEL,
         },
         "safe_transaction_service.history.services.collectibles_service": {
-            "level": "DEBUG" if DEBUG else "WARNING",
+            "level": COLLECTIBLES_API_LOG_LEVEL,
+        },
+        # ALL-TRANSACTIONS LOG
+        "safe_transaction_service.history.views.AllTransactionsListView": {
+            "level": ALL_TRANSACTIONS_API_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.services.transaction_service": {
+            "level": ALL_TRANSACTIONS_API_LOG_LEVEL,
+        },
+        # MESSAGES_API_LOG_LEVEL: NO LOGS FOR NOW
+        # ERC20_721_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.erc20_events_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_erc20_events_task": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        # PROXY_FACTORY_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.proxy_factory_indexer": {
+            "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_new_proxies_task": {
+            "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
+        },
+        # SAFE_EVENTS_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.safe_events_indexer": {
+            "level": SAFE_EVENTS_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_safe_events_task": {
+            "level": SAFE_EVENTS_INDEXER_LOG_LEVEL,
+        },
+        # INTERNAL_TX_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.internal_tx_indexer": {
+            "level": INTERNAL_TX_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_internal_txs_task": {
+            "level": INTERNAL_TX_INDEXER_LOG_LEVEL,
         },
         "celery": {
             "handlers": ["console"],
@@ -497,6 +585,15 @@ ETH_REORG_BLOCKS_BATCH = env.int(
 ETH_REORG_BLOCKS = env.int(
     "ETH_REORG_BLOCKS", default=200 if ETH_L2_NETWORK else 10
 )  # Number of blocks from the current block number needed to consider a block valid/stable
+ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE = env.int(
+    "ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE", default=500_000
+)  # Load Safe addresses for the ERC20 indexer with a database iterator with the defined `chunk_size`
+
+# Events processing
+# ------------------------------------------------------------------------------
+PROCESSING_ENABLE_OUT_OF_ORDER_CHECK = env.bool(
+    "PROCESSING_ENABLE_OUT_OF_ORDER_CHECK", default=True
+)  # Enable out of order check, in case some transactions appear after a reindex so Safes don't get corrupt. Disabling it can speed up processing
 
 # Tokens
 # ------------------------------------------------------------------------------
@@ -549,6 +646,12 @@ EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT = env.int(
     "EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT", default=0
 )
 
+# Events and notifications
+# ------------------------------------------------------------------------------
+DISABLE_NOTIFICATIONS_AND_EVENTS = env.bool(
+    "DISABLE_NOTIFICATIONS_AND_EVENTS", default=False
+)  # Increases indexing speed for initial sync by disabling sending notifications and events to the queue
+
 # Cache
 CACHE_ALL_TXS_VIEW = env.int(
     "CACHE_ALL_TXS_VIEW", default=10 * 60
@@ -572,13 +675,6 @@ AWS_CONFIGURED = bool(
 ETHERSCAN_API_KEY = env("ETHERSCAN_API_KEY", default=None)
 IPFS_GATEWAY = env("IPFS_GATEWAY", default="https://ipfs.io/ipfs/")
 
-SWAGGER_SETTINGS = {
-    "SECURITY_DEFINITIONS": {
-        "api_key": {"type": "apiKey", "in": "header", "name": "Authorization"}
-    },
-    "DEFAULT_AUTO_SCHEMA_CLASS": "safe_transaction_service.utils.swagger.CustomSwaggerSchema",
-}
-
 # Shell Plus
 # ------------------------------------------------------------------------------
 SHELL_PLUS_PRINT_SQL_TRUNCATE = env.int("SHELL_PLUS_PRINT_SQL_TRUNCATE", default=10_000)
@@ -590,3 +686,34 @@ TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS = env.int(
 
 # Compression level – an integer from 0 to 9. 0 means not compression
 CACHE_ALL_TXS_COMPRESSION_LEVEL = env.int("CACHE_ALL_TXS_COMPRESSION_LEVEL", default=0)
+CACHE_VIEW_DEFAULT_TIMEOUT = env.int(
+    "CACHE_VIEW_DEFAULT_TIMEOUT", default=0
+)  # 0 will disable the cache
+
+# Contracts reindex batch configuration
+# ------------------------------------------------------------------------------
+# The following configuration prevents overwhelming third-party data sources by controlling the rate of requests.
+# Defines the batch size to limit the number of reindex contracts tasks sent to Celery concurrently.
+REINDEX_CONTRACTS_METADATA_BATCH = env.int(
+    "REINDEX_CONTRACTS_METADATA_BATCH", default=100
+)
+# Defines the delay countdown between batches of reindex contract tasks.
+REINDEX_CONTRACTS_METADATA_COUNTDOWN = env.int(
+    "REINDEX_CONTRACTS_METADATA_COUNTDOWN", default=0
+)
+
+# DRF ESPECTACULAR
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Safe Transaction Service",
+    "DESCRIPTION": "API to keep track of transactions sent via Safe smart contracts",
+    "VERSION": __version__,
+    "SWAGGER_UI_FAVICON_HREF": "static/safe/favicon.png",
+    "OAS_VERSION": "3.1.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "SCHEMA_PATH_PREFIX": "/api/v[0-9]",
+    "DEFAULT_GENERATOR_CLASS": "safe_transaction_service.utils.swagger.IgnoreVersionSchemaGenerator",
+    "POSTPROCESSING_HOOKS": [
+        "drf_spectacular.contrib.djangorestframework_camel_case.camelize_serializer_fields"
+    ],
+    "SORT_OPERATION_PARAMETERS": False,
+}

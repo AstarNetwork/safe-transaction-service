@@ -1,3 +1,4 @@
+import datetime
 from typing import Any, Dict
 
 from django.utils import timezone
@@ -7,9 +8,12 @@ from eth_account import Account
 from factory.django import DjangoModelFactory
 from factory.fuzzy import FuzzyInteger
 from hexbytes import HexBytes
+from safe_eth.eth import get_auto_ethereum_client
 from safe_eth.eth.constants import NULL_ADDRESS
 from safe_eth.eth.utils import fast_keccak_text
+from safe_eth.safe import Safe
 from safe_eth.safe.safe_signature import SafeSignatureType
+from safe_eth.util.util import to_0x_hex_str
 
 from ..models import (
     ERC20Transfer,
@@ -52,8 +56,12 @@ class EthereumBlockFactory(DjangoModelFactory):
     gas_limit = factory.fuzzy.FuzzyInteger(100000000, 200000000)
     gas_used = factory.fuzzy.FuzzyInteger(100000, 500000)
     timestamp = factory.LazyFunction(timezone.now)
-    block_hash = factory.Sequence(lambda n: fast_keccak_text(f"block-{n}").hex())
-    parent_hash = factory.Sequence(lambda n: fast_keccak_text(f"block{n - 1}").hex())
+    block_hash = factory.Sequence(
+        lambda n: to_0x_hex_str(fast_keccak_text(f"block-{n}"))
+    )
+    parent_hash = factory.Sequence(
+        lambda n: to_0x_hex_str(fast_keccak_text(f"block{n - 1}"))
+    )
 
 
 class EthereumTxFactory(DjangoModelFactory):
@@ -62,7 +70,7 @@ class EthereumTxFactory(DjangoModelFactory):
 
     block = factory.SubFactory(EthereumBlockFactory)
     tx_hash = factory.Sequence(
-        lambda n: fast_keccak_text(f"ethereum_tx_hash-{n}").hex()
+        lambda n: to_0x_hex_str(fast_keccak_text(f"ethereum_tx_hash-{n}"))
     )
     _from = factory.LazyFunction(lambda: Account.create().address)
     gas = factory.fuzzy.FuzzyInteger(1000, 5000)
@@ -273,9 +281,11 @@ class MultisigTransactionFactory(DjangoModelFactory):
         model = MultisigTransaction
 
     safe_tx_hash = factory.Sequence(
-        lambda n: fast_keccak_text(f"multisig-tx-{n}").hex()
+        lambda n: to_0x_hex_str(fast_keccak_text(f"multisig-tx-{n}"))
     )
     safe = factory.LazyFunction(lambda: Account.create().address)
+    proposer = None
+    proposed_by_delegate = None
     ethereum_tx = factory.SubFactory(EthereumTxFactory)
     to = factory.LazyFunction(lambda: Account.create().address)
     value = FuzzyInteger(low=0, high=10)
@@ -302,6 +312,30 @@ class MultisigTransactionFactory(DjangoModelFactory):
             defaults={"timestamp": self.ethereum_tx.block.timestamp},
         )
 
+    @factory.post_generation
+    def enable_safe_tx_hash_calculation(self, create, extracted, **kwargs):
+        if not create:
+            return
+
+        if extracted:
+            ethereum_client = get_auto_ethereum_client()
+            safe = Safe(self.safe, ethereum_client)
+            safe_tx = safe.build_multisig_tx(
+                self.to,
+                self.value,
+                self.data,
+                self.operation,
+                self.safe_tx_gas,
+                self.base_gas,
+                self.gas_price,
+                self.gas_token,
+                self.refund_receiver,
+                safe_nonce=self.nonce,
+            )
+            self.delete()
+            self.safe_tx_hash = safe_tx.safe_tx_hash
+            self.save()
+
 
 class MultisigConfirmationFactory(DjangoModelFactory):
     class Meta:
@@ -310,11 +344,29 @@ class MultisigConfirmationFactory(DjangoModelFactory):
     ethereum_tx = factory.SubFactory(EthereumTxFactory)
     multisig_transaction = factory.SubFactory(MultisigTransactionFactory)
     multisig_transaction_hash = factory.Sequence(
-        lambda n: fast_keccak_text(f"multisig-confirmation-tx-{n}").hex()
+        lambda n: to_0x_hex_str(fast_keccak_text(f"multisig-confirmation-tx-{n}"))
     )
     owner = factory.LazyFunction(lambda: Account.create().address)
     signature = None
     signature_type = SafeSignatureType.APPROVED_HASH.value
+
+    @factory.post_generation
+    def force_sign_with_account(self, create, extracted, **kwargs):
+        """
+        Calculates real signature for the given account
+        """
+        if not create:
+            return
+
+        if extracted:
+            account = extracted
+            self.owner = account.address
+            self.multisig_transaction_hash = self.multisig_transaction.safe_tx_hash
+            signature = account.unsafe_sign_hash(self.multisig_transaction_hash)[
+                "signature"
+            ]
+            self.signature = signature
+            self.save()
 
 
 class SafeContractFactory(DjangoModelFactory):
@@ -335,6 +387,7 @@ class SafeContractDelegateFactory(DjangoModelFactory):
     label = factory.Faker("name")
     read = True
     write = True
+    expiry_date = timezone.now() + datetime.timedelta(minutes=90)
 
 
 class MonitoredAddressFactory(DjangoModelFactory):

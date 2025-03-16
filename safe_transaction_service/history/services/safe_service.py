@@ -1,9 +1,11 @@
 import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 from eth_typing import ChecksumAddress
+from eth_utils import event_abi_to_log_topic
+from hexbytes import HexBytes
 from safe_eth.eth import EthereumClient, get_auto_ethereum_client
 from safe_eth.eth.contracts import (
     get_cpk_factory_contract,
@@ -12,13 +14,22 @@ from safe_eth.eth.contracts import (
 )
 from safe_eth.safe import Safe
 from safe_eth.safe.exceptions import CannotRetrieveSafeInfoException
+from safe_eth.safe.multi_send import MultiSend
 from safe_eth.safe.safe import SafeInfo
 from web3 import Web3
+from web3.exceptions import Web3RPCError
 
 from safe_transaction_service.account_abstraction import models as aa_models
+from safe_transaction_service.utils.abis.gelato import gelato_relay_1_balance_v2_abi
 
 from ..exceptions import NodeConnectionException
-from ..models import InternalTx, SafeLastStatus, SafeMasterCopy
+from ..models import (
+    EthereumTx,
+    InternalTx,
+    InternalTxType,
+    SafeLastStatus,
+    SafeMasterCopy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +56,16 @@ class SafeCreationInfo:
     factory_address: EthereumAddress
     master_copy: Optional[EthereumAddress]
     setup_data: Optional[bytes]
+    salt_nonce: Optional[int]
     transaction_hash: str
     user_operation: Optional[aa_models.UserOperation]
+
+
+@dataclass
+class ProxyCreationData:
+    singleton: ChecksumAddress
+    initializer: bytes
+    salt_nonce: Optional[int]
 
 
 class SafeServiceProvider:
@@ -86,8 +105,16 @@ class SafeService:
         self.proxy_factory_v1_4_1_contract = get_proxy_factory_V1_4_1_contract(dummy_w3)
         self.proxy_factory_v1_3_0_contract = get_proxy_factory_V1_3_0_contract(dummy_w3)
         self.cpk_proxy_factory_contract = get_cpk_factory_contract(dummy_w3)
+        self.gelato_relay_1_balance_v2_contract = dummy_w3.eth.contract(
+            abi=gelato_relay_1_balance_v2_abi
+        )
+        self.proxy_creation_event_topic = event_abi_to_log_topic(
+            self.proxy_factory_v1_4_1_contract.events.ProxyCreation().abi
+        )
 
-    def get_safe_creation_info(self, safe_address: str) -> Optional[SafeCreationInfo]:
+    def get_safe_creation_info(
+        self, safe_address: ChecksumAddress
+    ) -> Optional[SafeCreationInfo]:
         """
         :param safe_address:
         :return: SafeCreation info for the provided ``safe_address``
@@ -96,7 +123,8 @@ class SafeService:
             # Get first the actual creation transaction for the safe
             creation_internal_tx = (
                 InternalTx.objects.filter(
-                    ethereum_tx__status=1  # Ignore Internal Transactions for failed Transactions
+                    ethereum_tx__status=1,  # Ignore Internal Transactions for failed Transactions
+                    tx_type=InternalTxType.CREATE.value,
                 )
                 .select_related("ethereum_tx__block")
                 .get(contract_address=safe_address)
@@ -112,25 +140,33 @@ class SafeService:
             creator = (parent_internal_tx or creation_ethereum_tx)._from
             proxy_factory = creation_internal_tx._from
 
-            master_copy: Optional[str] = None
-            setup_data: Optional[bytes] = None
+            singleton: Optional[str] = None
+            initializer: Optional[bytes] = None
+            salt_nonce: Optional[int] = None
+
+            # For L2s, as traces are "simulated", they don't hold `data` and creation ethereum_tx must be used
             data_tx = parent_internal_tx if parent_internal_tx else creation_ethereum_tx
 
             # A regular ether transfer could trigger a Safe deployment, so it's not guaranteed that there will be
             # ``data`` for the transaction
-            if data_tx.data:
-                data = bytes(data_tx.data)
-                result = self._decode_proxy_factory(
-                    data
-                ) or self._decode_cpk_proxy_factory(data)
-                if result:
-                    master_copy, setup_data = result
-            if not (master_copy and setup_data):
+            proxy_creation_data = (
+                self._process_creation_data(
+                    safe_address, HexBytes(data_tx.data), creation_ethereum_tx
+                )
+                if data_tx.data
+                else None
+            )
+
+            if proxy_creation_data:
+                singleton = proxy_creation_data.singleton
+                initializer = proxy_creation_data.initializer
+                salt_nonce = proxy_creation_data.salt_nonce
+            if not (singleton and initializer):
                 if setup_internal_tx := self._get_next_internal_tx(
                     creation_internal_tx
                 ):
-                    master_copy = setup_internal_tx.to
-                    setup_data = setup_internal_tx.data
+                    singleton = setup_internal_tx.to
+                    initializer = setup_internal_tx.data
         except InternalTx.DoesNotExist:
             return None
         except IOError as exc:
@@ -150,8 +186,9 @@ class SafeService:
             created_time,
             creator,
             proxy_factory,
-            master_copy,
-            setup_data,
+            singleton,
+            initializer,
+            salt_nonce,
             creation_internal_tx.ethereum_tx_id,
             user_operation,
         )
@@ -200,14 +237,97 @@ class SafeService:
         except SafeLastStatus.DoesNotExist as exc:
             raise CannotGetSafeInfoFromDB(safe_address) from exc
 
-    def _decode_proxy_factory(
-        self, data: Union[bytes, str]
-    ) -> Optional[Tuple[str, bytes]]:
+    def _process_creation_data(
+        self,
+        safe_address: ChecksumAddress,
+        data: bytes,
+        ethereum_tx: EthereumTx,
+    ) -> Optional[ProxyCreationData]:
         """
-        Decode contract creation function for Safe ProxyFactory deployments
+        Process creation data and return the proper one for the provided Safe, as for L2s multiple deployments
+        can be present in the data, so we need to check the events and match them with the decoded data.
 
         :param data:
-        :return: Tuple with the `master_copy` and `setup_data`, `None` if it cannot be decoded
+        :return: ProxyCreationData for the provided Safe
+        """
+
+        proxy_creation_data_list = self._decode_creation_data(data)
+
+        if not proxy_creation_data_list:
+            return None
+
+        if len(proxy_creation_data_list) == 1:
+            return proxy_creation_data_list[0]
+
+        # If there are more than one deployment, we need to know which one is the one we need
+        deployed_safes = ethereum_tx.get_deployed_proxies_from_logs()
+        if len(deployed_safes) == len(proxy_creation_data_list):
+            for deployed_safe, proxy_creation_data in zip(
+                deployed_safes, proxy_creation_data_list
+            ):
+                if safe_address == deployed_safe:
+                    return proxy_creation_data
+
+        logger.warning(
+            "[%s] Proxy creation data is not matching the proxies deployed %s",
+            safe_address,
+            deployed_safes,
+        )
+        return None
+
+    def _decode_creation_data(self, data: bytes) -> list[ProxyCreationData]:
+        """
+        Decode creation data for Safe ProxyFactory deployments.
+
+        For L1 networks the trace is present, so no need for `MultiSend` or `Gelato Relay` decoding. At much one
+        `ProxyCreationData` will be returned.
+
+        For L2 networks the data for the whole transaction will be decoded, so an approximation must
+        be done to find the function parameters. There could be more than one `ProxyCreationData` when
+        deploying Safes via contracts like `MultiSend`. `MultiSend` and `Gelato Relay` transactions are supported.
+
+        :return: `ProxyCreationData`, `None` if it cannot be decoded
+        """
+        if not data:
+            return []
+
+        # Try to decode using Gelato Relayer (relayer must be the first call)
+        data = self._decode_gelato_relay(data)
+
+        # Try to decode using MultiSend. If not, take the original data
+        multisend_data = [
+            multisend_tx.data for multisend_tx in MultiSend.from_transaction_data(data)
+        ] or [data]
+        results = []
+        for data in multisend_data:
+            result = self._decode_proxy_factory(data) or self._decode_cpk_proxy_factory(
+                data
+            )
+            if result:
+                results.append(result)
+        return results
+
+    def _decode_gelato_relay(self, data: bytes) -> bytes:
+        """
+        Try to decode transaction for Gelato Relayer
+
+        :param data:
+        :return: Decoded `data` if possible, original `data` otherwise
+        """
+        try:
+            _, decoded_gelato_data = (
+                self.gelato_relay_1_balance_v2_contract.decode_function_input(data)
+            )
+            return HexBytes(decoded_gelato_data["_data"])
+        except ValueError:
+            return data
+
+    def _decode_proxy_factory(self, data: bytes) -> Optional[ProxyCreationData]:
+        """
+        Decode contract creation function for Safe ProxyFactory 1.3.0 and 1.4.1 deployments
+
+        :param data:
+        :return: `ProxyCreationData`, `None` if it cannot be decoded
         """
         if not data:
             return None
@@ -223,22 +343,22 @@ class SafeService:
                 ) = self.proxy_factory_v1_4_1_contract.decode_function_input(data)
             except ValueError:
                 return None
-        master_copy = (
+
+        singleton = (
             data_decoded.get("masterCopy")
             or data_decoded.get("_mastercopy")
             or data_decoded.get("_singleton")
             or data_decoded.get("singleton")
         )
-        setup_data = data_decoded.get("data") or data_decoded.get("initializer")
-        if master_copy and setup_data is not None:
-            return master_copy, setup_data
+        initializer = data_decoded.get("data") or data_decoded.get("initializer")
+        salt_nonce = data_decoded.get("saltNonce")
+        if singleton is not None and initializer is not None:
+            return ProxyCreationData(singleton, initializer, salt_nonce)
 
         logger.error("Problem decoding proxy factory, data_decoded=%s", data_decoded)
         return None
 
-    def _decode_cpk_proxy_factory(
-        self, data: Union[bytes, str]
-    ) -> Optional[Tuple[str, bytes]]:
+    def _decode_cpk_proxy_factory(self, data: bytes) -> Optional[ProxyCreationData]:
         """
         Decode contract creation function for Safe Contract Proxy Kit Safe deployments (function is different
         from the regular ProxyFactory)
@@ -246,7 +366,7 @@ class SafeService:
         More info: https://github.com/5afe/contract-proxy-kit
 
         :param data:
-        :return: Tuple with the `master_copy` and `setup_data`, `None` if it cannot be decoded
+        :return: `ProxyCreationData`, `None` if it cannot be decoded
         """
         if not data:
             return None
@@ -256,7 +376,8 @@ class SafeService:
             )
             master_copy = data_decoded.get("masterCopy")
             setup_data = data_decoded.get("data")
-            return master_copy, setup_data
+            salt_nonce = data_decoded.get("saltNonce")
+            return ProxyCreationData(master_copy, setup_data, salt_nonce)
         except ValueError:
             return None
 
@@ -274,10 +395,10 @@ class SafeService:
             return next_traces and InternalTx.objects.build_from_trace(
                 next_traces[0], internal_tx.ethereum_tx
             )
-        except ValueError:
+        except (ValueError, Web3RPCError):
             return None
 
-    def _get_parent_internal_tx(self, internal_tx: InternalTx) -> InternalTx:
+    def _get_parent_internal_tx(self, internal_tx: InternalTx) -> Optional[InternalTx]:
         if parent_trace := internal_tx.get_parent():
             return parent_trace
         if not self.ethereum_tracing_client:
@@ -291,5 +412,5 @@ class SafeService:
             return previous_trace and InternalTx.objects.build_from_trace(
                 previous_trace, internal_tx.ethereum_tx
             )
-        except ValueError:
+        except (ValueError, Web3RPCError):
             return None

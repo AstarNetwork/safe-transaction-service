@@ -8,7 +8,7 @@ from safe_eth.eth.constants import NULL_ADDRESS
 from safe_eth.eth.ethereum_client import TracingManager
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 
-from ..models import SafeMasterCopy
+from ..models import InternalTxType, SafeMasterCopy
 from ..services.safe_service import (
     CannotGetSafeInfoFromBlockchain,
     CannotGetSafeInfoFromDB,
@@ -16,13 +16,55 @@ from ..services.safe_service import (
     SafeInfo,
     SafeServiceProvider,
 )
-from .factories import InternalTxFactory, SafeLastStatusFactory, SafeMasterCopyFactory
+from ..services.safe_service import logger as safe_service_logger
+from ..utils import clean_receipt_log
+from .factories import (
+    EthereumTxFactory,
+    InternalTxFactory,
+    SafeLastStatusFactory,
+    SafeMasterCopyFactory,
+)
+from .mocks.mocks_safe_creation import (
+    gelato_relay_creation_mock,
+    multiple_safes_same_tx_creation_mock,
+    multisend_creation_mock,
+)
 from .mocks.traces import create_trace, creation_internal_txs
 
 
 class TestSafeService(SafeTestCaseMixin, TestCase):
     def setUp(self) -> None:
         self.safe_service = SafeServiceProvider()
+
+    def test_get_safe_creation_info(self):
+        """
+        get_safe_creation_info should only return the TX of type CREATE
+        """
+        random_address = Account.create().address
+        self.assertIsNone(self.safe_service.get_safe_creation_info(random_address))
+
+        InternalTxFactory(
+            contract_address=random_address,
+            tx_type=InternalTxType.CREATE.value,
+            ethereum_tx__status=0,
+        )
+
+        self.assertIsNone(self.safe_service.get_safe_creation_info(random_address))
+
+        InternalTxFactory(
+            contract_address=random_address,
+            ethereum_tx__status=1,
+            tx_type=InternalTxType.CREATE.value,
+        )
+
+        InternalTxFactory(
+            contract_address=random_address,
+            ethereum_tx__status=1,
+            tx_type=InternalTxType.CALL.value,
+        )
+
+        safe_creation_info = self.safe_service.get_safe_creation_info(random_address)
+        self.assertIsInstance(safe_creation_info, SafeCreationInfo)
 
     def test_get_safe_creation_info_with_tracing(self):
         """
@@ -31,7 +73,11 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
         random_address = Account.create().address
         self.assertIsNone(self.safe_service.get_safe_creation_info(random_address))
 
-        InternalTxFactory(contract_address=random_address, ethereum_tx__status=0)
+        InternalTxFactory(
+            contract_address=random_address,
+            tx_type=InternalTxType.CREATE.value,
+            ethereum_tx__status=0,
+        )
         self.assertIsNone(self.safe_service.get_safe_creation_info(random_address))
 
         with mock.patch.object(
@@ -43,6 +89,7 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
             InternalTxFactory(
                 contract_address=random_address,
                 ethereum_tx__status=1,
+                tx_type=InternalTxType.CREATE.value,
                 trace_address="0",
             )
             safe_creation_info = self.safe_service.get_safe_creation_info(
@@ -61,7 +108,10 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
         self.assertIsNone(self.safe_service.get_safe_creation_info(random_address))
 
         creation_trace = InternalTxFactory(
-            contract_address=random_address, ethereum_tx__status=1, trace_address="0"
+            contract_address=random_address,
+            tx_type=InternalTxType.CREATE.value,
+            ethereum_tx__status=1,
+            trace_address="0",
         )
         safe_creation = self.safe_service.get_safe_creation_info(random_address)
         self.assertEqual(safe_creation.creator, creation_trace.ethereum_tx._from)
@@ -93,6 +143,7 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
         creation_trace = InternalTxFactory(
             contract_address=random_address,
             ethereum_tx__status=1,
+            tx_type=InternalTxType.CREATE.value,
             trace_address="0",
             ethereum_tx__data=None,
         )
@@ -112,7 +163,10 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
     ):
         random_address = Account.create().address
         InternalTxFactory(
-            contract_address=random_address, ethereum_tx__status=1, trace_address=""
+            contract_address=random_address,
+            tx_type=InternalTxType.CREATE.value,
+            ethereum_tx__status=1,
+            trace_address="",
         )
         safe_creation_info = self.safe_service.get_safe_creation_info(random_address)
         self.assertIsInstance(safe_creation_info, SafeCreationInfo)
@@ -162,3 +216,75 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
         self.assertIsInstance(safe_info, SafeInfo)
         self.assertEqual(safe_info.guard, NULL_ADDRESS)
         self.assertEqual(safe_info.version, None)
+
+    def test_decode_creation_data(self):
+        for creation_mock in (multisend_creation_mock, gelato_relay_creation_mock):
+            with self.subTest(creation_mock=creation_mock):
+                proxy_creation_data_list = self.safe_service._decode_creation_data(
+                    creation_mock["data"]
+                )
+                self.assertEqual(len(proxy_creation_data_list), 1)
+                proxy_creation_data = proxy_creation_data_list[0]
+                self.assertEqual(
+                    proxy_creation_data.singleton, creation_mock["expected_singleton"]
+                )
+                self.assertEqual(
+                    proxy_creation_data.initializer,
+                    creation_mock["expected_initializer"],
+                )
+                self.assertEqual(
+                    proxy_creation_data.salt_nonce, creation_mock["expected_salt_nonce"]
+                )
+
+    def test_decode_creation_data_multiple_safes_same_tx(self):
+        ethereum_tx = EthereumTxFactory(
+            logs=[
+                clean_receipt_log(log)
+                for log in multiple_safes_same_tx_creation_mock["tx_logs"]
+            ]
+        )
+        self.assertEqual(
+            ethereum_tx.get_deployed_proxies_from_logs(),
+            multiple_safes_same_tx_creation_mock["proxies_deployed"],
+        )
+
+        # There are 2 Safe creations inside of this transaction
+        results = self.safe_service._decode_creation_data(
+            multiple_safes_same_tx_creation_mock["data"]
+        )
+        self.assertEqual(len(results), 2)
+
+        # We need to get the right one for every Safe
+        for safe_address in multiple_safes_same_tx_creation_mock["proxies_deployed"]:
+            with self.subTest(safe_address=safe_address):
+                proxy_creation_data = self.safe_service._process_creation_data(
+                    safe_address,
+                    multiple_safes_same_tx_creation_mock["data"],
+                    ethereum_tx,
+                )
+                creation_mock = multiple_safes_same_tx_creation_mock[safe_address]
+                self.assertEqual(
+                    proxy_creation_data.singleton, creation_mock["expected_singleton"]
+                )
+                self.assertEqual(
+                    proxy_creation_data.initializer,
+                    creation_mock["expected_initializer"],
+                )
+                self.assertEqual(
+                    proxy_creation_data.salt_nonce, creation_mock["expected_salt_nonce"]
+                )
+
+        with self.assertLogs(safe_service_logger, level="WARNING") as cm:
+            random_safe_address = Account.create().address
+            self.assertIsNone(
+                self.safe_service._process_creation_data(
+                    random_safe_address,
+                    multiple_safes_same_tx_creation_mock["data"],
+                    ethereum_tx,
+                )
+            )
+
+            self.assertIn(
+                f'[{random_safe_address}] Proxy creation data is not matching the proxies deployed {multiple_safes_same_tx_creation_mock["proxies_deployed"]}',
+                cm.output[0],
+            )

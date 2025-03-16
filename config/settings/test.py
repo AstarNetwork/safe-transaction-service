@@ -24,6 +24,9 @@ CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.dummy.DummyCache",
     },
+    "local_storage": {
+        "BACKEND": "django.core.cache.backends.dummy.DummyCache",
+    },
 }
 
 # PASSWORDS
@@ -47,3 +50,7 @@ LOGGING["loggers"] = {  # noqa F405
         "level": "DEBUG",
     }
 }
+
+CACHE_VIEW_DEFAULT_TIMEOUT = env.int(
+    "DEFAULT_CACHE_PAGE_TIMEOUT", default=60
+)  # Enable cache for testing

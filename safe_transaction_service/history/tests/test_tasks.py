@@ -9,18 +9,33 @@ from django.utils import timezone
 
 from eth_account import Account
 
+from safe_transaction_service.events.services import QueueService
+
 from ...utils.redis import get_redis
 from ..indexers import (
     Erc20EventsIndexerProvider,
     InternalTxIndexerProvider,
     SafeEventsIndexerProvider,
 )
-from ..models import MultisigTransaction, SafeContract, SafeLastStatus, SafeStatus
-from ..services import CollectiblesService, CollectiblesServiceProvider, IndexService
+from ..models import (
+    MultisigTransaction,
+    SafeContract,
+    SafeContractDelegate,
+    SafeLastStatus,
+    SafeStatus,
+)
+from ..services import (
+    CollectiblesService,
+    CollectiblesServiceProvider,
+    IndexService,
+    ReorgService,
+)
 from ..services.collectibles_service import CollectibleWithMetadata
+from ..services.index_service import SpecificIndexingStatus
 from ..tasks import (
     check_reorgs_task,
     check_sync_status_task,
+    delete_expired_delegates_task,
     index_erc20_events_out_of_sync_task,
     index_erc20_events_task,
     index_internal_txs_task,
@@ -40,6 +55,7 @@ from .factories import (
     EthereumBlockFactory,
     InternalTxDecodedFactory,
     MultisigTransactionFactory,
+    SafeContractDelegateFactory,
     SafeContractFactory,
     SafeStatusFactory,
 )
@@ -59,8 +75,27 @@ class TestTasks(TestCase):
     def tearDown(self):
         self._delete_singletons()
 
-    def test_check_reorgs_task(self):
+    @patch.object(QueueService, "send_event")
+    @patch.object(ReorgService, "check_reorgs", return_value=None)
+    @patch.object(ReorgService, "recover_from_reorg", return_value=0)
+    def test_check_reorgs_task(
+        self,
+        mock_recover_from_reorg: MagicMock,
+        mock_check_reorgs: MagicMock,
+        mock_send_event: MagicMock,
+    ):
+        # Test without reorg
         self.assertIsNone(check_reorgs_task.delay().result, 0)
+        # Test if reorg is correctly detected
+        mock_check_reorgs.return_value = 100
+        event_payload_expected = {
+            "type": "REORG_DETECTED",
+            "blockNumber": 100,
+            "chainId": "1337",
+        }
+        self.assertEqual(check_reorgs_task.delay().result, 100)
+        # Check if REORG_DETECTED event was published correctly
+        mock_send_event.assert_called_with(event_payload_expected)
 
     def test_check_sync_status_task(self):
         self.assertFalse(check_sync_status_task.delay().result)
@@ -95,16 +130,23 @@ class TestTasks(TestCase):
     def test_index_safe_events_task(self):
         self.assertEqual(index_safe_events_task.delay().result, (0, 0))
 
+    @patch.object(IndexService, "get_master_copies_indexing_status")
     @patch.object(IndexService, "reindex_master_copies")
     def test_reindex_mastercopies_last_hours_task(
-        self, reindex_master_copies_mock: MagicMock
+        self,
+        reindex_master_copies_mock: MagicMock,
+        get_master_copies_indexing_status_mock: MagicMock,
     ):
+        get_master_copies_indexing_status_mock.return_value = SpecificIndexingStatus(
+            0, 0, True
+        )
+
         now = timezone.now()
         one_hour_ago = now - datetime.timedelta(hours=1)
         one_day_ago = now - datetime.timedelta(days=1)
         one_week_ago = now - datetime.timedelta(weeks=1)
 
-        reindex_mastercopies_last_hours_task()
+        self.assertFalse(reindex_mastercopies_last_hours_task())
         reindex_master_copies_mock.assert_not_called()
 
         ethereum_block_0 = EthereumBlockFactory(timestamp=one_week_ago)
@@ -112,36 +154,51 @@ class TestTasks(TestCase):
         ethereum_block_2 = EthereumBlockFactory(timestamp=one_hour_ago)
         ethereum_block_3 = EthereumBlockFactory(timestamp=now)
 
-        reindex_mastercopies_last_hours_task()
+        self.assertTrue(reindex_mastercopies_last_hours_task())
         reindex_master_copies_mock.assert_called_once_with(
             ethereum_block_1.number,
             to_block_number=ethereum_block_3.number,
             addresses=None,
         )
 
+        get_master_copies_indexing_status_mock.return_value = SpecificIndexingStatus(
+            0, 0, False
+        )
+        self.assertFalse(reindex_mastercopies_last_hours_task())
+
+    @patch.object(IndexService, "get_erc20_indexing_status")
     @patch.object(IndexService, "reindex_erc20_events")
     def test_reindex_erc20_erc721_last_hours_task(
-        self, reindex_erc20_events: MagicMock
+        self,
+        reindex_erc20_events_mock: MagicMock,
+        get_erc20_indexing_status_mock: MagicMock,
     ):
+        get_erc20_indexing_status_mock.return_value = SpecificIndexingStatus(0, 0, True)
+
         now = timezone.now()
         one_hour_ago = now - datetime.timedelta(hours=1)
         one_day_ago = now - datetime.timedelta(days=1)
         one_week_ago = now - datetime.timedelta(weeks=1)
 
-        reindex_erc20_erc721_last_hours_task()
-        reindex_erc20_events.assert_not_called()
+        self.assertFalse(reindex_erc20_erc721_last_hours_task())
+        reindex_erc20_events_mock.assert_not_called()
 
         ethereum_block_0 = EthereumBlockFactory(timestamp=one_week_ago)
         ethereum_block_1 = EthereumBlockFactory(timestamp=one_day_ago)
         ethereum_block_2 = EthereumBlockFactory(timestamp=one_hour_ago)
         ethereum_block_3 = EthereumBlockFactory(timestamp=now)
 
-        reindex_erc20_erc721_last_hours_task()
-        reindex_erc20_events.assert_called_once_with(
+        self.assertTrue(reindex_erc20_erc721_last_hours_task())
+        reindex_erc20_events_mock.assert_called_once_with(
             ethereum_block_1.number,
             to_block_number=ethereum_block_3.number,
             addresses=None,
         )
+
+        get_erc20_indexing_status_mock.return_value = SpecificIndexingStatus(
+            0, 0, False
+        )
+        self.assertFalse(reindex_erc20_erc721_last_hours_task())
 
     def test_process_decoded_internal_txs_task(self):
         owner = Account.create().address
@@ -307,5 +364,28 @@ class TestTasks(TestCase):
         self.assertFalse(
             MultisigTransaction.objects.filter(
                 safe_tx_hash=multisig_tx_expected_to_be_deleted.safe_tx_hash
+            ).exists()
+        )
+
+    def test_delete_expired_delegates_task(self):
+        self.assertEqual(delete_expired_delegates_task.delay().result, 0)
+
+        SafeContractDelegateFactory()
+        SafeContractDelegateFactory(expiry_date=None)
+
+        self.assertEqual(delete_expired_delegates_task.delay().result, 0)
+
+        safe_contract_delegate_expected_to_be_deleted = SafeContractDelegateFactory(
+            expiry_date=timezone.now() - datetime.timedelta(hours=1)
+        )
+
+        self.assertEqual(SafeContractDelegate.objects.count(), 3)
+        self.assertEqual(delete_expired_delegates_task.delay().result, 1)
+
+        self.assertFalse(
+            SafeContractDelegate.objects.filter(
+                safe_contract=safe_contract_delegate_expected_to_be_deleted.safe_contract,
+                delegate=safe_contract_delegate_expected_to_be_deleted.delegate,
+                delegator=safe_contract_delegate_expected_to_be_deleted.delegator,
             ).exists()
         )

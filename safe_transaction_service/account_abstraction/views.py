@@ -1,15 +1,16 @@
 import django_filters
-from drf_yasg.utils import swagger_auto_schema
+from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.filters import OrderingFilter
 from rest_framework.generics import ListAPIView, ListCreateAPIView, RetrieveAPIView
 from rest_framework.response import Response
 from safe_eth.eth.utils import fast_is_checksum_address
 
-from . import pagination, serializers
+from . import filters, pagination, serializers
 from .models import SafeOperation, SafeOperationConfirmation, UserOperation
 
 
+@extend_schema(tags=["4337"])
 class SafeOperationView(RetrieveAPIView):
     """
     Returns a SafeOperation given its Safe operation hash
@@ -28,11 +29,15 @@ class SafeOperationsView(ListCreateAPIView):
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,
     ]
+    filterset_class = filters.SafeOperationFilter
     ordering = ["-user_operation__nonce", "-created"]
     ordering_fields = ["user_operation__nonce", "created"]
     pagination_class = pagination.DefaultPagination
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return SafeOperation.objects.none()
+
         safe = self.kwargs["address"]
         return (
             SafeOperation.objects.filter(user_operation__sender=safe)
@@ -42,9 +47,6 @@ class SafeOperationsView(ListCreateAPIView):
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        if getattr(self, "swagger_fake_view", False):
-            return context
-
         context["safe_address"] = self.kwargs["address"]
         return context
 
@@ -54,6 +56,7 @@ class SafeOperationsView(ListCreateAPIView):
         elif self.request.method == "POST":
             return serializers.SafeOperationSerializer
 
+    @extend_schema(tags=["4337"])
     def get(self, request, address, *args, **kwargs):
         """
         Returns the list of SafeOperations for a given Safe account
@@ -69,8 +72,9 @@ class SafeOperationsView(ListCreateAPIView):
             )
         return super().get(request, address, *args, **kwargs)
 
-    @swagger_auto_schema(
-        request_body=serializers.SafeOperationSerializer,
+    @extend_schema(
+        tags=["4337"],
+        request=serializers.SafeOperationSerializer,
         responses={201: "Created"},
     )
     def post(self, request, address, *args, **kwargs):
@@ -97,6 +101,9 @@ class SafeOperationConfirmationsView(ListCreateAPIView):
     pagination_class = pagination.DefaultPagination
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return SafeOperationConfirmation.objects.none()
+
         return SafeOperationConfirmation.objects.filter(
             safe_operation__hash=self.kwargs["safe_operation_hash"]
         )
@@ -112,15 +119,26 @@ class SafeOperationConfirmationsView(ListCreateAPIView):
         elif self.request.method == "POST":
             return serializers.SafeOperationConfirmationSerializer
 
-    @swagger_auto_schema(responses={400: "Invalid data"})
+    @extend_schema(
+        tags=["4337"],
+        responses={
+            200: serializers.SafeOperationConfirmationResponseSerializer,
+            400: OpenApiResponse(description="Invalid data"),
+        },
+    )
     def get(self, request, *args, **kwargs):
         """
         Get the list of confirmations for a multisig transaction
         """
         return super().get(request, *args, **kwargs)
 
-    @swagger_auto_schema(
-        responses={201: "Created", 400: "Malformed data", 422: "Error processing data"}
+    @extend_schema(
+        tags=["4337"],
+        responses={
+            201: OpenApiResponse(description="Created"),
+            400: OpenApiResponse(description="Malformed data"),
+            422: OpenApiResponse(description="Error processing data"),
+        },
     )
     def post(self, request, *args, **kwargs):
         """
@@ -130,6 +148,7 @@ class SafeOperationConfirmationsView(ListCreateAPIView):
         return super().post(request, *args, **kwargs)
 
 
+@extend_schema(tags=["4337"])
 class UserOperationView(RetrieveAPIView):
     """
     Returns a UserOperation given its user operation hash
@@ -156,6 +175,9 @@ class UserOperationsView(ListAPIView):
     serializer_class = serializers.UserOperationWithSafeOperationResponseSerializer
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return UserOperation.objects.none()
+
         safe = self.kwargs["address"]
         return (
             UserOperation.objects.filter(sender=safe)
@@ -165,12 +187,10 @@ class UserOperationsView(ListAPIView):
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        if getattr(self, "swagger_fake_view", False):
-            return context
-
         context["safe_address"] = self.kwargs["address"]
         return context
 
+    @extend_schema(tags=["4337"])
     def get(self, request, address, *args, **kwargs):
         """
         Returns the list of UserOperations for a given Safe account

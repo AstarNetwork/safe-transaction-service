@@ -11,6 +11,7 @@ from safe_eth.eth.django.models import (
     Keccak256Field,
 )
 from safe_eth.safe.safe_signature import SafeSignatureType
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.utils.constants import SIGNATURE_LENGTH
 
@@ -28,6 +29,7 @@ class SafeMessage(TimeStampedModel):
     message = JSONField()  # String if EIP191, object if EIP712
     proposed_by = EthereumAddressBinaryField()  # Owner proposing the message
     safe_app_id = models.PositiveIntegerField(blank=True, null=True)
+    origin = models.JSONField(default=dict)  # To store arbitrary data
 
     class Meta:
         ordering = ["created"]
@@ -38,7 +40,7 @@ class SafeMessage(TimeStampedModel):
         message = message_str[:message_size]
         if len(message_str) > message_size:
             message += "..."
-        message_hash = HexBytes(self.message_hash).hex()
+        message_hash = to_0x_hex_str(HexBytes(self.message_hash))
         return f"Safe Message {message_hash} - {message}"
 
     def build_signature(self) -> bytes:

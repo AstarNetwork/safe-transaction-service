@@ -15,7 +15,9 @@ from redis.exceptions import LockError
 from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.utils import close_gevent_db_connection_decorator
 
-from ..utils.tasks import LOCK_TIMEOUT, SOFT_TIMEOUT, only_one_running_task
+from ..events.services.queue_service import get_queue_service
+from ..utils.celery import task_timeout
+from ..utils.tasks import LOCK_TIMEOUT, only_one_running_task
 from .indexers import (
     Erc20EventsIndexerProvider,
     FindRelevantElementsException,
@@ -23,7 +25,13 @@ from .indexers import (
     ProxyFactoryIndexerProvider,
     SafeEventsIndexerProvider,
 )
-from .models import EthereumBlock, InternalTxDecoded, MultisigTransaction, SafeContract
+from .models import (
+    EthereumBlock,
+    InternalTxDecoded,
+    MultisigTransaction,
+    SafeContract,
+    SafeContractDelegate,
+)
 from .services import (
     CollectiblesServiceProvider,
     IndexingException,
@@ -37,11 +45,13 @@ from .services.collectibles_service import (
     CollectibleWithMetadata,
     MetadataRetrievalExceptionTimeout,
 )
+from .services.notification_service import build_reorg_payload
 
 logger = get_task_logger(__name__)
 
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def check_reorgs_task(self) -> Optional[int]:
     """
     :return: Number of the oldest block with reorg detected. `None` if not reorg found
@@ -57,10 +67,15 @@ def check_reorgs_task(self) -> Optional[int]:
             logger.warning("Reorg found for block-number=%d", reorg_block_number)
             # Stopping running tasks is not possible with gevent
             reorg_service.recover_from_reorg(reorg_block_number)
+            logger.info("Publish reorg event for block-number=%d", reorg_block_number)
+            payload_event = build_reorg_payload(reorg_block_number)
+            queue_service = get_queue_service()
+            queue_service.send_event(payload_event)
             return reorg_block_number
 
 
-@app.shared_task(soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
+@app.shared_task()
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def check_sync_status_task() -> bool:
     """
     Check indexing status of the service
@@ -75,12 +90,11 @@ def check_sync_status_task() -> bool:
 
 @app.shared_task(
     bind=True,
-    soft_time_limit=SOFT_TIMEOUT,
-    time_limit=LOCK_TIMEOUT,
     autoretry_for=(IndexingException, IOError),
     default_retry_delay=15,
     retry_kwargs={"max_retries": 3},
 )
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def index_erc20_events_task(self) -> Optional[Tuple[int, int]]:
     """
     Find and process ERC20/721 events for monitored addresses
@@ -162,12 +176,11 @@ def index_erc20_events_out_of_sync_task(
 
 @app.shared_task(
     bind=True,
-    soft_time_limit=SOFT_TIMEOUT,
-    time_limit=LOCK_TIMEOUT,
     autoretry_for=(IndexingException, IOError),
     default_retry_delay=15,
     retry_kwargs={"max_retries": 3},
 )
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def index_internal_txs_task(self) -> Optional[Tuple[int, int]]:
     """
     Find and process internal txs for monitored addresses
@@ -190,12 +203,11 @@ def index_internal_txs_task(self) -> Optional[Tuple[int, int]]:
 
 @app.shared_task(
     bind=True,
-    soft_time_limit=SOFT_TIMEOUT,
-    time_limit=LOCK_TIMEOUT,
     autoretry_for=(IndexingException, IOError),
     default_retry_delay=15,
     retry_kwargs={"max_retries": 3},
 )
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def index_new_proxies_task(self) -> Optional[Tuple[int, int]]:
     """
     :return: Tuple of number of proxies created and number of blocks processed
@@ -213,12 +225,11 @@ def index_new_proxies_task(self) -> Optional[Tuple[int, int]]:
 
 @app.shared_task(
     bind=True,
-    soft_time_limit=SOFT_TIMEOUT,
-    time_limit=LOCK_TIMEOUT,
     autoretry_for=(IndexingException, IOError),
     default_retry_delay=15,
     retry_kwargs={"max_retries": 3},
 )
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def index_safe_events_task(self) -> Optional[Tuple[int, int]]:
     """
     Find and process for monitored addresses
@@ -236,7 +247,8 @@ def index_safe_events_task(self) -> Optional[Tuple[int, int]]:
             return number, number_of_blocks_processed
 
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def process_decoded_internal_txs_task(self) -> Optional[int]:
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
@@ -258,18 +270,21 @@ def process_decoded_internal_txs_task(self) -> Optional[int]:
                         safe_to_process
                     ).not_processed().update(processed=True)
                 else:
-                    count += 1
                     process_decoded_internal_txs_for_safe_task.delay(
                         safe_to_process, reindex_master_copies=True
                     )
+                    count += 1
 
             if not count:
                 logger.info("No Safes to process")
             else:
                 logger.info("%d Safes to process", count)
 
+            return count
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
+
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def process_decoded_internal_txs_for_safe_task(
     self, safe_address: ChecksumAddress, reindex_master_copies: bool = True
 ) -> Optional[int]:
@@ -292,13 +307,23 @@ def process_decoded_internal_txs_for_safe_task(
             return number_processed
 
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
-def reindex_mastercopies_last_hours_task(self, hours: float = 2.5) -> Optional[int]:
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def reindex_mastercopies_last_hours_task(self, hours: float = 2.5) -> bool:
     """
     Reindexes last hours for master copies to prevent indexing issues
+
+    :param hours: Hours to reindex from now
+    :return: `True` if reindexing is triggered, `False` otherwise
     """
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
+            indexing_status = IndexServiceProvider().get_indexing_status()
+            if not indexing_status.master_copies_synced:
+                logger.warning(
+                    "Reindexing master copies will not be executed as service is out of sync"
+                )
+                return False
             if ethereum_block := EthereumBlock.objects.oldest_than(
                 seconds=60 * 60 * hours
             ).first():
@@ -317,15 +342,27 @@ def reindex_mastercopies_last_hours_task(self, hours: float = 2.5) -> Optional[i
                     reindex_master_copies_task.delay(
                         from_block_number, to_block_number=to_block_number
                     )
+                    return True
+    return False
 
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
-def reindex_erc20_erc721_last_hours_task(self, hours: float = 2.5) -> Optional[int]:
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def reindex_erc20_erc721_last_hours_task(self, hours: float = 2.5) -> bool:
     """
     Reindexes last hours for erx20 and erc721 to prevent indexing issues
+
+    :param hours: Hours to reindex from now
+    :return: `True` if reindexing is triggered, `False` otherwise
     """
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
+            indexing_status = IndexServiceProvider().get_indexing_status()
+            if not indexing_status.erc20_synced:
+                logger.warning(
+                    "Reindexing erc20/721 events will not be executed as service is out of sync"
+                )
+                return False
             if ethereum_block := EthereumBlock.objects.oldest_than(
                 seconds=60 * 60 * hours
             ).first():
@@ -344,9 +381,12 @@ def reindex_erc20_erc721_last_hours_task(self, hours: float = 2.5) -> Optional[i
                     reindex_erc20_events_task.delay(
                         from_block_number, to_block_number=to_block_number
                     )
+                    return True
+    return False
 
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def reindex_master_copies_task(
     self,
     from_block_number: int,
@@ -372,7 +412,8 @@ def reindex_master_copies_task(
             )
 
 
-@app.shared_task(bind=True, soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def reindex_erc20_events_task(
     self,
     from_block_number: int,
@@ -398,11 +439,8 @@ def reindex_erc20_events_task(
             )
 
 
-@app.shared_task(
-    soft_time_limit=SOFT_TIMEOUT,
-    time_limit=LOCK_TIMEOUT,
-    max_retries=4,
-)
+@app.shared_task(max_retries=4)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def retry_get_metadata_task(
     address: ChecksumAddress, token_id: int
 ) -> Optional[CollectibleWithMetadata]:
@@ -490,4 +528,13 @@ def remove_not_trusted_multisig_txs_task(
         .filter(modified__lt=timezone.now() - time_delta)
         .delete()
     )
+    return deleted
+
+
+@app.shared_task()
+@close_gevent_db_connection_decorator
+def delete_expired_delegates_task():
+    logger.info("Deleting expired Safe Delegates")
+    now = timezone.now()
+    deleted, _ = SafeContractDelegate.objects.filter(expiry_date__lte=now).delete()
     return deleted
