@@ -32,6 +32,6 @@ psycogreen==1.0.2
 psycopg[binary]==3.2.3
 redis==5.2.1
 requests==2.32.3
-git+https://github.com/AstarNetwork/safe-eth-py.git@astar-v6.4.0#egg=safe-eth-py
-#safe-eth-py[django]==6.0.0b37
+git+https://github.com/AstarNetwork/safe-eth-py.git@v7.1.1#egg=safe-eth-py
+#safe-eth-py[django]==7.1.1
 web3==6.20.2
