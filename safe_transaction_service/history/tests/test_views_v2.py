@@ -804,8 +804,9 @@ class TestViewsV2(SafeTestCaseMixin, APITestCase):
             )
 
     def test_get_multisig_transactions(self):
-        safe_address = Account.create().address
-        proposer = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
+        proposer = safe.retrieve_owners()[0]
         response = self.client.get(
             reverse("v2:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -909,7 +910,8 @@ class TestViewsV2(SafeTestCaseMixin, APITestCase):
         Unique nonce should follow the trusted filter
         """
 
-        safe_address = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
         url = reverse("v2:history:multisig-transactions", args=(safe_address,))
         response = self.client.get(
             url,
@@ -946,9 +948,14 @@ class TestViewsV2(SafeTestCaseMixin, APITestCase):
         self, get_data_decoded_mock: MagicMock
     ):
         try:
+            safe = self.deploy_test_safe()
+            safe_address = safe.address
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             multisig_transaction = MultisigTransactionFactory(
-                operation=SafeOperationEnum.CALL.value, data=b"abcd", trusted=True
+                safe=safe_address,
+                operation=SafeOperationEnum.CALL.value,
+                data=b"abcd",
+                trusted=True,
             )
             safe_address = multisig_transaction.safe
             response = self.client.get(
@@ -1079,6 +1086,8 @@ class TestViewsV2(SafeTestCaseMixin, APITestCase):
         self.assertEqual(len(response.data["results"]), 1)
 
     def test_get_multisig_transaction(self):
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
         safe_tx_hash = to_0x_hex_str(fast_keccak_text("gnosis"))
         response = self.client.get(
             reverse("v2:history:multisig-transaction", args=(safe_tx_hash,)),
@@ -1092,7 +1101,9 @@ class TestViewsV2(SafeTestCaseMixin, APITestCase):
             "0000000001"
         )
 
-        multisig_tx = MultisigTransactionFactory(data=add_owner_with_threshold_data)
+        multisig_tx = MultisigTransactionFactory(
+            safe=safe_address, data=add_owner_with_threshold_data
+        )
         safe_tx_hash = multisig_tx.safe_tx_hash
         response = self.client.get(
             reverse("v2:history:multisig-transaction", args=(safe_tx_hash,)),
@@ -1941,6 +1952,88 @@ class TestViewsV2(SafeTestCaseMixin, APITestCase):
             "Just one signature is expected if using delegates",
             response.data["non_field_errors"][0],
         )
+
+    def test_post_multisig_transaction_with_delegate_call(self):
+        safe_owner_1 = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner_1.address])
+        safe_address = safe.address
+
+        try:
+            response = self.client.get(
+                reverse("v2:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 0)
+
+            data = {
+                "to": Account.create().address,
+                "value": 0,
+                "data": "0x12121212",
+                "operation": SafeOperationEnum.DELEGATE_CALL.value,
+                "nonce": 0,
+                "safeTxGas": 0,
+                "baseGas": 0,
+                "gasPrice": 0,
+                "gasToken": "0x0000000000000000000000000000000000000000",
+                "refundReceiver": "0x0000000000000000000000000000000000000000",
+                "sender": safe_owner_1.address,
+            }
+            safe_tx = safe.build_multisig_tx(
+                data["to"],
+                data["value"],
+                data["data"],
+                data["operation"],
+                data["safeTxGas"],
+                data["baseGas"],
+                data["gasPrice"],
+                data["gasToken"],
+                data["refundReceiver"],
+                safe_nonce=data["nonce"],
+            )
+            data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
+
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            # Disable creation with delegate call and not trusted contract
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v2:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(
+                    response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY
+                )
+
+            # Enable creation with delegate call
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=False
+            ):
+                response = self.client.post(
+                    reverse("v2:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                multisig_transaction_db = MultisigTransaction.objects.first()
+                self.assertEqual(multisig_transaction_db.operation, 1)
+
+            # Disable creation with delegate call and trusted contract
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            ContractFactory(address=data["to"], trusted_for_delegate_call=True)
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v2:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        finally:
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
     def test_delete_multisig_transaction(self):
         owner_account = Account.create()

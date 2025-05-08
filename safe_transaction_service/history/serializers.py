@@ -5,6 +5,7 @@ import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from django.conf import settings
 from django.http import Http404
 from django.utils import timezone
 
@@ -24,7 +25,7 @@ from safe_eth.eth.django.serializers import (
     HexadecimalField,
     Sha3HashField,
 )
-from safe_eth.safe import Safe
+from safe_eth.safe import Safe, SafeOperationEnum
 from safe_eth.safe.safe_signature import EthereumBytes, SafeSignature, SafeSignatureType
 from safe_eth.safe.serializers import SafeMultisigTxSerializer
 from safe_eth.util.util import to_0x_hex_str
@@ -40,6 +41,7 @@ from safe_transaction_service.utils.serializers import (
     get_safe_owners,
 )
 
+from ..contracts.models import Contract
 from .exceptions import InternalValidationError, NodeConnectionException
 from .helpers import (
     DelegateSignatureHelper,
@@ -125,6 +127,10 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
         ethereum_client = get_auto_ethereum_client()
         for safe_signature in parsed_signatures:
             owner = safe_signature.owner
+            if owner in settings.BANNED_EOAS:
+                raise ValidationError(
+                    f"Signer={owner} is not authorized to interact with the service"
+                )
             if owner not in safe_owners:
                 raise ValidationError(
                     f"Signer={owner} is not an owner. Current owners={safe_owners}"
@@ -191,15 +197,24 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
     def validate(self, attrs):
         super().validate(attrs)
 
+        tx_to = attrs["to"]
+        tx_operation = attrs["operation"]
+        if (
+            settings.DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION
+            and tx_operation == SafeOperationEnum.DELEGATE_CALL.value
+            and tx_to not in Contract.objects.trusted_addresses_for_delegate_call()
+        ):
+            raise ValidationError("Operation DELEGATE_CALL is not allowed")
+
         ethereum_client = get_auto_ethereum_client()
         safe_address = attrs["safe"]
 
         safe = Safe(safe_address, ethereum_client)
         safe_tx = safe.build_multisig_tx(
-            attrs["to"],
+            tx_to,
             attrs["value"],
             attrs["data"],
-            attrs["operation"],
+            tx_operation,
             attrs["safe_tx_gas"],
             attrs["base_gas"],
             attrs["gas_price"],
@@ -262,6 +277,11 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
                     f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={owner} is not valid"
+                )
+
+            if owner in settings.BANNED_EOAS:
+                raise ValidationError(
+                    f"Signer={owner} is not authorized to interact with the service"
                 )
 
             if owner in delegates and len(parsed_signatures) > 1:
@@ -713,19 +733,23 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
 
     def get_confirmations(self, obj: MultisigTransaction) -> Dict[str, Any]:
         """
-        Filters confirmations queryset
+        Validate and check integrity of confirmations queryset
+
         :param obj: MultisigConfirmation instance
         :return: Serialized queryset
+        :raises InternalValidationError: If any inconsistency is detected
         """
-        if obj.ethereum_tx_id:
+        safe_address = obj.safe
+        # Just get safe info for non executed transactions
+        if obj.ethereum_tx_id or obj.nonce < self.context.get("current_nonce", 0):
             return SafeMultisigConfirmationResponseSerializer(
                 obj.confirmations, many=True
             ).data
 
         signature_owners_addresses = []
-        safe_address = obj.safe
+
         safe_tx_hash = obj.safe_tx_hash
-        safe_owners = get_safe_owners(safe_address)
+        safe_owners = self.context.get("current_owners", [])
 
         ethereum_client = get_auto_ethereum_client()
         safe = Safe(safe_address, ethereum_client)
@@ -769,6 +793,7 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
                 raise InternalValidationError(
                     f"[{safe_tx_hash}]: Signer={owner} is not an owner. Current owners={safe_owners}"
                 )
+            # Signatures validation
             parsed_signatures = SafeSignature.parse_signature(
                 signature,
                 safe_tx_hash,
@@ -784,7 +809,11 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
                     f"1 owner signature was expected for owner {owner}, {len(parsed_signatures)} received"
                 )
             parsed_signature = parsed_signatures[0]
-            if not parsed_signature.is_valid(ethereum_client, safe_address):
+            # For approved_hash signature we just check if the contained owner is an owner of Safe.
+            if (
+                parsed_signature.signature_type != SafeSignatureType.APPROVED_HASH
+                and not parsed_signature.is_valid(ethereum_client, safe_address)
+            ):
                 logger.error(
                     obj.to_log(
                         f"Signature={to_0x_hex_str(parsed_signature.signature)} for owner={owner} is not valid"
@@ -793,6 +822,7 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
                 raise InternalValidationError(
                     f"Signature={to_0x_hex_str(parsed_signature.signature)} for owner={owner} is not valid"
                 )
+
             if parsed_signature.owner != owner:
                 logger.error(
                     obj.to_log(
@@ -802,6 +832,7 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
                 raise InternalValidationError(
                     f"Signature owner {parsed_signature.owner} does not match confirmation owner={owner}"
                 )
+
             if owner in signature_owners_addresses:
                 logger.error(
                     obj.to_log(

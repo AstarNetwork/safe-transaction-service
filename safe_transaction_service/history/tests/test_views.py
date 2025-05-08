@@ -858,7 +858,46 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(MultisigConfirmation.objects.count(), 2)
 
+    def test_post_multisig_confirmation_banned(self):
+        owner_account_1 = Account.create()
+        owner_account_2 = Account.create()
+        safe = self.deploy_test_safe(
+            owners=[owner_account_1.address, owner_account_2.address]
+        )
+        safe_address = safe.address
+        multisig_transaction = MultisigTransactionFactory(
+            safe=safe_address, trusted=True, ethereum_tx=None
+        )
+        safe_tx_hash = multisig_transaction.safe_tx_hash
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
+        }
+        self.assertEqual(MultisigConfirmation.objects.count(), 0)
+        with self.settings(BANNED_EOAS={owner_account_1.address}):
+            response = self.client.post(
+                reverse(
+                    "v1:history:multisig-transaction-confirmations",
+                    args=(safe_tx_hash,),
+                ),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.json(),
+                {
+                    "signature": [
+                        f"Signer={owner_account_1.address} is not authorized to interact with the service"
+                    ]
+                },
+            )
+            self.assertEqual(MultisigConfirmation.objects.count(), 0)
+
     def test_get_multisig_transaction(self):
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
         safe_tx_hash = to_0x_hex_str(fast_keccak_text("gnosis"))
         response = self.client.get(
             reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
@@ -872,7 +911,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "0000000001"
         )
 
-        multisig_tx = MultisigTransactionFactory(data=add_owner_with_threshold_data)
+        multisig_tx = MultisigTransactionFactory(
+            safe=safe_address, data=add_owner_with_threshold_data
+        )
         safe_tx_hash = multisig_tx.safe_tx_hash
         response = self.client.get(
             reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
@@ -1171,8 +1212,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_get_multisig_transactions(self):
-        safe_address = Account.create().address
-        proposer = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
+        proposer = safe.retrieve_owners()[0]
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1276,7 +1318,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         Unique nonce should follow the trusted filter
         """
 
-        safe_address = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
         url = reverse("v1:history:multisig-transactions", args=(safe_address,))
         response = self.client.get(
             url,
@@ -1313,11 +1356,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self, get_data_decoded_mock: MagicMock
     ):
         try:
+            safe = self.deploy_test_safe()
+            safe_address = safe.address
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             multisig_transaction = MultisigTransactionFactory(
-                operation=SafeOperationEnum.CALL.value, data=b"abcd", trusted=True
+                safe=safe_address,
+                operation=SafeOperationEnum.CALL.value,
+                data=b"abcd",
+                trusted=True,
             )
-            safe_address = multisig_transaction.safe
             response = self.client.get(
                 reverse("v1:history:multisig-transactions", args=(safe_address,)),
                 format="json",
@@ -1336,10 +1383,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertIsNone(response.data["results"][0]["data_decoded"])
 
-            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             ContractFactory(
                 address=multisig_transaction.to, trusted_for_delegate_call=True
             )
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             # Force don't use cache because we are not cleaning the cache on contracts change
             with mock.patch(
                 "safe_transaction_service.history.views.settings.CACHE_VIEW_DEFAULT_TIMEOUT",
@@ -1733,7 +1780,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         # Ensure right response is returned
         response = self.client.get(
-            reverse("v2:history:multisig-transactions", args=(safe.address,)),
+            reverse("v1:history:multisig-transactions", args=(safe.address,)),
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -2220,6 +2267,147 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "Just one signature is expected if using delegates",
             response.data["non_field_errors"][0],
         )
+
+    def test_post_multisig_transactions_with_banned_signatures(self):
+        safe_owners = [Account.create() for _ in range(4)]
+        safe_owner_addresses = [s.address for s in safe_owners]
+        safe = self.deploy_test_safe(owners=safe_owner_addresses, threshold=3)
+        safe_address = safe.address
+
+        data = {
+            "to": Account.create().address,
+            "value": 100000000000000000,
+            "data": None,
+            "operation": 0,
+            "nonce": 0,
+            "safeTxGas": 0,
+            "baseGas": 0,
+            "gasPrice": 0,
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000",
+            # "contractTransactionHash": "0x1c2c77b29086701ccdda7836c399112a9b715c6a153f6c8f75c84da4297f60d3",
+            "sender": safe_owners[0].address,
+            "origin": "Testing origin field",
+        }
+
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        safe_tx_hash = safe_tx.safe_tx_hash
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            b"".join(
+                [
+                    safe_owner.unsafe_sign_hash(safe_tx_hash)["signature"]
+                    for safe_owner in safe_owners
+                ]
+            )
+        )
+        with self.settings(BANNED_EOAS={safe_owners[0].address}):
+            response = self.client.post(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+            self.assertEqual(
+                response.json(),
+                {
+                    "nonFieldErrors": [
+                        f"Signer={safe_owners[0].address} is not authorized to interact with the service"
+                    ]
+                },
+            )
+
+    def test_post_multisig_transaction_with_delegate_call(self):
+        safe_owner_1 = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner_1.address])
+        safe_address = safe.address
+        try:
+            response = self.client.get(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 0)
+
+            data = {
+                "to": Account.create().address,
+                "value": 0,
+                "data": "0x12121212",
+                "operation": SafeOperationEnum.DELEGATE_CALL.value,
+                "nonce": 0,
+                "safeTxGas": 0,
+                "baseGas": 0,
+                "gasPrice": 0,
+                "gasToken": "0x0000000000000000000000000000000000000000",
+                "refundReceiver": "0x0000000000000000000000000000000000000000",
+                "sender": safe_owner_1.address,
+            }
+            safe_tx = safe.build_multisig_tx(
+                data["to"],
+                data["value"],
+                data["data"],
+                data["operation"],
+                data["safeTxGas"],
+                data["baseGas"],
+                data["gasPrice"],
+                data["gasToken"],
+                data["refundReceiver"],
+                safe_nonce=data["nonce"],
+            )
+            data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
+
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            # Disable creation with delegate call and not trusted contract
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(
+                    response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY
+                )
+
+            # Enable creation with delegate call
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=False
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                multisig_transaction_db = MultisigTransaction.objects.first()
+                self.assertEqual(multisig_transaction_db.operation, 1)
+
+            # Disable creation with delegate call and trusted contract
+            ContractFactory(address=data["to"], trusted_for_delegate_call=True)
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        finally:
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
     def test_safe_balances_view(self):
         safe_address = Account.create().address
@@ -3880,3 +4068,17 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def test_get_multisigtransaction_with_node_errors(self):
+        safe_address = Account.create().address
+        proposer = Account.create().address
+        multisig_tx = MultisigTransactionFactory(
+            safe=safe_address, proposer=proposer, trusted=True
+        )
+        response = self.client.get(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # NodeConnectionException
