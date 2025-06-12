@@ -86,17 +86,11 @@ class Command(BaseCommand):
             # only update the contracts with empty values
             queryset = Contract.objects.get_or_create
 
-        if not (
-            chain_deployments := self._get_deployments_by_chain_and_version(
-                versions, str(chain_id)
-            )
-        ):
-            # If the chain is not listed on safe_deployments, then Search on chain
-            logger.warning("Creating default Safe contracts from chain")
+        logger.info("Creating default Safe contracts from chain")
 
-            chain_deployments = self._get_default_deployments_by_version_on_chain(
-                versions, ethereum_client
-            )
+        chain_deployments = self._get_default_deployments_by_version_on_chain(
+            versions, ethereum_client
+        )
 
         if chain_deployments:
             self._create_or_update_contracts_from_deployments(
