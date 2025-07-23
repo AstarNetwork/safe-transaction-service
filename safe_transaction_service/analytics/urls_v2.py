@@ -9,5 +9,10 @@ urlpatterns = [
         "multisig-transactions/by-origin/",
         views_v2.AnalyticsMultisigTxsByOriginListView.as_view(),
         name="analytics-multisig-txs-by-origin",
-    )
+    ),
+    path(
+        "safe-statistics/",
+        views_v2.AnalyticsSafeStatisticsView.as_view(),
+        name="analytics-safe-statistics",
+    ),
 ]

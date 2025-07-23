@@ -175,6 +175,11 @@ TASKS = [
         description="Run query to get number of transactions grouped by safe-app (Every sunday at 00:00)",
         cron=CronDefinition(minute=0, hour=0, day_of_week=0),  # Every sunday 0 0 * * 0
     ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.get_safe_statistics_task",
+        description="Calculate Safe statistics (every day at 00:00)",
+        cron=CronDefinition(minute=0, hour=0),  # Every day at 00:00 - 0 0 * * *
+    ),
 ]
 
 
