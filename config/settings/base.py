@@ -53,7 +53,7 @@ FORCE_SCRIPT_NAME = env("FORCE_SCRIPT_NAME", default=None)
 SSO_ENABLED = False
 
 # Enable analytics endpoints
-ENABLE_ANALYTICS = env("ENABLE_ANALYTICS", default=False)
+ENABLE_ANALYTICS = env.bool("ENABLE_ANALYTICS", default=False)
 
 # GUNICORN
 GUNICORN_REQUEST_TIMEOUT = gunicorn_request_timeout
@@ -253,7 +253,14 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = env.bool(
     "CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP", default=True
 )
 # https://docs.celeryq.dev/en/latest/userguide/configuration.html#task-result-backend-settings
-CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=None)
+# Default to the same Redis the cache + analytics tasks already use:
+# chord-based fan-outs (e.g. analytics native-balance shards) need a
+# result backend to coordinate the reduce step, even though
+# CELERY_IGNORE_RESULT below keeps regular task results from being stored.
+CELERY_RESULT_BACKEND = env(
+    "CELERY_RESULT_BACKEND",
+    default=env("REDIS_URL", default="redis://localhost:6379/0"),
+)
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-accept_content
 CELERY_ACCEPT_CONTENT = ["json"]
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-task_serializer
@@ -309,6 +316,10 @@ CELERY_ROUTES = (
         ),
         (
             "safe_transaction_service.analytics.tasks.*",
+            {"queue": "contracts", "delivery_mode": "transient"},
+        ),
+        (
+            "safe_transaction_service.analytics.tasks_shards.*",
             {"queue": "contracts", "delivery_mode": "transient"},
         ),
     ],

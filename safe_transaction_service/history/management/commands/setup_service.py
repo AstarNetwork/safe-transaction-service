@@ -161,9 +161,42 @@ TASKS = [
         cron=CronDefinition(minute=0, hour=0, day_of_week=0),  # Every sunday 0 0 * * 0
     ),
     CeleryTaskConfiguration(
-        name="safe_transaction_service.analytics.tasks.get_safe_statistics_task",
-        description="Calculate Safe statistics (every day at 00:00)",
-        cron=CronDefinition(minute=0, hour=0),  # Every day at 00:00 - 0 0 * * *
+        name="safe_transaction_service.analytics.tasks.compute_summary_task",
+        description="Refresh /summary/ snapshot (daily at 02:00)",
+        cron=CronDefinition(minute=0, hour=2),  # Daily at 02:00 - 0 2 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_daily_metrics_task",
+        description=(
+            "Compute incremental DailyMetric row + refresh active_* window "
+            "caches (daily at 01:00)"
+        ),
+        cron=CronDefinition(minute=0, hour=1),  # Daily at 01:00 - 0 1 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_active_safes_task",
+        description="Precompute active Safes for 7d/30d/90d (daily at 02:30)",
+        cron=CronDefinition(minute=30, hour=2),  # Daily at 02:30 - 30 2 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_active_owners_task",
+        description="Precompute active owners for 7d/30d/90d (daily at 02:45)",
+        cron=CronDefinition(minute=45, hour=2),  # Daily at 02:45 - 45 2 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_safe_segments_task",
+        description="Precompute Safe segments by owner count (daily at 03:00)",
+        cron=CronDefinition(minute=0, hour=3),  # Daily at 03:00 - 0 3 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_tvl_task",
+        description="Precompute TVL aggregates (daily at 03:15)",
+        cron=CronDefinition(minute=15, hour=3),  # Daily at 03:15 - 15 3 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_safe_creations_task",
+        description="Compute Safe creations day-grain time series (daily at 04:30)",
+        cron=CronDefinition(minute=30, hour=4),  # 30 4 * * *
     ),
 ]
 
