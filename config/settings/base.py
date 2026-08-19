@@ -389,6 +389,14 @@ COLLECTIBLES_API_LOG_LEVEL = (
     env("COLLECTIBLES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
 )
 
+# ERROR REPORTS
+# ------------------------------------------------------------------------------
+# Redacts sensitive settings/`request.META` values on Django error reports.
+# https://docs.djangoproject.com/en/dev/howto/error-reporting/#filtering-error-reports
+DEFAULT_EXCEPTION_REPORTER_FILTER = (
+    "safe_transaction_service.loggers.exception_filters.CustomExceptionReporterFilter"
+)
+
 # LOGGING
 # ------------------------------------------------------------------------------
 # See: https://docs.djangoproject.com/en/dev/ref/settings/#logging
