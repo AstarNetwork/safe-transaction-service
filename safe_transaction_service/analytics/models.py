@@ -31,6 +31,23 @@ class DailyMetric(models.Model):
     multisig_txs_proposed = models.PositiveIntegerField(default=0)
     confirmations_count = models.PositiveIntegerField(default=0)
     confirmed_tx_count = models.PositiveIntegerField(default=0)
+    # API attribution of the executed multisig txs counted in
+    # `multisig_txs_executed`, split on `MultisigTransaction.proposer`.
+    # That field is only ever written by the proposal API
+    # (`history/serializers.py`, inside the `get_or_create` defaults):
+    # `via_api` = the tx was created through this service's API before
+    # it executed; `indexed_only` = the indexer was the first (and only)
+    # writer, i.e. the tx was executed on-chain without ever being
+    # proposed here. Both are nullable on purpose: NULL means "not
+    # computed for this day" (row written before the columns existed, or
+    # the day was not indexed yet), which is a different statement from
+    # a real 0. `via_api` + `indexed_only` == `multisig_txs_executed` for
+    # any day computed after the columns landed — all three come out of
+    # the same aggregate over the same join. Nullable is also required
+    # mechanically: `_compute_daily_tx_volume` INSERTs this row with an
+    # explicit column list that does not name these two.
+    multisig_txs_via_api = models.PositiveIntegerField(null=True)
+    multisig_txs_indexed_only = models.PositiveIntegerField(null=True)
     computed_at = models.DateTimeField()
 
     class Meta:

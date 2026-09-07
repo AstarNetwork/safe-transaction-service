@@ -535,6 +535,19 @@ class AnalyticsService:
         we deliberately do NOT fall back to a 30s live query on the
         request path (that's what caused the 504s this rollup
         replaces).
+
+        API attribution — `executed_multisig_txs_via_api` /
+        `executed_multisig_txs_indexed_only` split `executed_multisig_txs`
+        by whether the tx carries a `proposer`, i.e. whether it was
+        created through this service's proposal API or first seen on
+        chain by the indexer. They sum to `executed_multisig_txs` on a
+        fully covered window.
+
+        `api_attribution_coverage_days` ships with them and callers must
+        use it. The two columns are nullable and `Sum` skips NULL, so on a
+        partly backfilled window both halves silently understate; a
+        caller that divides without first checking this counter against
+        `coverage_days` will publish a wrong ratio.
         """
         days = _parse_window(window)
         if days is None:
@@ -557,6 +570,12 @@ class AnalyticsService:
             ),
             conf_total=Coalesce(Sum("confirmations_count"), Value(0)),
             conf_txs=Coalesce(Sum("confirmed_tx_count"), Value(0)),
+            via_api=Coalesce(Sum("multisig_txs_via_api"), Value(0)),
+            indexed_only=Coalesce(Sum("multisig_txs_indexed_only"), Value(0)),
+            # Count() skips NULL, so this is "days that actually carry
+            # the split", not "days in the window" — that's the whole
+            # point of surfacing it next to coverage_days.
+            split_coverage=Count("multisig_txs_via_api"),
             coverage=Count("date"),
         )
         conf_total = int(agg["conf_total"] or 0)
@@ -567,6 +586,9 @@ class AnalyticsService:
             "window": window,
             "total_multisig_txs": int(agg["proposed"] or 0),
             "executed_multisig_txs": int(agg["executed"] or 0),
+            "executed_multisig_txs_via_api": int(agg["via_api"] or 0),
+            "executed_multisig_txs_indexed_only": int(agg["indexed_only"] or 0),
+            "api_attribution_coverage_days": int(agg["split_coverage"] or 0),
             "module_txs": int(agg["module"] or 0),
             "total_value_wei": str(int(agg["native"] or 0)),
             "avg_confirmations": avg_conf,

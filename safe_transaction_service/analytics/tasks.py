@@ -953,10 +953,18 @@ WHERE etx.block_id >= %s AND etx.block_id < %s
 # wall-clock for this step. The cast to `text` (then to Python int in
 # the caller) keeps the value precise for the uint256 sum without
 # relying on Django's implicit DecimalField precision.
+# The two `FILTER` aggregates split the same rows by API attribution:
+# `mt.proposer` is written only by the proposal API, so non-NULL means
+# the tx was created through this service (`via_api`) and NULL means the
+# indexer was the first writer — executed on-chain, never proposed here
+# (`indexed_only`). They ride along on the join that was already being
+# scanned — no extra round-trip, no extra index need.
 _METRIC_CORE_MULTISIG_COUNT_SUM_SQL = """
 SELECT
     COUNT(*) AS tx_count,
-    COALESCE(SUM(mt.value), 0)::text AS native_wei
+    COALESCE(SUM(mt.value), 0)::text AS native_wei,
+    COUNT(*) FILTER (WHERE mt.proposer IS NOT NULL) AS via_api,
+    COUNT(*) FILTER (WHERE mt.proposer IS NULL) AS indexed_only
 FROM history_multisigtransaction mt
 JOIN history_ethereumtx etx ON mt.ethereum_tx_id = etx.tx_hash
 WHERE etx.block_id >= %s AND etx.block_id < %s
@@ -979,9 +987,10 @@ def _compute_daily_metric_core(day_start, day_end) -> DailyMetric:
     together took ~40 min/day in the original implementation. The
     block-window form puts each in the seconds range.
 
-    `multisig_txs_executed` and `native_value_wei` share the same join
-    shape; combined into a single SQL with two aggregates to halve the
-    round-trip.
+    `multisig_txs_executed`, `native_value_wei` and the
+    `multisig_txs_via_api` / `multisig_txs_indexed_only` split
+    share the same join shape; combined into a single SQL with four
+    aggregates to halve the round-trip.
 
     `module_txs` keeps the simple 2-table ORM filter on
     `internal_tx.timestamp` (directly btree-indexed); `erc20_transfers`
@@ -996,6 +1005,11 @@ def _compute_daily_metric_core(day_start, day_end) -> DailyMetric:
         new_safes = 0
         multisig_txs_executed = 0
         native_value_wei = 0
+        # Nullable columns stay NULL here — "day not split" rather than a
+        # real zero, so a not-yet-indexed day can't be read as "nothing
+        # came through the proposal API".
+        multisig_txs_via_api = None
+        multisig_txs_indexed_only = None
     else:
         with connection.cursor() as cursor:
             cursor.execute(_METRIC_CORE_NEW_SAFES_SQL, [start_block, end_block])
@@ -1007,6 +1021,8 @@ def _compute_daily_metric_core(day_start, day_end) -> DailyMetric:
             row = cursor.fetchone()
             multisig_txs_executed = int(row[0] or 0)
             native_value_wei = int(row[1] or 0)
+            multisig_txs_via_api = int(row[2] or 0)
+            multisig_txs_indexed_only = int(row[3] or 0)
 
     module_txs = ModuleTransaction.objects.filter(
         internal_tx__timestamp__gte=day_start,
@@ -1050,6 +1066,8 @@ def _compute_daily_metric_core(day_start, day_end) -> DailyMetric:
             "active_safes": active_safes_daily,
             "active_owners": active_owners_daily,
             "multisig_txs_executed": multisig_txs_executed,
+            "multisig_txs_via_api": multisig_txs_via_api,
+            "multisig_txs_indexed_only": multisig_txs_indexed_only,
             "module_txs": module_txs,
             "erc20_transfers": erc20_transfers,
             "native_value_wei": native_value_wei,
@@ -1552,12 +1570,15 @@ def _upsert_daily_metric(day_start, day_end) -> DailyMetric:
     obj = _compute_daily_metric_core(day_start, day_end)
     logger.info(
         "_upsert_daily_metric: metric_core took %.2fs day=%s "
-        "active_safes=%d active_owners=%d multisig_txs_executed=%d",
+        "active_safes=%d active_owners=%d multisig_txs_executed=%d "
+        "via_api=%s indexed_only=%s",
         time.time() - core_started,
         day_label,
         obj.active_safes,
         obj.active_owners,
         obj.multisig_txs_executed,
+        obj.multisig_txs_via_api,
+        obj.multisig_txs_indexed_only,
     )
     logger.info(
         "_upsert_daily_metric: completed in %.2fs day=%s",

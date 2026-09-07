@@ -318,6 +318,10 @@ class TestTxVolumeView(AnalyticsTestMixin, APITestCase):
         self.assertEqual(data["executed_multisig_txs"], 0)
         self.assertEqual(data["module_txs"], 0)
         self.assertEqual(data["total_value_wei"], "0")
+        # Attribution keys are always present, zero on an empty window.
+        self.assertEqual(data["executed_multisig_txs_via_api"], 0)
+        self.assertEqual(data["executed_multisig_txs_indexed_only"], 0)
+        self.assertEqual(data["api_attribution_coverage_days"], 0)
 
     def test_with_data(self):
         """The view reads from the DailyMetric rollup. Today's row is
@@ -338,6 +342,8 @@ class TestTxVolumeView(AnalyticsTestMixin, APITestCase):
             date=timezone.now().date() - timedelta(days=1),
             multisig_txs_proposed=2,
             multisig_txs_executed=2,
+            multisig_txs_via_api=1,
+            multisig_txs_indexed_only=1,
             module_txs=1,
             native_value_wei=3000,
             confirmations_count=4,
@@ -359,6 +365,73 @@ class TestTxVolumeView(AnalyticsTestMixin, APITestCase):
         self.assertEqual(data["avg_confirmations"], 2.0)
         self.assertEqual(data.get("source"), "daily_metric")
         self.assertEqual(data["coverage_days"], 1)
+        # API attribution: the executed split adds up to
+        # `executed_multisig_txs` and the coverage counter equals
+        # `coverage_days` on a fully covered window, which is the only
+        # condition under which a consumer may divide.
+        self.assertEqual(data["executed_multisig_txs_via_api"], 1)
+        self.assertEqual(data["executed_multisig_txs_indexed_only"], 1)
+        self.assertEqual(
+            data["executed_multisig_txs_via_api"]
+            + data["executed_multisig_txs_indexed_only"],
+            data["executed_multisig_txs"],
+        )
+        self.assertEqual(data["api_attribution_coverage_days"], data["coverage_days"])
+
+    def test_api_attribution_partial_coverage(self):
+        """A window that is only partly backfilled: `Sum` skips the NULL
+        days, so both halves understate. `api_attribution_coverage_days`
+        falling short of `coverage_days` is what tells the consumer not
+        to divide.
+        """
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from safe_transaction_service.analytics.models import DailyMetric
+
+        today = timezone.now().date()
+        # Fully computed day.
+        DailyMetric.objects.create(
+            date=today - timedelta(days=1),
+            multisig_txs_proposed=5,
+            multisig_txs_executed=4,
+            multisig_txs_via_api=3,
+            multisig_txs_indexed_only=1,
+            computed_at=timezone.now(),
+        )
+        # Pre-backfill day: executed split NULL.
+        DailyMetric.objects.create(
+            date=today - timedelta(days=2),
+            multisig_txs_proposed=7,
+            multisig_txs_executed=6,
+            computed_at=timezone.now(),
+        )
+        # Fully computed day with every executed tx attributed to the API.
+        DailyMetric.objects.create(
+            date=today - timedelta(days=3),
+            multisig_txs_proposed=0,
+            multisig_txs_executed=2,
+            multisig_txs_via_api=2,
+            multisig_txs_indexed_only=0,
+            computed_at=timezone.now(),
+        )
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-tx-volume"),
+            {"window": "30d"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+
+        self.assertEqual(data["coverage_days"], 3)
+        # Keys are still numbers, never null — they just don't add up.
+        self.assertEqual(data["executed_multisig_txs_via_api"], 5)
+        self.assertEqual(data["executed_multisig_txs_indexed_only"], 1)
+        self.assertEqual(data["executed_multisig_txs"], 12)
+        self.assertLess(data["api_attribution_coverage_days"], data["coverage_days"])
+        self.assertEqual(data["api_attribution_coverage_days"], 2)
 
 
 class TestSafeSegmentsView(AnalyticsTestMixin, APITestCase):

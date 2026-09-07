@@ -489,6 +489,46 @@ class TestUpsertDailyMetric(TestCase):
         self.assertEqual(int(row.native_value_wei), 1500)
         self.assertIsNotNone(row.computed_at)
 
+    def test_splits_executed_multisig_txs_by_api_attribution(self):
+        """`proposer` is written only by the proposal API, so the split
+        separates "created through this service's API" (`via_api`) from
+        "seen on-chain only" (`indexed_only`). The two columns must add
+        up to `multisig_txs_executed`."""
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        safe = SafeContractFactory()
+        MultisigTransactionFactory(safe=safe.address, proposer=Account.create().address)
+        MultisigTransactionFactory(safe=safe.address, proposer=None)
+        MultisigTransactionFactory(safe=safe.address, proposer=None)
+
+        day_start = timezone.now() - timezone.timedelta(hours=1)
+        day_end = day_start + timezone.timedelta(days=1)
+        _upsert_daily_metric(day_start, day_end)
+
+        row = DailyMetric.objects.get(date=day_start.date())
+        self.assertEqual(row.multisig_txs_via_api, 1)
+        self.assertEqual(row.multisig_txs_indexed_only, 2)
+        self.assertEqual(
+            row.multisig_txs_via_api + row.multisig_txs_indexed_only,
+            row.multisig_txs_executed,
+        )
+
+    def test_api_attribution_split_is_null_when_day_not_indexed(self):
+        """No blocks in the window -> the split stays NULL instead of
+        claiming a real zero (see `_compute_daily_metric_core`)."""
+        from django.utils import timezone
+
+        day_start = timezone.now() + timezone.timedelta(days=365)
+        day_end = day_start + timezone.timedelta(days=1)
+        _upsert_daily_metric(day_start, day_end)
+
+        row = DailyMetric.objects.get(date=day_start.date())
+        self.assertEqual(row.multisig_txs_executed, 0)
+        self.assertIsNone(row.multisig_txs_via_api)
+        self.assertIsNone(row.multisig_txs_indexed_only)
+
     def test_idempotent_upsert(self):
         from django.utils import timezone
 
@@ -774,9 +814,9 @@ class TestDailyRollupPopulators(TestCase):
 
     def test_compute_daily_tx_volume_preserves_core_columns(self):
         """When `_compute_daily_metric_core` has already written the row,
-        the tx-volume upsert must update ONLY the three new columns and
-        leave the executed-side counts alone (ON CONFLICT clause is
-        explicit about which fields to overwrite)."""
+        the tx-volume upsert must update ONLY its own columns and leave
+        the executed-side counts alone (ON CONFLICT clause is explicit
+        about which fields to overwrite)."""
         from safe_transaction_service.analytics.tasks import (
             _compute_daily_tx_volume,
         )
@@ -797,7 +837,11 @@ class TestDailyRollupPopulators(TestCase):
         _compute_daily_tx_volume(self.day_start, self.day_end)
         row = DailyMetric.objects.get(date=self.date_value)
         self.assertEqual(row.multisig_txs_proposed, 1)
-        # Executed-side columns untouched.
+        # Executed-side columns untouched — including the API-attribution
+        # split, which this populator must not write (the core upsert owns
+        # it, which is why the columns are nullable).
+        self.assertIsNone(row.multisig_txs_via_api)
+        self.assertIsNone(row.multisig_txs_indexed_only)
         self.assertEqual(row.multisig_txs_executed, 7)
         self.assertEqual(row.module_txs, 3)
         self.assertEqual(row.erc20_transfers, 11)
