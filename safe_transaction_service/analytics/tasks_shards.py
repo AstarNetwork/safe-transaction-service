@@ -7,9 +7,10 @@ Two independent fan-outs live here:
    ``reduce_native_balance_shards``) — splits the all-Safes native-balance
    compute by first hex nibble of the Safe address so the wall-clock drops
    ~16× on BASE-sized fleets, gated by the worker pool size.
-2. **Backfill sharding** (``_compute_daily_metric_shard`` +
-   ``_backfill_done``) — one Celery task per UTC day for the
-   ``backfill_daily_metrics`` management command.
+2. **Backfill sharding** (``compute_daily_metric_shard`` +
+   ``backfill_done``) — one Celery task per UTC day for the
+   ``backfill_daily_metrics`` management command, fanned out one chunk at
+   a time: the chord callback of chunk *n* dispatches chunk *n+1*.
 
 Both shapes use the celery primitives `group` / `chord`; both are eager-mode
 safe so they run inline during tests without a broker.
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from datetime import date, datetime, timedelta
 
@@ -42,10 +44,18 @@ logger = logging.getLogger(__name__)
 # (two-nibble) only if pool size grows past 16.
 HEX_PREFIXES: tuple[str, ...] = tuple("0123456789abcdef")
 
-# Redis key holding the most-recent backfill summary written by
-# `backfill_done` — useful for `manage.py backfill_daily_metrics --wait`
-# style polling.
+# Redis key pointing at the most recently *started* backfill run
+# (`{"run_id", "run_key", "started_at"}`), so `manage.py
+# backfill_daily_metrics --status` can find it without arguments. Legacy
+# callers of `dispatch_backfill()` without a stats_key still get their
+# single-chord summary written here — `--status` tolerates both shapes.
 BACKFILL_CURSOR_KEY = "analytics_backfill_cursor"
+# Per-run manifest lives at `<prefix><run_id>`; per-chunk summaries at
+# `<prefix><run_id>:chunk:<n>`. Both refreshed with this TTL on every write.
+BACKFILL_RUN_KEY_PREFIX = "analytics_backfill_run:"
+BACKFILL_KEY_TTL_SECONDS = 7 * 24 * 3600
+# Cap on the per-day failure records carried in the run aggregate.
+BACKFILL_MAX_FAILURES = 200
 
 
 # ────────────────────── Native-balance sharding ────────────────────────
@@ -313,6 +323,15 @@ def dispatch_tvl_chord() -> None:
 
 
 # ────────────────────── Backfill sharding ──────────────────────────────
+#
+# Shape (since 2026-09): a *run* is a manifest blob in Redis describing the
+# whole date range split into chunks; exactly one chunk is in flight at any
+# time. ``backfill_done`` (the chord callback) records the finished chunk,
+# refreshes the run aggregate and dispatches the next chunk itself. The
+# management command therefore never holds the throttle — it only starts
+# the run and (optionally) polls Redis to report progress. Nothing about
+# the concurrency cap depends on the worker pool size, on the result
+# backend, or on the command process staying alive.
 
 
 def _parse_iso_date(value: str | date | datetime) -> date:
@@ -323,16 +342,229 @@ def _parse_iso_date(value: str | date | datetime) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
+def _iso(value: str | date | datetime) -> str:
+    return value if isinstance(value, str) else _parse_iso_date(value).isoformat()
+
+
+def backfill_run_key(run_id: str) -> str:
+    return f"{BACKFILL_RUN_KEY_PREFIX}{run_id}"
+
+
+def backfill_chunk_key(run_id: str, chunk_index: int) -> str:
+    return f"{BACKFILL_RUN_KEY_PREFIX}{run_id}:chunk:{chunk_index}"
+
+
+def new_backfill_run_id() -> str:
+    return f"{timezone.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
+
+
+def _redis_set_json(key: str, value: dict) -> None:
+    get_redis().set(key, json.dumps(value), ex=BACKFILL_KEY_TTL_SECONDS)
+
+
+def _redis_get_json(key: str) -> dict | None:
+    blob = get_redis().get(key)
+    if not blob:
+        return None
+    try:
+        return json.loads(blob)
+    except (TypeError, ValueError):
+        logger.warning("backfill: unreadable JSON at redis key %s", key)
+        return None
+
+
+def load_backfill_run(run_id: str) -> dict | None:
+    """Return the run manifest for ``run_id`` or ``None`` if unknown/expired."""
+    return _redis_get_json(backfill_run_key(run_id))
+
+
+def load_backfill_chunk_summary(run_id: str, chunk_index: int) -> dict | None:
+    """Return the per-chunk summary written by ``backfill_done`` or ``None``
+    while the chunk is still pending / in flight."""
+    return _redis_get_json(backfill_chunk_key(run_id, chunk_index))
+
+
+def latest_backfill_run_id() -> str | None:
+    """``BACKFILL_CURSOR_KEY`` points at the most recently started run."""
+    pointer = _redis_get_json(BACKFILL_CURSOR_KEY)
+    if pointer and isinstance(pointer.get("run_id"), str):
+        return pointer["run_id"]
+    return None
+
+
+def build_backfill_run(
+    dates: list[date | str], chunk_days: int, run_id: str | None = None
+) -> dict:
+    """Pure helper: the manifest for ``dates`` split into ``chunk_days``-sized
+    chunks. Nothing is written or dispatched. ``chunk_days <= 0`` → one chunk.
+    """
+    if not dates:
+        raise ValueError("backfill run needs at least one date")
+    days = [_iso(d) for d in dates]
+    chunk_size = chunk_days if chunk_days and chunk_days > 0 else len(days)
+    run_id = run_id or new_backfill_run_id()
+    chunks = []
+    for index, offset in enumerate(range(0, len(days), chunk_size)):
+        chunk_days_list = days[offset : offset + chunk_size]
+        chunks.append(
+            {
+                "index": index,
+                "start": chunk_days_list[0],
+                "end": chunk_days_list[-1],
+                "days": chunk_days_list,
+                "key": backfill_chunk_key(run_id, index),
+                "state": "pending",
+                "dispatched_at": None,
+                "finished_at": None,
+                "total": 0,
+                "written": 0,
+                "failed": 0,
+                "error": None,
+            }
+        )
+    return {
+        "run_id": run_id,
+        "run_key": backfill_run_key(run_id),
+        "start": days[0],
+        "end": days[-1],
+        "total_days": len(days),
+        "chunk_days": chunk_size,
+        "chunk_count": len(chunks),
+        "started_at": timezone.now().isoformat(),
+        "finished_at": None,
+        # Aggregate over *finished* chunks only.
+        "total": 0,
+        "written": 0,
+        "failed": 0,
+        "failures": [],
+        "chunks": chunks,
+    }
+
+
+def _save_backfill_run(run: dict) -> None:
+    _redis_set_json(run["run_key"], run)
+
+
+def _dispatch_backfill_chunk(run: dict, chunk_index: int):
+    """Mark chunk ``chunk_index`` as running, persist the manifest, then
+    submit its chord. The manifest is written *before* ``apply_async`` and
+    never after it: under eager mode the whole chain (including the nested
+    ``backfill_done`` for every later chunk) runs inside ``apply_async``, so
+    any write after it would clobber newer state with this stale copy.
+    """
+    chunk = run["chunks"][chunk_index]
+    chunk["state"] = "running"
+    chunk["dispatched_at"] = timezone.now().isoformat()
+    _save_backfill_run(run)
+    logger.info(
+        "backfill: run=%s dispatching chunk %d/%d (%s → %s, %d days)",
+        run["run_id"],
+        chunk_index + 1,
+        run["chunk_count"],
+        chunk["start"],
+        chunk["end"],
+        len(chunk["days"]),
+    )
+    return dispatch_backfill(
+        chunk["days"],
+        stats_key=chunk["key"],
+        run_id=run["run_id"],
+        chunk_index=chunk_index,
+    )
+
+
+def start_backfill_run(
+    dates: list[date | str], chunk_days: int, run_id: str | None = None
+) -> dict:
+    """Persist a new run manifest, point ``BACKFILL_CURSOR_KEY`` at it and
+    dispatch the first chunk. Returns the manifest as it stands after the
+    dispatch call returns (under eager mode that is the finished run).
+
+    Later chunks are dispatched by ``backfill_done`` on the worker, one
+    after the other — the caller may exit immediately.
+    """
+    run = build_backfill_run(dates, chunk_days, run_id=run_id)
+    _save_backfill_run(run)
+    _redis_set_json(
+        BACKFILL_CURSOR_KEY,
+        {
+            "run_id": run["run_id"],
+            "run_key": run["run_key"],
+            "started_at": run["started_at"],
+        },
+    )
+    _dispatch_backfill_chunk(run, 0)
+    return load_backfill_run(run["run_id"]) or run
+
+
+def _advance_backfill_run(run_id: str, chunk_index: int, summary: dict) -> None:
+    """Record ``summary`` for the finished chunk, refresh the aggregate and
+    dispatch the next chunk (or close the run). Only ever called from the
+    chord callback, so there is a single writer per run and no CAS needed.
+    """
+    run = load_backfill_run(run_id)
+    if run is None:
+        logger.warning(
+            "backfill_done: run=%s manifest missing (expired?); chunk %d "
+            "summary kept at its own key, no further chunks dispatched",
+            run_id,
+            chunk_index,
+        )
+        return
+    chunk = run["chunks"][chunk_index]
+    chunk.update(
+        state="done",
+        finished_at=summary["finished_at"],
+        total=summary["total"],
+        written=summary["written"],
+        failed=summary["failed"],
+    )
+    done = [c for c in run["chunks"] if c["state"] == "done"]
+    run["total"] = sum(c["total"] for c in done)
+    run["written"] = sum(c["written"] for c in done)
+    run["failed"] = sum(c["failed"] for c in done)
+    run["failures"] = (run.get("failures") or [])[:BACKFILL_MAX_FAILURES]
+    room = BACKFILL_MAX_FAILURES - len(run["failures"])
+    if room > 0:
+        run["failures"].extend(summary.get("failures", [])[:room])
+
+    next_index = chunk_index + 1
+    if next_index >= run["chunk_count"]:
+        run["finished_at"] = timezone.now().isoformat()
+        _save_backfill_run(run)
+        logger.info(
+            "backfill: run=%s finished written=%d failed=%d total=%d",
+            run_id,
+            run["written"],
+            run["failed"],
+            run["total"],
+        )
+        return
+
+    try:
+        _dispatch_backfill_chunk(run, next_index)
+    except Exception as exc:  # noqa: BLE001 — surface via manifest
+        logger.exception(
+            "backfill: run=%s failed to dispatch chunk %d", run_id, next_index
+        )
+        # `_dispatch_backfill_chunk` may have persisted "running" before the
+        # broker call blew up — reload so we don't resurrect stale state.
+        run = load_backfill_run(run_id) or run
+        run["chunks"][next_index].update(state="dispatch_failed", error=str(exc)[:500])
+        run["finished_at"] = timezone.now().isoformat()
+        _save_backfill_run(run)
+
+
 @app.shared_task()
 @task_timeout(timeout_seconds=LOCK_TIMEOUT * 4)
 def compute_daily_metric_shard(day_iso: str) -> dict:
     """One backfill shard — compute and upsert the DailyMetric row plus all
-    four narrow rollup tables for the given UTC day.
+    narrow rollup tables for the given UTC day.
 
-    `_upsert_daily_metric` already runs the 5-step inline path; this is a
-    thin Celery-task wrapper so the backfill management command can group-
-    dispatch one task per day and let the worker pool naturally cap
-    concurrency.
+    `_upsert_daily_metric` already runs the full inline populate path; this
+    is a thin Celery-task wrapper so ``dispatch_backfill`` can fan one chunk
+    out as a chord. Concurrency is bounded by the chunk size (one chunk in
+    flight per run), not by this task.
     """
     # Local import — keeps the tasks_shards <-> tasks edge lazy so module
     # import order in Celery autodiscovery doesn't matter.
@@ -367,55 +599,110 @@ def compute_daily_metric_shard(day_iso: str) -> dict:
     }
 
 
-@app.shared_task()
+# `ignore_result=False` overrides the project-wide `CELERY_IGNORE_RESULT =
+# True`. Without it the callback's own return value is never stored, so an
+# `AsyncResult.get()` on the chord (what `dispatch_backfill(...).get()` and
+# the pre-2026-09 management command did) blocks until its timeout even
+# though the callback ran to completion. The chord *header* coordination is
+# unaffected either way (`on_chord_part_return` runs regardless of
+# `ignore_result`), which is why the Redis summary always landed.
+@app.shared_task(ignore_result=False)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
-def backfill_done(shard_results: list[dict], stats_key: str | None = None) -> dict:
-    """Chord callback for `backfill_daily_metrics`.
+def backfill_done(
+    shard_results: list[dict | None],
+    stats_key: str | None = None,
+    run_id: str | None = None,
+    chunk_index: int | None = None,
+) -> dict:
+    """Chord callback for one backfill chunk.
 
-    Aggregates the per-day shard results and writes a small summary blob
-    to Redis at `stats_key` (defaults to BACKFILL_CURSOR_KEY) so the
-    management command can poll for completion.
+    Aggregates the per-day shard results and writes the chunk summary to
+    Redis at ``stats_key`` (defaults to ``BACKFILL_CURSOR_KEY`` for callers
+    that use ``dispatch_backfill`` standalone). When ``run_id`` /
+    ``chunk_index`` are given the summary is also folded into the run
+    manifest and the *next* chunk of that run is dispatched from here —
+    this callback is the throttle.
+
+    A shard that hit ``task_timeout`` returns ``None`` instead of a dict;
+    those are counted as failed days (with the date recovered from the
+    chunk manifest by position) rather than crashing the callback, which
+    would otherwise stall the whole run.
     """
-    written = sum(1 for r in shard_results if r.get("ok"))
-    failed = sum(1 for r in shard_results if not r.get("ok"))
-    failures = [r for r in shard_results if not r.get("ok")][:50]
+    days: list[str] | None = None
+    if run_id is not None and chunk_index is not None:
+        run = load_backfill_run(run_id)
+        if run is not None:
+            days = run["chunks"][chunk_index]["days"]
+
+    normalized: list[dict] = []
+    for position, result in enumerate(shard_results or []):
+        if not isinstance(result, dict):
+            result = {
+                "date": days[position] if days and position < len(days) else None,
+                "ok": False,
+                "error": "shard returned no result (task timeout or worker loss)",
+            }
+        normalized.append(result)
+
+    written = sum(1 for r in normalized if r.get("ok"))
+    failed = len(normalized) - written
+    failures = [r for r in normalized if not r.get("ok")][:50]
     summary = {
-        "total": len(shard_results),
+        "total": len(normalized),
         "written": written,
         "failed": failed,
         "failures": failures,
         "finished_at": timezone.now().isoformat(),
     }
+    if run_id is not None:
+        summary["run_id"] = run_id
+        summary["chunk_index"] = chunk_index
+    if days:
+        summary["start"] = days[0]
+        summary["end"] = days[-1]
+
     key = stats_key or BACKFILL_CURSOR_KEY
-    get_redis().set(key, json.dumps(summary))
+    _redis_set_json(key, summary)
     logger.info(
-        "backfill_done: completed days_written=%d/%d failed=%d summary_key=%s",
+        "backfill_done: completed run=%s chunk=%s days_written=%d/%d failed=%d "
+        "summary_key=%s",
+        run_id,
+        chunk_index,
         written,
-        len(shard_results),
+        len(normalized),
         failed,
         key,
     )
+    if run_id is not None and chunk_index is not None:
+        _advance_backfill_run(run_id, chunk_index, summary)
     return summary
 
 
-def dispatch_backfill(dates: list[date], stats_key: str | None = None):
-    """Build the backfill chord — one shard per UTC day, summary written
-    on completion. Returns the AsyncResult; callers can ``.get(timeout=…)``
-    to block on completion.
+def dispatch_backfill(
+    dates: list[date | str],
+    stats_key: str | None = None,
+    run_id: str | None = None,
+    chunk_index: int | None = None,
+):
+    """Build and submit ONE backfill chord — one shard per UTC day, chunk
+    summary written to ``stats_key`` on completion. Returns the AsyncResult.
 
-    Eager mode works identically via the Redis result backend configured
-    in `config/settings/base.py`.
+    This is the low-level primitive; ``start_backfill_run`` is what the
+    management command uses so chunks execute one after another. Calling
+    this directly for a large range puts every day on the queue at once.
     """
     key = stats_key or BACKFILL_CURSOR_KEY
-    job = group(
-        compute_daily_metric_shard.s(d.isoformat()) for d in dates
-    ) | backfill_done.s(key)
+    job = group(compute_daily_metric_shard.s(_iso(d)) for d in dates) | backfill_done.s(
+        key, run_id=run_id, chunk_index=chunk_index
+    )
     return job.apply_async(queue="contracts")
 
 
 __all__ = [
     "HEX_PREFIXES",
     "BACKFILL_CURSOR_KEY",
+    "BACKFILL_RUN_KEY_PREFIX",
+    "BACKFILL_KEY_TTL_SECONDS",
     "compute_native_balance_shard",
     "reduce_native_balance_shards",
     "finalize_tvl_snapshot",
@@ -423,4 +710,12 @@ __all__ = [
     "compute_daily_metric_shard",
     "backfill_done",
     "dispatch_backfill",
+    "build_backfill_run",
+    "start_backfill_run",
+    "load_backfill_run",
+    "load_backfill_chunk_summary",
+    "latest_backfill_run_id",
+    "backfill_run_key",
+    "backfill_chunk_key",
+    "new_backfill_run_id",
 ]

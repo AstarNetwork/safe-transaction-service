@@ -390,3 +390,215 @@ this branch — only the analytics subtree was validated.
   deleted. (`REDIS_SAFE_STATISTICS` was removed alongside the
   `/safe-statistics/` endpoint — see plan
   `robust-wandering-spark.md`.)
+
+---
+
+# Part 3 — `backfill_daily_metrics`: waiting, throttling, per-run state
+
+Three defects surfaced on Ethereum staging on 2026-09-08, all reproduced on
+live data. Branch `feat/analytics-backfill-throttling`. Only
+`analytics/tasks_shards.py`, `analytics/management/commands/backfill_daily_metrics.py`
+and tests changed; populators, `_upsert_daily_metric`, SQL and `config/`
+are untouched.
+
+## Reproduction (Ethereum staging, 2026-09-08)
+
+```
+python manage.py backfill_daily_metrics --start 2026-06-10 --end 2026-08-31 \
+    --chunk-days 6 --wait 3600
+```
+
+- Chunk 1 (`2026-06-10 → 2026-06-15`) really finished after ~22 minutes:
+  `backfill_done` wrote `analytics_backfill_cursor =
+  {'total': 6, 'written': 6, 'failed': 0, 'failures': [],
+  'finished_at': '2026-09-08T07:04:44+00:00'}`. The command nevertheless sat
+  in `result.get(timeout=3600, disable_sync_subtasks=False)` for the full
+  hour and exited with `The operation timed out.` Every chunk waited exactly
+  `--wait` seconds regardless of its real duration. **(Defect 1)**
+- Same range with `--wait 0`: 12 chords were submitted back to back and the
+  `contracts` worker started all 77 days at once. `pg_stat_activity` showed
+  ~70 concurrent backfill sessions in the same stage (`INSERT INTO
+  analytics_dailymetric` from `_compute_daily_tx_volume`), all waiting on
+  IPC for Postgres parallel workers, on the shared multi-chain
+  `postgres-shared` instance. The help text's "concurrency caps naturally at
+  worker pool size" was not a cap on that pool. **(Defect 2)**
+- With several chords in flight `analytics_backfill_cursor` was overwritten
+  by whichever chunk finished last; there was no per-chunk record and no
+  run-level picture. **(Defect 3)**
+
+## Root cause of defect 1 — `CELERY_IGNORE_RESULT = True`
+
+`config/settings/base.py` sets `CELERY_IGNORE_RESULT = True` (project-wide
+`task_ignore_result`). In Celery 5.5.3 `backends/base.py::mark_as_done`
+does:
+
+```python
+if store_result and not _is_request_ignore_result(request):
+    self.store_result(...)          # skipped for every task here
+if request and request.chord:
+    self.on_chord_part_return(...)  # ALWAYS runs
+```
+
+So the chord *header* still coordinates through Redis (that is why the
+callback ran and the Redis summary landed), but the *callback's own return
+value* is never written to the result backend. `chord.apply_async()` hands
+back the callback's `AsyncResult`, and `.get()` on it waits for a key that
+will never appear — until the timeout. Eager-mode tests never saw this
+because `EagerResult` carries the value in-process. This is almost
+certainly the same mechanism behind the Berachain TVL hang recorded
+above ("gevent worker + Redis result backend never observed the chord
+callback's result key") — that one was side-stepped by removing the
+`.get()`, which is also what the command does now.
+
+`CELERY_RESULT_BACKEND` itself is fine (defaults to `REDIS_URL`, same env
+var on web pod and worker, so both talk to the same Redis); `result_expires`
+is Celery's default 1 day and irrelevant here because nothing is stored.
+
+**No change is needed in `config/settings/base.py`.** Two things were done
+inside `analytics/` instead:
+
+1. `backfill_done` is declared `@app.shared_task(ignore_result=False)` — a
+   task-level override of the global setting, so `dispatch_backfill(...).get()`
+   now works for anyone who still calls it that way. It stores one small
+   JSON blob per chunk with the default 1-day expiry.
+2. The management command no longer uses the result backend at all. Chunk
+   completion is detected by the appearance of the chunk's own summary key
+   in Redis (see below); `--wait` is only an upper bound per chunk.
+
+If you ever want *every* analytics task result stored, that would be a
+`base.py` change (`CELERY_IGNORE_RESULT`, or a per-task override) — not
+recommended, the beat tasks return large payloads.
+
+## What changed
+
+### `tasks_shards.py` — run manifest, per-chunk keys, callback-driven chain
+
+A backfill is now a *run* described by a manifest in Redis:
+
+| Key | Content | Written by |
+|---|---|---|
+| `analytics_backfill_run:<run_id>` | manifest: `run_id`, `start`, `end`, `total_days`, `chunk_days`, `chunk_count`, `started_at`, `finished_at`, aggregate `total/written/failed/failures` (failures capped at 200), and `chunks[]` each with `index/start/end/days/key/state/dispatched_at/finished_at/total/written/failed/error` | `start_backfill_run`, `_dispatch_backfill_chunk`, `_advance_backfill_run` |
+| `analytics_backfill_run:<run_id>:chunk:<n>` | that chunk's summary (`total/written/failed/failures/finished_at/start/end/run_id/chunk_index`) | `backfill_done` |
+| `analytics_backfill_cursor` | pointer `{"run_id", "run_key", "started_at"}` to the most recently started run | `start_backfill_run` |
+
+All three carry a 7-day TTL refreshed on every write
+(`BACKFILL_KEY_TTL_SECONDS`).
+
+Chunk states: `pending → running → done`, or `dispatch_failed` if the broker
+call for the *next* chunk raised (the run is then closed with
+`finished_at` set and the error recorded; re-run with `--failed-only`).
+
+**Sequencing.** `start_backfill_run(dates, chunk_days)` writes the manifest
+and dispatches chunk 0 only. `backfill_done(shard_results, stats_key,
+run_id, chunk_index)` writes the chunk key, folds the numbers into the
+manifest and then calls `_dispatch_backfill_chunk(run, n+1)` itself. The
+callback is the throttle: at most `--chunk-days` days are in flight for a
+run, independent of the worker pool size and of whether the command
+process is alive. `--wait 0` therefore means "don't block the console",
+not "fire everything".
+
+Alternative considered: one big `chord | chord | …` canvas. Rejected —
+the whole canvas (all signatures) is serialised into every message, there
+is no place to record progress, and a failed link stalls silently. The
+manifest gives an inspectable, resumable state machine for the price of
+one Redis read/write per chunk.
+
+**Eager-mode subtlety.** Under `CELERY_ALWAYS_EAGER` the entire chain runs
+*inside* the first `apply_async` (nested callbacks). `_dispatch_backfill_chunk`
+therefore persists the manifest *before* `apply_async` and never after it,
+otherwise the stale in-memory copy would clobber the finished state. Same
+rule in `_advance_backfill_run`. Tests rely on this — the sequencing test
+reads the manifest from inside the patched populator and asserts exactly
+one chunk is `running`, earlier ones `done`, later ones `pending`.
+
+**`None` shard results.** `compute_daily_metric_shard` is wrapped in
+`task_timeout(raise_exception=False)`, which returns `None` on a gevent
+timeout. The old callback did `r.get("ok")` on it and would have crashed,
+stalling the chain. `backfill_done` now treats a non-dict result as a
+failed day and recovers the date by position from the chunk's `days` list.
+
+`dispatch_backfill(dates, stats_key=None, run_id=None, chunk_index=None)`
+is kept as the single-chord primitive (signature extended, backwards
+compatible). Called standalone without `stats_key` it still writes its
+summary to `analytics_backfill_cursor`; `--status` tolerates that legacy
+shape.
+
+### `backfill_daily_metrics.py`
+
+- `--wait N`: per chunk, poll Redis every `--poll-interval` seconds
+  (default 15) until the chunk's summary key exists or the chunk is marked
+  `dispatch_failed`. Prints a per-chunk line with chunk and cumulative
+  counters, then the full run summary. Exceeding `N` raises `CommandError`
+  (exit 1) with a `--status <run_id>` hint — the run itself keeps going on
+  the worker.
+- `--wait 0` (default): start the run, print the run id and the status
+  command, return.
+- `--status [RUN_ID]`: print the run (defaults to the latest). Reads Redis
+  only, no DB. `--start/--end` are not required with it.
+- `--failed-only`: restrict the range to days whose `DailyMetric` row is
+  missing or has `multisig_txs_via_api IS NULL` (ORM query, no new SQL).
+  Works with both Celery and `--inline` modes. Prints `k/n days … need
+  (re)running`; exits early with `Nothing to do.` when `k = 0`.
+- `--run-id`: optional explicit id (default `YYYYmmddTHHMMSS-<6 hex>`).
+- `--chunk-days 0` still means one chunk — in Celery mode that is every
+  day on the queue at once; the help now says not to do that on a shared
+  DB.
+- Help text and docstrings no longer claim a "natural" concurrency cap.
+- `--inline` path is byte-for-byte the previous loop (only the optional
+  `--failed-only` filter is applied before it). `nohup … --inline` remains
+  the no-worker fallback.
+
+### Tests — `tests/test_backfill_daily_metrics.py` (new, 16 tests)
+
+The notes above (Part 1) mention this file; it did not exist in the repo —
+the two command tests lived in `test_tasks.py::TestBackfillDailyMetricsCommand`
+and are unchanged. New coverage: strict chunk ordering with one chunk in
+flight, command dispatches only chunk 0, per-chunk keys + TTL, run
+aggregate with failures across chunks, `None` shard result, legacy
+standalone `dispatch_backfill`, `--wait` completing on the Redis key with
+`start_backfill_run` stubbed to *not* execute (i.e. no result backend
+involved), `--wait` timeout → `CommandError` and manifest untouched,
+`--wait 0` returns immediately, `--status` latest/explicit/unknown,
+argument validation, `select_failed_days`, `--failed-only` inline and
+"nothing to do", and one eager end-to-end run with real populators.
+
+## How to run on heavy chains (Ethereum, BASE, Berachain)
+
+```
+# 90 days, 6 days in flight at a time, follow it from the console
+# (up to 2 h per chunk before the console gives up; the run continues):
+python manage.py backfill_daily_metrics --start 2026-06-10 --end 2026-09-07 \
+    --chunk-days 6 --wait 7200
+
+# fire-and-forget, then check later:
+python manage.py backfill_daily_metrics --start 2026-06-10 --end 2026-09-07 --chunk-days 6
+python manage.py backfill_daily_metrics --status            # latest run
+python manage.py backfill_daily_metrics --status <run_id>
+
+# redo only the gaps left by a previous run:
+python manage.py backfill_daily_metrics --start 2026-06-10 --end 2026-09-07 \
+    --chunk-days 6 --failed-only --wait 7200
+```
+
+Sizing `--chunk-days`: it is the number of concurrent
+`_compute_daily_tx_volume` INSERTs (and the rest of the populators) the
+shared Postgres will see from this chain. On Ethereum staging a 6-day chunk
+took ~22 min; 6 is a sensible ceiling on `postgres-shared`, go lower if
+`pg_stat_activity` shows IPC waits on parallel workers.
+
+## Operational observations (no code change)
+
+1. **Duplicate Celery node names in the worker pod.** The worker pod runs
+   several `celery` processes that all register as `celery@<pod>`. `celery
+   inspect active_queues` / `inspect active` answer from whichever process
+   replies first, so the reported queue set (and task list) looks random
+   between calls. It is not a routing bug; when checking whether the
+   `contracts` queue is being consumed, either query several times or use
+   `--destination` with unique `-n` names once the run scripts set them.
+2. **Stay out of the beat window.** The analytics beat chain runs 01:00 →
+   ~05:00 UTC (`compute_daily_metrics_task` 01:00 … `compute_safe_creations_task`
+   04:30, all on the `contracts` queue). A backfill on a heavy chain in
+   that window competes with it for the same pool and the same Postgres,
+   and the daily task's own `_upsert_daily_metric` for yesterday can
+   interleave with backfill rows. Start heavy backfills after 05:00 UTC and
+   size `--chunk-days` × chunk duration so they finish before 01:00.
