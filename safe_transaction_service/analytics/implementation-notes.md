@@ -602,3 +602,488 @@ took ~22 min; 6 is a sensible ceiling on `postgres-shared`, go lower if
    and the daily task's own `_upsert_daily_metric` for yesterday can
    interleave with backfill rows. Start heavy backfills after 05:00 UTC and
    size `--chunk-days` × chunk duration so they finish before 01:00.
+
+---
+
+# Part 4 — Token `symbol` on `top_tokens` (phase-B T6)
+
+`phase-b-data-gaps.md` §4.5 / T6. One additive key, `symbol`, on every
+`top_tokens` entry of `/token-volume/` and `/tvl/`. Only
+`analytics/services/analytics_service.py`, `analytics/tasks_shards.py` and
+`analytics/tests/test_views_v2.py` changed; nothing under `tokens/` is
+touched — the analytics app *reads* `tokens_token`, it does not own it.
+
+## One helper, three call sites
+
+`get_token_symbols(addresses) -> {address: symbol | None}` lives in
+`analytics_service.py` (module level, next to `_parse_window`) and is
+imported lazily by `tasks_shards.finalize_tvl_snapshot`. Three callers:
+the live token-volume aggregation, the rollup-served token-volume read,
+and the TVL snapshot build.
+
+`Token.address` is an `EthereumAddressBinaryField`, same as
+`DailyTokenVolume.token_address` and `ERC20Transfer.address`, so the
+lookup is a bytes-to-bytes PK probe — one `IN (...)` over at most 20
+addresses, no `decode(...)`, no per-address query. `get_prep_value`
+normalises before encoding, so a lower-case address matches a
+checksummed row and vice versa.
+
+## Unknown is `null`, never the address
+
+Both "no `tokens_token` row" and "row exists with a blank symbol" map to
+`None`. Substituting the address would make *unknown* indistinguishable
+from a token whose symbol genuinely is a hex string, and the rendering
+decision belongs to the consumer (the hub shows a truncated address —
+spec Q16). Every requested address is present in the mapping, so the key
+is always present in the payload.
+
+`name`, `decimals` and `logo_uri` are deliberately absent (Q15/Q19).
+`decimals` becomes necessary the day a token *volume* is displayed —
+`total_value` is in raw units — but nothing displays it today.
+
+## TVL: write time, not read time
+
+Spec §4.5 calls this "a read-time join" for both endpoints, and for
+`/token-volume/` it is one. `/tvl/` is served from an `AnalyticsSnapshot`,
+so its join necessarily happens where the payload is *built* —
+`finalize_tvl_snapshot`, as the last statement before `_write_snapshot`.
+
+Consequence: a `tvl` snapshot written *before* this deploy serves
+`top_tokens` without `symbol` until the next chord reduces. Additive-key
+semantics cover that (the hub ignores unknown keys and treats an absent
+one as "store nothing"), so no read-time backfill was added in `get_tvl`
+— that would put a `tokens_token` query on a hot snapshot read for the
+sake of one cycle.
+
+## The metadata join needs its own `except` (review fix)
+
+T6's acceptance clause is *"the TVL join sits inside the existing
+snapshot-writing `try` so that a metadata failure can never lose a TVL
+snapshot."* Being lexically inside that `try` satisfies the first half and
+**breaks the second**: the outer handler's whole job is to keep the phase-1
+zero placeholder, so a `tokens_token` read that fell through to it would
+discard a fully-reduced snapshot — precisely the loss the clause forbids.
+Placing the lookup last and side-effect-free makes that improbable, not
+impossible, which is not what "can never" means.
+
+Shape landed:
+
+```python
+try:
+    symbols = get_token_symbols(addr for addr, _ in top_tokens)
+except Exception:
+    symbols = {}
+    logger.warning("finalize_tvl_snapshot: token metadata lookup failed …")
+```
+
+Still lexically inside the outer `try` (belt and braces, as the spec asks),
+but the outer `except` no longer handles metadata failures — it keeps only
+the failures it legitimately owns (the ERC20 net-flow aggregation and the
+snapshot write). `symbols = {}` needs no other change: `symbols.get(addr)`
+already yields `None` per entry, so the payload shape is identical and every
+`symbol` key stays present-and-null, which *is* the documented contract for
+an unknown token. Degrade the symbols, never the snapshot.
+
+`compute_tvl_task`'s placeholder logic and the reduce are untouched.
+
+## Tests
+
+`test_views_v2.py`, five new cases, all through the reversed route with
+the auth header:
+
+- `TestRollupReadPath.test_token_volume_symbol_served_from_rollup` and
+  `…_symbol_cold_window_falls_back_to_live` — the existing rollup /
+  cold-window pairing, each with one known and one unknown token.
+- `TestRollupReadPath.test_token_volume_blank_symbol_reads_as_null` —
+  `symbol=""` in `tokens_token` is still unknown.
+- `TestTvlSnapshotReadPath.test_tvl_top_tokens_carry_symbol`.
+- `TestTvlSnapshotReadPath.test_tvl_snapshot_survives_a_token_metadata_failure`
+  — patches `get_token_symbols` to raise and asserts the **reduced**
+  payload was written anyway: non-zero `native_balance_wei`, populated
+  `top_tokens`, and `"symbol"` *present* and `None` on every entry (asserted
+  as key-presence, so dropping the key on the degraded path fails here).
+  Its first revision asserted the opposite — placeholder kept, `top_tokens
+  == []` — which is the behaviour the review fix above removed. Proof that
+  the injected failure really fired moved to the two things that can only
+  happen on the degraded path: the patched mock's `called`, and an
+  `assertLogs` on the WARNING. Without them a green test would not
+  distinguish "degraded correctly" from "patch never ran".
+
+Fixtures use `tokens.tests.factories.TokenFactory`. Note the name clash
+in that test module: `Token` there is `rest_framework.authtoken.models.Token`.
+
+---
+
+# Part 5 — `breakdown=day` on `/tx-volume/` (phase-B T8)
+
+`phase-b-data-gaps.md` §4.5 / T8. One opt-in query parameter on
+`/tx-volume/` **only**. Only `analytics/views_v2.py`,
+`analytics/services/analytics_service.py` and
+`analytics/tests/test_views_v2.py` changed.
+
+## `urls_v2.py` is untouched
+
+T8 lists it as a likely file; it needs no edit. `breakdown` is a query
+parameter, and `path("tx-volume/", ...)` already matches every query
+string. The route name the tests reverse (`analytics-tx-volume`) is
+unchanged.
+
+## Absent parameter ⇒ the same dict, built the same way
+
+The scalar payload is now assigned to `payload` and the three new keys are
+*appended* after it, so with `breakdown=None` the dict is constructed with
+the same keys in the same insertion order as before — which is what makes
+the serialised body byte-identical, not merely equal as a mapping. The
+test pins `list(body.keys())` as an ordered list against a frozen literal
+of the pre-T8 key set for exactly that reason; a set comparison would pass
+while the bytes changed.
+
+This is the property §4.9 leans on: the producer half can deploy to the
+whole heterogeneous fleet before any hub change exists.
+
+## Validation lives in the view, the shape in the service
+
+`breakdown not in (None, "day")` → 400 in `AnalyticsTxVolumeView`, next to
+the `window`/`interval` checks the other views already do. `?breakdown=`
+(empty value) is a 400 too — `query_params.get` returns `""`, which is not
+`None`, and "any value other than `day`" is the contract. `"Day"` is also a
+400: no case folding, matching the existing exact-match style of the
+`window` and `interval` guards.
+
+`window` is deliberately left alone: it is still unvalidated on this
+endpoint and `_parse_window` still falls back to 30 on anything
+unparseable, capped by nothing under `breakdown=day` (spec Q21). A
+`test_breakdown_day_window_is_not_capped` case pins that, so a later
+"defensive" cap fails a test instead of silently truncating a consumer's
+series.
+
+## `days` entries are keyed `date`, not `period`
+
+`/safe-creations/` emits `{"period", "count"}` because that series is
+resampled to day/week/month and `period` is honestly the bucket label.
+A `breakdown=day` series has exactly one granularity, so the entries carry
+`date` (ISO `YYYY-MM-DD`). T9 should use the same key on the two active-\*
+endpoints, and T11's hub-side upsert keys `daily_chain_series` on it.
+
+## Window bounds are inclusive and describe the rows read
+
+The read has always been `date__gte=today-window, date__lt=today` — today
+is not a completed UTC day. `window_start` / `window_end` therefore report
+`today-window` .. `yesterday`, both inclusive, i.e. the range the rows
+actually come from rather than the half-open filter as written. They ship
+even on a cold rollup: they describe the *request*, and a consumer needs
+them to know which days a short `days` list is silent about.
+
+## Nulls and gaps pass through untouched
+
+Per-day rows are read with `.values(...)` (a second, index-only query
+against the same filtered queryset — no model instantiation) and mapped
+one-to-one. Consequences, all asserted:
+
+- `multisig_txs_via_api` / `multisig_txs_indexed_only` are nullable and a
+  pre-backfill day yields `null`, never `0` — the same statement the
+  scalar payload makes with `api_attribution_coverage_days`.
+- A day missing from the rollup is **absent** from `days`. Zero-filling
+  would assert "no activity" where the truth is "not computed".
+- A cold rollup gives `"days": []` for free from the empty comprehension —
+  present and empty, which is the signal T11's feature detection reads
+  ("old producer" is the key being absent).
+
+Contract invariant 3 is not at risk here: all four per-day columns are
+additive counts, and nothing sums `days` to produce a window value — the
+scalar half still comes from its own `aggregate()` over the same rows.
+
+## Tests
+
+`test_views_v2.py`, two new classes, 12 cases (6 of them subtests):
+
+- `TestTxVolumeDayBreakdown` — the three §5 cases (absent / valid /
+  invalid), the series shape (order, gap, exclusion of today and of
+  out-of-window days, null pass-through), and the not-capped window.
+  `test_breakdown_day_adds_the_series_and_changes_nothing_else` diffs the
+  `breakdown=day` body key-by-key against the no-parameter body from the
+  same fixture, skipping only `computed_at` (stamped at read time).
+- `TestTxVolumeDayBreakdownColdRollup` — the cold half of the rollup
+  pairing. `/tx-volume/` has no live fallback (the 504s that removal
+  fixed are in Part 1), so "cold" here means the honest zero payload plus
+  `"days": []`, and the test seeds a `MultisigTransaction` to prove the
+  live path is not consulted.
+
+---
+
+# Part 6 — `breakdown=day` on `/active-safes/` and `/active-owners/` (phase-B T9)
+
+`phase-b-data-gaps.md` §4.5 / T9. The same opt-in parameter Part 5 added
+to `/tx-volume/`, now on the two DAU endpoints, read from the
+`DailyActiveSafe` / `DailyActiveOwner` rollups. Only
+`analytics/views_v2.py`, `analytics/services/analytics_service.py` and
+`analytics/tests/test_views_v2.py` changed. `urls_v2.py` needed no edit,
+for the reason Part 5 gives: `breakdown` is a query parameter and
+`path("active-safes/", …)` already matches every query string.
+
+Part 5's shape is followed deliberately rather than improved on:
+validation in the view next to the existing `window` guard, the shape in
+the service, keys *appended* to a completed payload, entries keyed
+`date`, exact-match validation with no case folding (`?breakdown=` and
+`Day` are both 400).
+
+## Contract invariant 3 — the whole point of this task
+
+`active_safes` / `active_owners` are per-day **distinct counts**, so the
+two numbers in the response are not two views of one quantity:
+
+- the window value stays `windowed.values(<addr>).distinct().count()`,
+  the `COUNT(DISTINCT …)` it has always been;
+- each `days` entry is its own per-day `COUNT(DISTINCT …)`, from a second
+  `values("date").annotate(Count(<addr>, distinct=True))` pass over the
+  **same** filtered queryset.
+
+Neither is derived from the other, nothing sums `days`, and no helper
+takes a list of days and returns a total. `_daily_distinct_counts` says so
+in its docstring, because it is exactly the function a later "just add up
+the series" edit would reach for. The test fixture makes the trap
+concrete and fails on it: one Safe active on two days plus two others
+gives per-day counts `1, 1, 2` (sum 4) and a window value of 3.
+`test_per_day_values_are_not_additive` pins both numbers, so a regression
+that computed either from the other cannot pass.
+
+The hub's `_dau` column suffix (spec §4.2) is the consumer-side half of
+the same guard.
+
+## `window_end` is **today** here, not yesterday
+
+The one substantive divergence from Part 5, and it is in the data, not in
+the shape. `/tx-volume/` reads `date__gte=today-N, date__lt=today`, so its
+bounds report `today-N … yesterday`. Both active-\* reads filter
+`date__gte=since` with **no upper bound** and therefore include a partial
+current UTC day — the asymmetry the workspace contract's endpoint table
+records. `window_start` / `window_end` describe the rows the read
+actually covers, so they are `since … today` here. Reporting `yesterday`
+for consistency's sake would have been a lie about which days the series
+can contain, and `test_breakdown_day_series_shape` seeds a row dated
+today to pin that the current day really is served.
+
+Realigning that right edge is explicitly out of scope (§6, "gap 1's
+semantic half"): it changes numbers already in use.
+
+## Three return paths, all of which must emit `days`
+
+Unlike `/tx-volume/`'s single return, each active-\* read can leave by
+three doors: the rollup-served payload, the Redis cold-window fallback
+(`_redis_get_or_compute`, populated by `compute_daily_metrics_task`), and
+the final honest zero payload. The task's cold-path clause applies to all
+three, so `_append_day_breakdown` is called on each. On the two cold doors
+the series is `[]` — the Redis fallback carries a window scalar and has no
+per-day rows behind it, and inventing them from the scalar would be the
+invariant-3 error in another costume.
+
+`days` present-and-empty on a cold read is what keeps "producer predates
+the parameter" (key absent) apart from "producer has no rows yet" (key
+empty), which T11's hub-side feature detection reads.
+
+Mutating the dict `_redis_get_or_compute` returns is safe: it is a fresh
+`json.loads` per request, not a shared object, and the keys land at the
+end so the parameter-absent response is untouched.
+
+## The `7d|30d|90d` guard is unchanged, and still runs first
+
+These two endpoints do validate `window`, unlike `/tx-volume/`. Q21's
+"`window` is not capped under `breakdown=day`" therefore means *no
+further* cap, not a relaxation: `breakdown=day` accepts exactly the three
+windows the endpoints already accepted. The `window` check stays above the
+`breakdown` check, so `?window=5d&breakdown=week` reports `window` — the
+more basic error — and `test_breakdown_day_does_not_relax_window_validation`
+pins that a long window is still a 400 rather than being waved through
+because a breakdown was asked for. Response size stays bounded by 90 days
+here as a side effect, which is not a cap anyone should rely on.
+
+## Per-day values are never `null` on these two
+
+Part 5 has nullable per-day columns (`multisig_txs_via_api` and friends)
+and passes them through. There is no analogue here: both rollups are
+unique per `(date, address)` and hold no nullable columns, so a day
+present in the rollup has a count of at least 1 and a day absent from it
+is absent from `days` — never a zero-filled row. The null pass-through
+clause of §4.5 is satisfied vacuously, not by coercion.
+
+## Tests
+
+`test_views_v2.py`, four new classes, 24 cases (32 subtests):
+`TestActiveSafesDayBreakdown`, `TestActiveSafesDayBreakdownColdRollup`,
+`TestActiveOwnersDayBreakdown`, `TestActiveOwnersDayBreakdownColdRollup`.
+Each mirrors Part 5's pair: the three §5 cases (absent / valid /
+invalid), the series shape, and the rollup / cold-rollup pairing.
+
+The bodies live in two mixins (`_ActiveDayBreakdownMixin`,
+`_ActiveDayBreakdownColdMixin`) parametrised by route, rollup model,
+address field, count key and Redis prefix. That is the one place Part 5's
+shape is not copied literally — the two endpoints differ in exactly those
+five values, and two hand-copied 180-line classes would let them drift
+apart, which is the opposite of the consistency T9 is asked for. The
+concrete classes are still one per endpoint, and the test method names
+match Part 5's. Neither mixin inherits `TestCase` and neither is named
+`Test*`, so nothing collects them on their own.
+
+`test_breakdown_absent_response_is_unchanged` pins
+`list(body.keys()) == ["window", "<count_key>", "computed_at"]` as an
+ordered list against a frozen literal — a set would pass while the bytes
+changed — and
+`test_breakdown_day_adds_the_series_and_changes_nothing_else` diffs the
+`breakdown=day` body key-by-key against the no-parameter body from the
+same fixture, skipping only `computed_at` (stamped at read time).
+
+`test_breakdown_day_on_cached_fallback_returns_empty_days` seeds the
+legacy Redis key with `7`, so a `7` in the response proves the fallback
+door is the one that emitted `"days": []` — the cold path is asserted on
+directly rather than inferred.
+
+---
+
+# Part 7 — `from`/`to` range on `/active-safes/` and `/active-owners/` (phase-B T10)
+
+`phase-b-data-gaps.md` §4.5 / T10. An optional strict ISO `YYYY-MM-DD`
+range on the two DAU endpoints, on top of Part 6's `breakdown=day`. Only
+`analytics/views_v2.py`, `analytics/services/analytics_service.py` and
+`analytics/tests/test_views_v2.py` changed — `urls_v2.py` again needed no
+edit, for the reason Parts 5 and 6 give.
+
+Part 6's shape is followed: parsing and validation in the view beside the
+`window` and `breakdown` guards, the span in the service, the tests as one
+mixin parametrised by route / model / address field / count key / Redis
+prefix with one concrete class per endpoint.
+
+## The parser is strict here, and is not shared with `/safe-creations/`
+
+`date.fromisoformat` alone is too loose for the contract §4.5 writes down:
+at Python 3.12 it accepts `20260105` (basic form) and `2026-W01-1` (week
+form). `django.utils.dateparse.parse_date` is looser still — it falls back
+to a regex that accepts `2026-1-5`. So `_parse_iso_date` in `views_v2.py`
+pins the shape with a `\A\d{4}-\d{2}-\d{2}\Z` regex and lets
+`fromisoformat` reject impossible dates such as `2026-02-30`. `?from=`
+(empty value) is a supplied-and-unparseable bound and therefore a 400,
+exactly as `?breakdown=` is a supplied-and-invalid breakdown.
+
+`/safe-creations/`'s lenient `parse_datetime` bounds are **untouched**
+(spec §6) and deliberately not refactored to share this parser. The two
+endpoints now parse dates differently on purpose.
+
+**Correction to §4.5/§6's wording, found while writing the guard test.**
+The spec describes `/safe-creations/` as *silently ignoring a date-only
+bound*. At the pinned Django 5.2 / Python 3.12 it does not: since Django
+5.0 `parse_datetime` tries `datetime.fromisoformat` first, and that
+resolves `2026-05-01` (and `20260501`) to midnight, so a date-only bound
+there **is** honoured and does filter. What is silently ignored is a bound
+`parse_datetime` cannot use at all — `not-a-date`, `2026-13-01`,
+`2026-02-30` (that last returns `None` rather than raising, so there is no
+500 either). The out-of-scope decision is unaffected; only the reason
+given for it was stale. `TestSafeCreationsRangeStaysLenient` pins both
+halves so the endpoint's real contract is written down somewhere.
+
+## Three 400s, each naming its parameter
+
+`_parse_iso_date_range` returns `(date_from, date_to, error)` and the view
+answers `{"error": …}` with 400. The messages are asserted on by equality,
+not by substring, because "a message naming the offending parameter" is
+the acceptance clause:
+
+- `from must be an ISO date (YYYY-MM-DD)`
+- `to must be an ISO date (YYYY-MM-DD)`
+- `from must not be after to` — `from == to` is a valid single-day range,
+  not this error.
+
+Guard order is `window` → `breakdown` → range, cheapest and most basic
+first, so a request wrong in two ways reports `window`. A range does
+**not** waive the `7d|30d|90d` guard: precedence decides which days are
+counted, not which parameters are validated, and
+`test_a_range_does_not_waive_the_window_validation` pins that.
+
+## "The range wins" is expressed as `window: null`
+
+Either bound present makes the read *ranged* and the window stops applying
+altogether — the supplied bounds filter the rollup, the unsupplied side
+stays unbounded (`_rollup_date_filters` contributes no filter for a `None`
+edge rather than a sentinel date). A lone `to` therefore means "everything
+up to `to`", not "the window, clipped".
+
+The payload reports `window: None` on a ranged read. Reasons, in order:
+
+1. echoing `"30d"` — the default the caller never asked for — next to a
+   count over an unrelated span would be an active lie about what the
+   number covers;
+2. it makes precedence *observable*. A producer that predates T10 ignores
+   `from`/`to` and echoes the window string, so `window: null` is how a
+   caller tells "range honoured" from "range dropped" — the same
+   feature-detection role `days: []` plays for Part 6;
+3. it changes no key. Invariant 6 forbids renaming or removing one; the
+   value changes only on the new opt-in path, and with both bounds absent
+   the response is byte-identical to pre-T10, `window` string included.
+
+Under `breakdown=day` the bounds keys report the span actually read:
+`window_start` is the `from` (or `today - window` when unranged) and
+`window_end` the `to` (or today). The one case where `window_start` is
+`null` is a `to`-only range, where the read has no lower bound and there
+is no honest date to name.
+
+## A ranged cold read does not touch the Redis fallback
+
+The `_redis_get_or_compute` fallback holds a *rolling-window* scalar
+written by `compute_daily_metrics_task`. It is the right stale answer to a
+window question and the wrong answer to a range question, so the ranged
+path skips it entirely and returns the honest zero payload with
+`computed_at: None`. Cold-plus-ranged is therefore "no rows in that span",
+which a caller can act on, rather than a number for some other span.
+`test_ranged_cold_read_does_not_serve_the_cached_window_scalar` seeds the
+legacy key with `7` and asserts a `0` comes back, so the skip is asserted
+directly rather than inferred.
+
+The `analytics.rollup.cold_window` log line carries `since..until` instead
+of the window string on a ranged read, so a cold range is not mistaken for
+a cold 30d in worker logs.
+
+## Contract invariant 3, again, and the range × `breakdown=day` corner
+
+The ranged number is `windowed.values(<addr>).distinct().count()` over the
+range-filtered queryset — the same `COUNT(DISTINCT …)` the windowed number
+has always been, with a different `WHERE`. The `from`/`to` path adds a
+filter and nothing else; it does not introduce a second way of arriving at
+the count, and in particular it cannot bypass the distinct count, because
+there is no other expression in the method that produces one.
+
+With a range *and* `breakdown=day`, both halves are read from that one
+filtered queryset by two independent passes: `_daily_distinct_counts` for
+the per-day series and `.distinct().count()` for the scalar. Neither is
+derived from the other and nothing sums `days`.
+`test_range_with_breakdown_day_values_are_not_additive` extends Part 6's
+`test_per_day_values_are_not_additive` onto a span that is not a window:
+over `today-10 … today` the series sums to 5 while the distinct count is
+4, because `addr1` is active on two of those days.
+
+## Tests
+
+`test_views_v2.py`, three new classes: `TestActiveSafesDateRange` and
+`TestActiveOwnersDateRange` (one `_ActiveRangeMixin`, 13 cases each,
+several of them subtests) plus `TestSafeCreationsRangeStaysLenient`.
+
+The mixin reuses Part 6's fixture verbatim — rows at `today`, `today-1`,
+`today-2` (two rows), `today-10`, with `today-3` deliberately absent — so
+a ranged number can be compared against a windowed one the Part 6 cases
+already pin: 7d gives 3, `today-10 … today` gives 4, and the extra address
+is the out-of-window one.
+
+Per spec §5, three cases per parameter per endpoint: absent (ordered key
+list and the `window` string pinned against a frozen literal), valid (the
+distinct count over five spans, including a single-day range and a span
+with no rows), invalid (the three forms above, on message equality).
+Precedence has its own case asserting the *number* only the range can
+produce, not just `window: null`. The rollup / cold-window pairing is kept
+as the ranged-cold pair described above.
+
+## No consumer, on purpose
+
+Spec §6: the hub collects on a schedule and its dashboard reads the
+database, so consuming a custom range needs an on-demand query path that
+does not exist. Nothing was added on the hub side, and no task reads this
+yet — custom ranges keep falling back to 90d until such a path exists.
+This is the producer half standing alone, which the merge order in the
+workspace contract allows precisely because the parameter-absent response
+is unchanged.

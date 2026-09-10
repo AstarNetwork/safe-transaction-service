@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta
 from functools import cache
 
@@ -32,6 +32,117 @@ def _parse_window(window: str) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _daily_distinct_counts(queryset, address_field: str, count_key: str) -> list[dict]:
+    """Per-day distinct-address counts over one of the two DAU rollups,
+    newest-first, one entry per day *present in the rollup*.
+
+    Powers the opt-in ``breakdown=day`` series on ``/active-safes/`` and
+    ``/active-owners/`` (phase-B T9). ``queryset`` is the already
+    window-filtered rollup queryset, so the series and the scalar window
+    value are read from exactly the same rows. A day absent from the
+    rollup is absent here too, never zero-filled: a gap means "not
+    computed", not "no activity". Both rollups are unique per
+    ``(date, address)``, so a day that has any row has a count of at
+    least one and never ``null``.
+
+    **Contract invariant 3.** Every value here is a per-day
+    ``COUNT(DISTINCT …)`` and the entries are **not additive**. Summing
+    them does not yield the window value — a Safe active on three days
+    contributes three entries and one distinct address — so no caller may.
+    The window value stays its own ``COUNT(DISTINCT …)`` over this same
+    queryset.
+    """
+    return [
+        {"date": row["date"].isoformat(), count_key: row["distinct_count"]}
+        for row in queryset.values("date")
+        .annotate(distinct_count=Count(address_field, distinct=True))
+        .order_by("-date")
+    ]
+
+
+def _rollup_date_filters(since: date | None, until: date | None) -> dict:
+    """ORM filter kwargs for the date span of an active-* rollup read.
+
+    Either edge may be ``None``, meaning *unbounded on that side*, and an
+    unbounded edge contributes no filter rather than a sentinel date. Two
+    shapes reach here (phase-B T10):
+
+    - no range asked for: ``since = today - window``, ``until = None`` — the
+      exact ``date__gte``-only filter these reads have always used, which is
+      why the ``from``/``to``-absent response stays byte-identical;
+    - a range asked for: whichever of ``from`` / ``to`` the caller supplied,
+      the other side left unbounded.
+    """
+    filters = {}
+    if since is not None:
+        filters["date__gte"] = since
+    if until is not None:
+        filters["date__lte"] = until
+    return filters
+
+
+def _append_day_breakdown(
+    payload: dict, since: date | None, until: date, day_rows: list[dict]
+) -> dict:
+    """Append the three opt-in ``breakdown=day`` keys to an already-built
+    payload, in the order T8 established: ``window_start``,
+    ``window_end``, ``days``.
+
+    Called only under ``breakdown == "day"``, and only once the payload is
+    otherwise complete, so the parameter-absent response keeps the exact
+    key set *and insertion order* it had before — which is what makes it
+    byte-identical rather than merely equal as a mapping (spec §4.9).
+
+    ``window_start`` / ``window_end`` are the inclusive UTC bounds of the
+    rows the read covers. ``window_start`` is ``null`` in the one case where
+    the read has no lower bound at all — a ``to``-only range, phase-B T10 —
+    because there is no honest date to name there. They ship even when
+    ``day_rows`` is empty:
+    they describe the *request*, and a consumer needs them to know which
+    days a short series is silent about. ``days`` is therefore
+    present-and-empty on a cold or warming read, never omitted — that is
+    what keeps "producer predates the parameter" (key absent)
+    distinguishable from "producer has no rows yet" (key empty).
+    """
+    payload["window_start"] = since.isoformat() if since is not None else None
+    payload["window_end"] = until.isoformat()
+    payload["days"] = day_rows
+    return payload
+
+
+def get_token_symbols(addresses: Iterable[str]) -> dict[str, str | None]:
+    """Read-time join of ERC20 addresses against the upstream ``tokens_token``
+    table (``safe_transaction_service.tokens.models.Token``).
+
+    Read-only by design — the analytics app owns none of that table and
+    writes nothing to it. ``Token.address`` is an
+    ``EthereumAddressBinaryField`` just like the analytics rollups'
+    ``token_address``, so the lookup is a bytes-to-bytes primary-key probe:
+    no ``decode(...)``, no per-address query, one ``IN (...)`` for the whole
+    (at most 20-entry) top-tokens list.
+
+    Every requested address appears in the returned mapping. A token the
+    indexer holds no metadata row for — or whose row carries a blank
+    symbol — maps to ``None``, never to its own address: the consumer
+    decides how an unknown token renders (the hub renders a truncated
+    address), and substituting the address here would make "unknown"
+    indistinguishable from a token whose symbol genuinely is a hex string.
+    """
+    from safe_transaction_service.tokens.models import Token
+
+    unique_addresses = list(dict.fromkeys(addresses))
+    if not unique_addresses:
+        return {}
+
+    symbols: dict[str, str | None] = dict.fromkeys(unique_addresses)
+    for address, symbol in Token.objects.filter(
+        address__in=unique_addresses
+    ).values_list("address", "symbol"):
+        if address in symbols:
+            symbols[address] = symbol or None
+    return symbols
 
 
 _COMPUTE_LOCK_TTL_SECONDS = 1800  # max expected task duration (30 min)
@@ -394,7 +505,13 @@ class AnalyticsService:
 
     # ── A.2 Active Safes (Redis-cached) ──────────────────────────────
 
-    def get_active_safes(self, window: str) -> dict:
+    def get_active_safes(
+        self,
+        window: str,
+        breakdown: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> dict:
         """Read the window-distinct active_safes count.
 
         Single ``COUNT(DISTINCT safe_address)`` over the per-day
@@ -402,32 +519,96 @@ class AnalyticsService:
         regardless of ``history_*`` size. On a cold rollup we fall
         through to the Redis-cached rolling-window value populated by
         ``compute_daily_metrics_task``.
+
+        `breakdown` is opt-in and additive (phase-B T9). It is ``None``
+        for every caller that does not ask, and then this method returns
+        exactly the payload it always has — same keys, same order, on all
+        three return paths. With ``breakdown="day"`` three keys are
+        appended: ``window_start`` / ``window_end`` / ``days`` (see
+        `_append_day_breakdown`). The per-day values are per-day
+        ``COUNT(DISTINCT safe_address)`` and are **not additive**
+        (contract invariant 3): the window value below is its own
+        ``COUNT(DISTINCT …)`` over the same rows and is never derived by
+        summing `days`. `window` is validated by the view (7d/30d/90d)
+        and not capped further under ``breakdown=day`` (spec Q21).
+
+        Note the window's right edge: this read filters ``date__gte``
+        with **no upper bound**, so — unlike ``/tx-volume/`` — it includes
+        a partial current UTC day, and ``window_end`` is therefore today
+        rather than yesterday.
+
+        `date_from` / `date_to` are the optional strict ISO range the view
+        parses out of ``from`` / ``to`` (phase-B T10). Both ``None`` — every
+        caller that does not ask — leaves this read exactly as it was.
+        Either one set makes the read **ranged**: the window stops applying
+        entirely, the supplied bounds filter the rollup, the unsupplied side
+        stays unbounded, and ``window`` is reported as ``None`` so that a
+        caller can tell a producer that honoured its range from an older one
+        that ignored the parameters. Range length is not capped (spec Q21,
+        applied to the range for the same reason).
+
+        A ranged read also does **not** fall through to the Redis
+        cold-window scalar: that value is a rolling *window* number, so
+        answering a range request with it would be a wrong answer rather
+        than a stale one. A cold rollup therefore returns the honest zero
+        payload with ``computed_at: None``.
         """
         from safe_transaction_service.analytics.models import DailyActiveSafe
 
-        days = _parse_window(window) or 30
         today = timezone.now().date()
-        since = today - timedelta(days=days)
-        windowed = DailyActiveSafe.objects.filter(date__gte=since)
+        ranged = date_from is not None or date_to is not None
+        if ranged:
+            since, until = date_from, date_to
+        else:
+            since, until = today - timedelta(days=_parse_window(window) or 30), None
+        windowed = DailyActiveSafe.objects.filter(**_rollup_date_filters(since, until))
         if windowed.exists():
+            # Invariant 3: the reported number is a COUNT(DISTINCT ...) over
+            # the rows of the span, ranged or not — never a sum of the
+            # per-day series below, which is its own separate distinct count
+            # over the same queryset.
             count = windowed.values("safe_address").distinct().count()
-            return {
-                "window": window,
+            payload = {
+                "window": None if ranged else window,
                 "active_safes": count,
                 "computed_at": timezone.now().isoformat(),
             }
-        logger.info("analytics.rollup.cold_window key=active_safes_%s", window)
-
-        from safe_transaction_service.analytics.tasks import (
-            compute_daily_metrics_task,
+            if breakdown == "day":
+                _append_day_breakdown(
+                    payload,
+                    since,
+                    until or today,
+                    _daily_distinct_counts(windowed, "safe_address", "active_safes"),
+                )
+            return payload
+        logger.info(
+            "analytics.rollup.cold_window key=active_safes_%s",
+            f"{since}..{until}" if ranged else window,
         )
 
-        cached = _redis_get_or_compute(
-            self.REDIS_ACTIVE_SAFES_PREFIX + window, compute_daily_metrics_task
-        )
-        if cached and cached.get("window") == window:
-            return cached
-        return {"window": window, "active_safes": 0, "computed_at": None}
+        if not ranged:
+            from safe_transaction_service.analytics.tasks import (
+                compute_daily_metrics_task,
+            )
+
+            cached = _redis_get_or_compute(
+                self.REDIS_ACTIVE_SAFES_PREFIX + window, compute_daily_metrics_task
+            )
+            if cached and cached.get("window") == window:
+                # The Redis fallback carries a window scalar and no per-day
+                # rows, so the series is honestly empty here — present and
+                # empty, never omitted.
+                if breakdown == "day":
+                    _append_day_breakdown(cached, since, today, [])
+                return cached
+        payload = {
+            "window": None if ranged else window,
+            "active_safes": 0,
+            "computed_at": None,
+        }
+        if breakdown == "day":
+            _append_day_breakdown(payload, since, until or today, [])
+        return payload
 
     # ── A.3 Safe Creations Time Series (Redis-cached, resampled in memory) ──
 
@@ -468,7 +649,13 @@ class AnalyticsService:
 
     # ── A.4 Active Owners (Redis-cached) ─────────────────────────────
 
-    def get_active_owners(self, window: str) -> dict:
+    def get_active_owners(
+        self,
+        window: str,
+        breakdown: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> dict:
         """Distinct owners who confirmed any multisig tx executed in the
         window — confirmation-based active-owners semantic.
 
@@ -480,36 +667,91 @@ class AnalyticsService:
 
         On a cold rollup we fall through to the Redis-cached
         rolling-window value populated by ``compute_daily_metrics_task``.
+
+        `breakdown` is opt-in and additive (phase-B T9), exactly as on
+        ``/active-safes/``: ``None`` returns the payload this method has
+        always returned, key-for-key and in the same order on all three
+        return paths, and ``breakdown="day"`` appends ``window_start`` /
+        ``window_end`` / ``days``. The per-day values are per-day
+        ``COUNT(DISTINCT owner_address)`` and are **not additive**
+        (contract invariant 3) — the window value stays its own
+        ``COUNT(DISTINCT …)`` over the same rows. This read also has no
+        upper date bound, so ``window_end`` is today.
+
+        `date_from` / `date_to` are the optional strict ISO range the view
+        parses out of ``from`` / ``to`` (phase-B T10). Both ``None`` — every
+        caller that does not ask — leaves this read exactly as it was.
+        Either one set makes the read **ranged**: the window stops applying
+        entirely, the supplied bounds filter the rollup, the unsupplied side
+        stays unbounded, and ``window`` is reported as ``None`` so that a
+        caller can tell a producer that honoured its range from an older one
+        that ignored the parameters. Range length is not capped (spec Q21,
+        applied to the range for the same reason).
+
+        A ranged read also does **not** fall through to the Redis
+        cold-window scalar: that value is a rolling *window* number, so
+        answering a range request with it would be a wrong answer rather
+        than a stale one. A cold rollup therefore returns the honest zero
+        payload with ``computed_at: None``.
+
+        `date_from` / `date_to` behave exactly as on ``/active-safes/``.
         """
         from safe_transaction_service.analytics.models import DailyActiveOwner
 
-        days = _parse_window(window) or 30
         today = timezone.now().date()
-        since = today - timedelta(days=days)
-        windowed = DailyActiveOwner.objects.filter(date__gte=since)
+        ranged = date_from is not None or date_to is not None
+        if ranged:
+            since, until = date_from, date_to
+        else:
+            since, until = today - timedelta(days=_parse_window(window) or 30), None
+        windowed = DailyActiveOwner.objects.filter(**_rollup_date_filters(since, until))
         if windowed.exists():
+            # Invariant 3, as on /active-safes/: a COUNT(DISTINCT ...) over
+            # the span's rows, never a sum of `days`.
             count = windowed.values("owner_address").distinct().count()
-            return {
-                "window": window,
+            payload = {
+                "window": None if ranged else window,
                 "active_owners": count,
                 "computed_at": timezone.now().isoformat(),
             }
-        logger.info("analytics.rollup.cold_window key=active_owners_%s", window)
-
-        from safe_transaction_service.analytics.tasks import (
-            compute_daily_metrics_task,
+            if breakdown == "day":
+                _append_day_breakdown(
+                    payload,
+                    since,
+                    until or today,
+                    _daily_distinct_counts(windowed, "owner_address", "active_owners"),
+                )
+            return payload
+        logger.info(
+            "analytics.rollup.cold_window key=active_owners_%s",
+            f"{since}..{until}" if ranged else window,
         )
 
-        cached = _redis_get_or_compute(
-            self.REDIS_ACTIVE_OWNERS_PREFIX + window, compute_daily_metrics_task
-        )
-        if cached and cached.get("window") == window:
-            return cached
-        return {"window": window, "active_owners": 0, "computed_at": None}
+        if not ranged:
+            from safe_transaction_service.analytics.tasks import (
+                compute_daily_metrics_task,
+            )
+
+            cached = _redis_get_or_compute(
+                self.REDIS_ACTIVE_OWNERS_PREFIX + window, compute_daily_metrics_task
+            )
+            if cached and cached.get("window") == window:
+                # Window scalar only — no per-day rows behind it.
+                if breakdown == "day":
+                    _append_day_breakdown(cached, since, today, [])
+                return cached
+        payload = {
+            "window": None if ranged else window,
+            "active_owners": 0,
+            "computed_at": None,
+        }
+        if breakdown == "day":
+            _append_day_breakdown(payload, since, until or today, [])
+        return payload
 
     # ── A.5 TX Volume (DailyMetric sum when populated, live fallback) ─
 
-    def get_tx_volume(self, window: str) -> dict:
+    def get_tx_volume(self, window: str, breakdown: str | None = None) -> dict:
         """Read the tx-volume window from the `DailyMetric` rollup.
 
         Pure SUM over ~N day rows — single round-trip to Postgres, no
@@ -548,6 +790,23 @@ class AnalyticsService:
         partly backfilled window both halves silently understate; a
         caller that divides without first checking this counter against
         `coverage_days` will publish a wrong ratio.
+
+        `breakdown` is opt-in and additive (phase-B T8). It is ``None``
+        for every caller that does not ask, and then this method returns
+        exactly the payload it always has — same keys, same order. With
+        ``breakdown="day"`` three keys are appended: `window_start` /
+        `window_end` (the inclusive UTC bounds of the rows actually read,
+        i.e. `today - window` .. `yesterday`) and `days`, newest-first,
+        one entry per day *present in the rollup*. Missing days are
+        absent rather than zero-filled — a gap in the rollup is not a
+        day with no activity — and the two nullable attribution columns
+        pass straight through as `null` for the same reason they do in
+        the scalar payload. A cold or warming rollup therefore yields
+        `"days": []`: present and empty, never omitted, so that a
+        consumer can tell "producer predates the parameter" (key absent)
+        from "producer has no rows yet" (key empty). `window` is
+        deliberately not capped here (spec Q21), so the response grows
+        linearly with it.
         """
         days = _parse_window(window)
         if days is None:
@@ -582,7 +841,7 @@ class AnalyticsService:
         conf_txs = int(agg["conf_txs"] or 0)
         avg_conf = round(conf_total / conf_txs, 1) if conf_txs else 0.0
 
-        return {
+        payload = {
             "window": window,
             "total_multisig_txs": int(agg["proposed"] or 0),
             "executed_multisig_txs": int(agg["executed"] or 0),
@@ -597,6 +856,26 @@ class AnalyticsService:
             "computed_at": timezone.now(),
             "source": "daily_metric",
         }
+        if breakdown == "day":
+            payload["window_start"] = date_from.isoformat()
+            payload["window_end"] = (today - timedelta(days=1)).isoformat()
+            payload["days"] = [
+                {
+                    "date": row["date"].isoformat(),
+                    "multisig_txs_executed": row["multisig_txs_executed"],
+                    "multisig_txs_via_api": row["multisig_txs_via_api"],
+                    "multisig_txs_indexed_only": row["multisig_txs_indexed_only"],
+                    "erc20_transfers": row["erc20_transfers"],
+                }
+                for row in rows.order_by("-date").values(
+                    "date",
+                    "multisig_txs_executed",
+                    "multisig_txs_via_api",
+                    "multisig_txs_indexed_only",
+                    "erc20_transfers",
+                )
+            ]
+        return payload
 
     # ── A.6 Safe Segments (Redis-cached) ─────────────────────────────
 
@@ -657,6 +936,8 @@ class AnalyticsService:
             .order_by("-transfer_count")[:20]
         )
 
+        symbols = get_token_symbols(t["address"] for t in top_tokens)
+
         return {
             "window": window,
             "total_erc20_transfers": total_transfers,
@@ -664,6 +945,7 @@ class AnalyticsService:
             "top_tokens": [
                 {
                     "address": t["address"],
+                    "symbol": symbols.get(t["address"]),
                     "transfer_count": t["transfer_count"],
                     "total_value": str(t["total_value"] or 0),
                 }
@@ -696,6 +978,7 @@ class AnalyticsService:
         total_transfers = sum(int(r["transfer_count"] or 0) for r in rows)
         unique_tokens = len(rows)
         top = rows[:20]
+        symbols = get_token_symbols(t["token_address"] for t in top)
         return {
             "window": window,
             "total_erc20_transfers": total_transfers,
@@ -703,6 +986,7 @@ class AnalyticsService:
             "top_tokens": [
                 {
                     "address": t["token_address"],
+                    "symbol": symbols.get(t["token_address"]),
                     "transfer_count": int(t["transfer_count"] or 0),
                     "total_value": str(int(t["total_value"] or 0)),
                 }

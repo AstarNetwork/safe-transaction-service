@@ -211,9 +211,17 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
 
     Failure stays local: the placeholder snapshot is left in place so the
     endpoint keeps serving a coherent zero payload until the next run.
+    The one failure that does *not* reach that handler is the token
+    metadata join — it degrades to null symbols rather than costing the
+    reduced snapshot (see the narrow try around ``get_token_symbols``).
     """
-    # Local import — ``tasks`` imports ``tasks_shards`` at module load to
-    # register the chord members, so the reverse edge has to stay lazy.
+    # Local imports — ``tasks`` imports ``tasks_shards`` at module load to
+    # register the chord members, so the reverse edge has to stay lazy;
+    # ``analytics_service`` is kept lazy alongside it for symmetry (it is
+    # only reached on the happy path of this one task).
+    from safe_transaction_service.analytics.services.analytics_service import (
+        get_token_symbols,
+    )
     from safe_transaction_service.analytics.tasks import _write_snapshot
 
     started = time.time()
@@ -264,6 +272,27 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
         top_tokens = sorted(token_balances.items(), key=lambda x: x[1], reverse=True)[
             :20
         ]
+        # Token metadata join. Lexically inside the outer try (belt and
+        # braces), but it owns its own except: the outer handler keeps the
+        # phase-1 zero placeholder, so letting a `tokens_token` read fall
+        # through to it would mean a metadata failure *loses* a
+        # fully-reduced TVL snapshot. Degrade the symbols instead — an
+        # empty map makes every `symbol` present-and-null, which is
+        # already the documented contract for an unknown token.
+        try:
+            symbols = get_token_symbols(addr for addr, _ in top_tokens)
+        except Exception:
+            symbols = {}
+            logger.warning(
+                "finalize_tvl_snapshot: token metadata lookup failed for %d "
+                "top tokens after %.2fs (partial_shards=%d/%d); writing the "
+                "snapshot with null symbols",
+                len(top_tokens),
+                time.time() - started,
+                partial_shards,
+                total_shards,
+                exc_info=True,
+            )
         payload = {
             "total_safes_with_balance": total_safes_with_balance,
             "native_balance_wei": str(native_balance_wei),
@@ -271,6 +300,7 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
             "top_tokens": [
                 {
                     "address": addr,
+                    "symbol": symbols.get(addr),
                     "total_balance": str(bal),
                     "safe_count": token_safe_counts.get(addr, 0),
                 }

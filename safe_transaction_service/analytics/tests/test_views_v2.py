@@ -31,6 +31,7 @@ from safe_transaction_service.history.tests.factories import (
     SafeContractFactory,
     SafeStatusFactory,
 )
+from safe_transaction_service.tokens.tests.factories import TokenFactory
 from safe_transaction_service.utils.redis import get_redis
 
 
@@ -705,6 +706,75 @@ class TestTvlSnapshotReadPath(AnalyticsTestMixin, APITestCase):
         self.assertEqual(response.data["top_tokens"], [{"address": "0xabc"}])
         self.assertIsNotNone(response.data["computed_at"])
 
+    def test_tvl_top_tokens_carry_symbol(self):
+        """`finalize_tvl_snapshot` joins `tokens_token` while building the
+        payload, so `/tvl/` serves a `symbol` on every top-tokens entry.
+        A token the indexer has no metadata row for is present-and-null —
+        never its own address."""
+        from eth_account import Account
+
+        AnalyticsSnapshot.objects.all().delete()
+        safe = SafeContractFactory()
+        known = TokenFactory(symbol="WETH")
+        unknown_address = Account.create().address
+        ERC20TransferFactory(address=known.address, to=safe.address, value=500)
+        ERC20TransferFactory(address=unknown_address, to=safe.address, value=400)
+
+        compute_tvl_task()
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-tvl"), **self.auth_header
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        symbols = {t["address"]: t["symbol"] for t in response.data["top_tokens"]}
+        self.assertEqual(symbols[known.address], "WETH")
+        self.assertIn(unknown_address, symbols)
+        self.assertIsNone(symbols[unknown_address])
+
+    def test_tvl_snapshot_survives_a_token_metadata_failure(self):
+        """The metadata join has its own `except`, so a `tokens_token` read
+        that blows up must not cost us the reduced TVL snapshot — it may
+        only cost the symbols.
+
+        The failure must NOT fall through to the outer handler, which keeps
+        the phase-1 zero placeholder: that would lose a fully-reduced
+        snapshot, which is what T6's "can never lose a TVL snapshot" clause
+        forbids."""
+        AnalyticsSnapshot.objects.all().delete()
+        safe = SafeContractFactory()
+        InternalTxFactory(to=safe.address, value=1_000_000, call_type=0, error=None)
+        ERC20TransferFactory(to=safe.address, value=500)
+
+        with patch(
+            "safe_transaction_service.analytics.services."
+            "analytics_service.get_token_symbols",
+            side_effect=RuntimeError("simulated tokens_token failure"),
+        ) as mock_get_token_symbols:
+            with self.assertLogs(
+                "safe_transaction_service.analytics.tasks_shards", level="WARNING"
+            ) as logs:
+                compute_tvl_task()
+
+        # Proof the injected failure actually fired and was swallowed
+        # where we intended — this is what the old `top_tokens == []`
+        # assertion was standing in for.
+        self.assertTrue(mock_get_token_symbols.called)
+        self.assertTrue(
+            any("token metadata lookup failed" in line for line in logs.output),
+            logs.output,
+        )
+
+        # The *reduced* payload was written, not the placeholder.
+        snap = AnalyticsSnapshot.objects.get(name="tvl")
+        self.assertIsNotNone(snap.computed_at)
+        self.assertNotEqual(snap.payload["native_balance_wei"], "0")
+        self.assertTrue(snap.payload["top_tokens"])
+        for entry in snap.payload["top_tokens"]:
+            # Present-and-null, not absent: a later change that drops the
+            # key on the degraded path has to fail here.
+            self.assertIn("symbol", entry)
+            self.assertIsNone(entry["symbol"])
+
     def test_tvl_cold_snapshot_returns_empty(self):
         # No `tvl` row yet — view returns the empty payload immediately
         # and fire-and-forget dispatches a refresh. Patch the task to a
@@ -872,6 +942,82 @@ class TestRollupReadPath(AnalyticsTestMixin, APITestCase):
         self.assertEqual(response.data["total_erc20_transfers"], 1)
         # Live path doesn't tag source.
         self.assertNotIn("source", response.data)
+
+    def test_token_volume_symbol_served_from_rollup(self):
+        """Rollup-served read joins `tokens_token` for the `symbol` key:
+        a known token gets its symbol, an unknown one is present-and-null
+        rather than falling back to its address."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        from safe_transaction_service.analytics.models import DailyTokenVolume
+
+        known = TokenFactory(symbol="USDC")
+        unknown_address = Account.create().address
+        today = timezone.now().date()
+        DailyTokenVolume.objects.create(
+            date=today - timedelta(days=1),
+            token_address=known.address,
+            transfer_count=9,
+            transfer_value=900,
+        )
+        DailyTokenVolume.objects.create(
+            date=today - timedelta(days=1),
+            token_address=unknown_address,
+            transfer_count=2,
+            transfer_value=100,
+        )
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-token-volume"),
+            {"window": "30d"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        top_tokens = response.data["top_tokens"]
+        self.assertEqual(len(top_tokens), 2)
+        symbols = {t["address"]: t["symbol"] for t in top_tokens}
+        self.assertEqual(symbols[known.address], "USDC")
+        self.assertIn(unknown_address, symbols)
+        self.assertIsNone(symbols[unknown_address])
+
+    def test_token_volume_symbol_cold_window_falls_back_to_live(self):
+        """Same `symbol` contract on the cold-window live aggregation —
+        the key must not appear only on the rollup path."""
+        from eth_account import Account
+
+        known = TokenFactory(symbol="DAI")
+        unknown_address = Account.create().address
+        ERC20TransferFactory(address=known.address, value=100)
+        ERC20TransferFactory(address=unknown_address, value=100)
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-token-volume"),
+            {"window": "30d"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        symbols = {t["address"]: t["symbol"] for t in response.data["top_tokens"]}
+        self.assertEqual(symbols[known.address], "DAI")
+        self.assertIn(unknown_address, symbols)
+        self.assertIsNone(symbols[unknown_address])
+
+    def test_token_volume_blank_symbol_reads_as_null(self):
+        """A `tokens_token` row exists but carries an empty symbol — that is
+        still "unknown", so it must be null and not an empty string."""
+        blank = TokenFactory(symbol="")
+        ERC20TransferFactory(address=blank.address, value=100)
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-token-volume"),
+            {"window": "30d"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["top_tokens"][0]["symbol"])
 
     def test_active_safes_served_from_rollup(self):
         from datetime import timedelta
@@ -1086,6 +1232,902 @@ class TestTxVolumeDailyMetricSource(AnalyticsTestMixin, APITestCase):
         self.assertEqual(data["avg_confirmations"], 0.0)
         self.assertEqual(data["coverage_days"], 0)
         self.assertEqual(data.get("source"), "daily_metric")
+
+
+class TestTxVolumeDayBreakdown(AnalyticsTestMixin, APITestCase):
+    """phase-B T8 — the opt-in `breakdown=day` parameter on `/tx-volume/`.
+
+    Three cases per spec §5 (absent / valid / invalid) plus the
+    rollup-served / cold-rollup pairing every rollup-backed read carries.
+    """
+
+    # The scalar payload as it shipped before T8, in emission order. The
+    # `breakdown`-absent response must still be exactly this — that is
+    # the property that lets the producer half deploy on its own (§4.9),
+    # so it is pinned as an ordered list, not as a set.
+    KEYS_WITHOUT_BREAKDOWN = [
+        "window",
+        "total_multisig_txs",
+        "executed_multisig_txs",
+        "executed_multisig_txs_via_api",
+        "executed_multisig_txs_indexed_only",
+        "api_attribution_coverage_days",
+        "module_txs",
+        "total_value_wei",
+        "avg_confirmations",
+        "avg_confirmations_approximation",
+        "coverage_days",
+        "computed_at",
+        "source",
+    ]
+
+    def setUp(self):
+        super().setUp()
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from safe_transaction_service.analytics.models import DailyMetric
+
+        self.today = timezone.now().date()
+        # Fully computed day.
+        DailyMetric.objects.create(
+            date=self.today - timedelta(days=1),
+            multisig_txs_proposed=5,
+            multisig_txs_executed=4,
+            multisig_txs_via_api=3,
+            multisig_txs_indexed_only=1,
+            erc20_transfers=7,
+            module_txs=2,
+            native_value_wei=1000,
+            confirmations_count=8,
+            confirmed_tx_count=4,
+            computed_at=timezone.now(),
+        )
+        # today-2 is deliberately absent from the rollup.
+        # Pre-backfill day: the executed split is NULL, not 0.
+        DailyMetric.objects.create(
+            date=self.today - timedelta(days=3),
+            multisig_txs_proposed=1,
+            multisig_txs_executed=1,
+            erc20_transfers=2,
+            computed_at=timezone.now(),
+        )
+        # Today is not a completed UTC day (`date__lt=today`), and
+        # today-40 sits outside the 30d window. Neither may appear.
+        DailyMetric.objects.create(
+            date=self.today,
+            multisig_txs_executed=99,
+            computed_at=timezone.now(),
+        )
+        DailyMetric.objects.create(
+            date=self.today - timedelta(days=40),
+            multisig_txs_executed=77,
+            computed_at=timezone.now(),
+        )
+
+    def _get(self, params):
+        return self.client.get(
+            reverse("v2:analytics:analytics-tx-volume"),
+            params,
+            **self.auth_header,
+        )
+
+    def test_breakdown_absent_response_is_unchanged(self):
+        """Case 1 of 3: no parameter, no new keys — in the same order."""
+        response = self._get({"window": "30d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), self.KEYS_WITHOUT_BREAKDOWN)
+        self.assertNotIn("days", body)
+        self.assertNotIn("window_start", body)
+        self.assertNotIn("window_end", body)
+        # The pre-T8 numbers for this fixture, unchanged.
+        self.assertEqual(body["total_multisig_txs"], 6)
+        self.assertEqual(body["executed_multisig_txs"], 5)
+        self.assertEqual(body["executed_multisig_txs_via_api"], 3)
+        self.assertEqual(body["executed_multisig_txs_indexed_only"], 1)
+        self.assertEqual(body["api_attribution_coverage_days"], 1)
+        self.assertEqual(body["coverage_days"], 2)
+        self.assertEqual(body["total_value_wei"], "1000")
+        self.assertEqual(body["source"], "daily_metric")
+
+    def test_breakdown_day_adds_the_series_and_changes_nothing_else(self):
+        """Case 2 of 3: the parameter is purely additive. Compared
+        key-by-key against the response the same fixture produces
+        without it, so a change to any existing value fails here."""
+        scalar = json.loads(self._get({"window": "30d"}).content)
+        response = self._get({"window": "30d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertEqual(
+            list(body.keys()),
+            self.KEYS_WITHOUT_BREAKDOWN + ["window_start", "window_end", "days"],
+        )
+        for key in self.KEYS_WITHOUT_BREAKDOWN:
+            if key == "computed_at":
+                # Stamped at read time; equal values would be a coincidence.
+                continue
+            self.assertEqual(body[key], scalar[key], key)
+
+    def test_breakdown_day_series_shape(self):
+        from datetime import timedelta
+
+        response = self._get({"window": "30d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertEqual(
+            body["window_start"], (self.today - timedelta(days=30)).isoformat()
+        )
+        self.assertEqual(
+            body["window_end"], (self.today - timedelta(days=1)).isoformat()
+        )
+
+        days = body["days"]
+        # Newest-first; one entry per day *present in the rollup*, so
+        # today-2 is absent rather than a zero-filled row, today is not a
+        # completed day, and today-40 is outside the window.
+        self.assertEqual(
+            [d["date"] for d in days],
+            [
+                (self.today - timedelta(days=1)).isoformat(),
+                (self.today - timedelta(days=3)).isoformat(),
+            ],
+        )
+        self.assertEqual(
+            days[0],
+            {
+                "date": (self.today - timedelta(days=1)).isoformat(),
+                "multisig_txs_executed": 4,
+                "multisig_txs_via_api": 3,
+                "multisig_txs_indexed_only": 1,
+                "erc20_transfers": 7,
+            },
+        )
+        # The two nullable columns pass through as null — present keys,
+        # never coerced to 0, exactly as in the scalar payload.
+        self.assertIn("multisig_txs_via_api", days[1])
+        self.assertIsNone(days[1]["multisig_txs_via_api"])
+        self.assertIn("multisig_txs_indexed_only", days[1])
+        self.assertIsNone(days[1]["multisig_txs_indexed_only"])
+        self.assertEqual(days[1]["multisig_txs_executed"], 1)
+        self.assertEqual(days[1]["erc20_transfers"], 2)
+
+    def test_breakdown_day_window_is_not_capped(self):
+        """Spec Q21 — a long window is served, not rejected or clamped,
+        and `window` itself is echoed back verbatim (it is not validated
+        on this endpoint)."""
+        from datetime import timedelta
+
+        response = self._get({"window": "365d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(body["window"], "365d")
+        self.assertEqual(
+            body["window_start"], (self.today - timedelta(days=365)).isoformat()
+        )
+        # today-40 is inside a 365d window and outside a 30d one.
+        self.assertEqual(len(body["days"]), 3)
+
+    def test_breakdown_invalid_returns_400(self):
+        """Case 3 of 3. Any value but `day`, including an empty one."""
+        for value in ("week", "month", "hour", "", "Day", "day,week"):
+            with self.subTest(breakdown=value):
+                response = self._get({"window": "30d", "breakdown": value})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, value
+                )
+                self.assertIn("breakdown", json.loads(response.content)["error"])
+
+
+class TestTxVolumeDayBreakdownColdRollup(AnalyticsTestMixin, APITestCase):
+    """The cold half of the rollup pairing: `days` is present and empty,
+    never omitted. That is what keeps "old producer, key absent"
+    distinguishable from "new producer, no rows yet" for the hub's
+    feature detection (T11)."""
+
+    def test_breakdown_day_on_cold_rollup_returns_empty_days(self):
+        # Live data the read path must not touch — `/tx-volume/` has no
+        # live fallback, it reports the empty rollup honestly.
+        MultisigTransactionFactory(value=1000)
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-tx-volume"),
+            {"window": "30d", "breakdown": "day"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertIn("days", body)
+        self.assertEqual(body["days"], [])
+        # The window bounds describe the request, so they still ship.
+        self.assertIn("window_start", body)
+        self.assertIn("window_end", body)
+        self.assertEqual(body["coverage_days"], 0)
+        self.assertEqual(body["executed_multisig_txs"], 0)
+
+
+class _ActiveDayBreakdownMixin(AnalyticsTestMixin):
+    """Shared body for the `breakdown=day` cases on `/active-safes/` and
+    `/active-owners/` (phase-B T9). The two endpoints read different
+    rollups through the same code path, so the assertions are identical
+    apart from the rollup model, the address field and the count key —
+    the three things each subclass supplies.
+
+    Three cases per spec §5 (absent / valid / invalid) plus the
+    rollup-served / cold-rollup pairing every rollup-backed read carries
+    (the cold half lives in the companion class below).
+    """
+
+    route = None  # reversed route name
+    model = None  # DailyActiveSafe | DailyActiveOwner
+    address_field = None  # "safe_address" | "owner_address"
+    count_key = None  # "active_safes" | "active_owners"
+
+    @property
+    def keys_without_breakdown(self):
+        """The payload as it shipped before T9, in emission order. The
+        `breakdown`-absent response must still be exactly this — that is
+        the property that lets the producer half deploy on its own
+        (§4.9) — so it is pinned as an ordered list, not as a set."""
+        return ["window", self.count_key, "computed_at"]
+
+    def setUp(self):
+        super().setUp()
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        self.today = timezone.now().date()
+        self.addr1 = Account.create().address
+        self.addr2 = Account.create().address
+        self.addr3 = Account.create().address
+        self.addr4 = Account.create().address
+
+        def row(days_ago, address):
+            self.model.objects.create(
+                **{
+                    "date": self.today - timedelta(days=days_ago),
+                    self.address_field: address,
+                }
+            )
+
+        # These reads filter `date__gte` with no upper bound, so the
+        # partial current UTC day is in the window (unlike /tx-volume/).
+        row(0, self.addr3)
+        row(1, self.addr1)
+        # Two rows on the same day; addr1 spans two days and is one
+        # distinct address across the window.
+        row(2, self.addr1)
+        row(2, self.addr2)
+        # today-3 is deliberately absent from the rollup.
+        # today-10 sits outside the 7d window used below.
+        row(10, self.addr4)
+
+    def _get(self, params):
+        return self.client.get(reverse(self.route), params, **self.auth_header)
+
+    def test_breakdown_absent_response_is_unchanged(self):
+        """Case 1 of 3: no parameter, no new keys — in the same order."""
+        response = self._get({"window": "7d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), self.keys_without_breakdown)
+        self.assertNotIn("days", body)
+        self.assertNotIn("window_start", body)
+        self.assertNotIn("window_end", body)
+        # The pre-T9 number for this fixture, unchanged: distinct over
+        # the window, not a per-day sum.
+        self.assertEqual(body[self.count_key], 3)
+        self.assertIsNotNone(body["computed_at"])
+
+    def test_breakdown_day_adds_the_series_and_changes_nothing_else(self):
+        """Case 2 of 3: the parameter is purely additive. Compared
+        key-by-key against the response the same fixture produces
+        without it, so a change to any existing value fails here."""
+        scalar = json.loads(self._get({"window": "7d"}).content)
+        response = self._get({"window": "7d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertEqual(
+            list(body.keys()),
+            self.keys_without_breakdown + ["window_start", "window_end", "days"],
+        )
+        for key in self.keys_without_breakdown:
+            if key == "computed_at":
+                # Stamped at read time; equal values would be a coincidence.
+                continue
+            self.assertEqual(body[key], scalar[key], key)
+
+    def test_breakdown_day_series_shape(self):
+        from datetime import timedelta
+
+        response = self._get({"window": "7d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertEqual(
+            body["window_start"], (self.today - timedelta(days=7)).isoformat()
+        )
+        # No upper date bound on this read, so the right edge is today.
+        self.assertEqual(body["window_end"], self.today.isoformat())
+
+        days = body["days"]
+        # Newest-first; one entry per day *present in the rollup*, so
+        # today-3 is absent rather than a zero-filled row and today-10
+        # is outside the window.
+        self.assertEqual(
+            [d["date"] for d in days],
+            [
+                self.today.isoformat(),
+                (self.today - timedelta(days=1)).isoformat(),
+                (self.today - timedelta(days=2)).isoformat(),
+            ],
+        )
+        self.assertEqual(
+            days,
+            [
+                {"date": self.today.isoformat(), self.count_key: 1},
+                {
+                    "date": (self.today - timedelta(days=1)).isoformat(),
+                    self.count_key: 1,
+                },
+                {
+                    "date": (self.today - timedelta(days=2)).isoformat(),
+                    self.count_key: 2,
+                },
+            ],
+        )
+
+    def test_per_day_values_are_not_additive(self):
+        """Contract invariant 3, pinned. The per-day entries are per-day
+        distinct counts: summing them (4 here) does not give the window
+        value (3), because addr1 is active on two of the days. A regression
+        that derived either number from the other fails here."""
+        response = self._get({"window": "7d", "breakdown": "day"})
+        body = json.loads(response.content)
+        self.assertEqual(sum(d[self.count_key] for d in body["days"]), 4)
+        self.assertEqual(body[self.count_key], 3)
+
+    def test_breakdown_day_does_not_relax_window_validation(self):
+        """The 7d|30d|90d guard is unchanged and still runs first."""
+        for window in ("5d", "365d", "1y", ""):
+            with self.subTest(window=window):
+                response = self._get({"window": window, "breakdown": "day"})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, window
+                )
+                self.assertIn("window", json.loads(response.content)["error"])
+
+    def test_breakdown_day_accepts_every_valid_window_uncapped(self):
+        """Spec Q21 — `breakdown=day` caps nothing; each of the three
+        allowed windows is served."""
+        from datetime import timedelta
+
+        for window, expected in (("7d", 3), ("30d", 4), ("90d", 4)):
+            with self.subTest(window=window):
+                response = self._get({"window": window, "breakdown": "day"})
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                body = json.loads(response.content)
+                self.assertEqual(body["window"], window)
+                self.assertEqual(
+                    body["window_start"],
+                    (self.today - timedelta(days=int(window[:-1]))).isoformat(),
+                )
+                # today-10 joins the series from 30d up.
+                self.assertEqual(len(body["days"]), expected)
+
+    def test_breakdown_invalid_returns_400(self):
+        """Case 3 of 3. Any value but `day`, including an empty one."""
+        for value in ("week", "month", "hour", "", "Day", "day,week"):
+            with self.subTest(breakdown=value):
+                response = self._get({"window": "7d", "breakdown": value})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, value
+                )
+                self.assertIn("breakdown", json.loads(response.content)["error"])
+
+
+class _ActiveDayBreakdownColdMixin(AnalyticsTestMixin):
+    """The cold half of the rollup pairing: `days` is present and empty,
+    never omitted, on **both** paths a cold rollup can take — the Redis
+    cached-scalar fallback and the final zero payload. That is what keeps
+    "old producer, key absent" distinguishable from "new producer, no
+    rows yet" for the hub's feature detection (T11)."""
+
+    route = None
+    count_key = None
+    redis_prefix = None
+
+    def test_breakdown_day_on_cold_rollup_returns_empty_days(self):
+        response = self.client.get(
+            reverse(self.route),
+            {"window": "30d", "breakdown": "day"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertIn("days", body)
+        self.assertEqual(body["days"], [])
+        # The window bounds describe the request, so they still ship.
+        self.assertIn("window_start", body)
+        self.assertIn("window_end", body)
+        self.assertEqual(body[self.count_key], 0)
+
+    def test_breakdown_day_on_cached_fallback_returns_empty_days(self):
+        """The cold-window fallback serves a Redis window scalar with no
+        per-day rows behind it. It must still emit the key."""
+        self.redis.set(
+            self.redis_prefix + "30d",
+            json.dumps(
+                {
+                    "window": "30d",
+                    self.count_key: 7,
+                    "computed_at": "2026-05-18T00:00:00+00:00",
+                }
+            ),
+        )
+
+        response = self.client.get(
+            reverse(self.route),
+            {"window": "30d", "breakdown": "day"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        # 7 can only have come from the cached fallback, so this pins
+        # which path emitted the key.
+        self.assertEqual(body[self.count_key], 7)
+        self.assertEqual(body["computed_at"], "2026-05-18T00:00:00+00:00")
+        self.assertIn("days", body)
+        self.assertEqual(body["days"], [])
+        self.assertIn("window_start", body)
+        self.assertIn("window_end", body)
+
+
+class TestActiveSafesDayBreakdown(_ActiveDayBreakdownMixin, APITestCase):
+    route = "v2:analytics:analytics-active-safes"
+    address_field = "safe_address"
+    count_key = "active_safes"
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveSafe
+
+        return DailyActiveSafe
+
+
+class TestActiveSafesDayBreakdownColdRollup(_ActiveDayBreakdownColdMixin, APITestCase):
+    route = "v2:analytics:analytics-active-safes"
+    count_key = "active_safes"
+    redis_prefix = AnalyticsService.REDIS_ACTIVE_SAFES_PREFIX
+
+
+class TestActiveOwnersDayBreakdown(_ActiveDayBreakdownMixin, APITestCase):
+    route = "v2:analytics:analytics-active-owners"
+    address_field = "owner_address"
+    count_key = "active_owners"
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveOwner
+
+        return DailyActiveOwner
+
+
+class TestActiveOwnersDayBreakdownColdRollup(_ActiveDayBreakdownColdMixin, APITestCase):
+    route = "v2:analytics:analytics-active-owners"
+    count_key = "active_owners"
+    redis_prefix = AnalyticsService.REDIS_ACTIVE_OWNERS_PREFIX
+
+
+class _ActiveRangeMixin(AnalyticsTestMixin):
+    """Shared body for the optional `from`/`to` range on `/active-safes/`
+    and `/active-owners/` (phase-B T10). Same arrangement as T9's
+    breakdown mixin — the two endpoints differ only in the rollup model,
+    the address field, the count key and the Redis prefix — and the same
+    fixture, so the ranged numbers can be compared against the windowed
+    ones the T9 cases already pin.
+
+    Three cases per spec §5: range absent (byte-identical to pre-T10),
+    range valid, range invalid (400). "Invalid" has three distinct forms
+    here — an unparseable `from`, an unparseable `to`, and `from > to` —
+    and each is asserted on its *message*, not only on the status, since
+    the task requires the offending parameter to be named.
+    """
+
+    route = None  # reversed route name
+    model = None  # DailyActiveSafe | DailyActiveOwner
+    address_field = None  # "safe_address" | "owner_address"
+    count_key = None  # "active_safes" | "active_owners"
+    redis_prefix = None  # legacy rolling-window cache key prefix
+
+    # Bounds that are not a strict ISO `YYYY-MM-DD` calendar date. The last
+    # three are the interesting ones: `date.fromisoformat` alone accepts the
+    # basic and week forms, and `parse_date` accepts `2026-1-5` — this
+    # endpoint accepts none of them, unlike `/safe-creations/`'s lenient
+    # `parse_datetime` bounds, which are deliberately left alone (spec §6).
+    unparseable_bounds = (
+        "not-a-date",
+        "2026-13-01",
+        "2026-02-30",
+        "01-02-2026",
+        "",
+        "20260105",
+        "2026-W01-1",
+        "2026-1-5",
+        "2026-01-05T00:00:00+00:00",
+    )
+
+    @property
+    def keys_without_range(self):
+        """The payload as it shipped before T10, in emission order — the
+        range adds no key, it only changes `window` to null when it wins.
+        Pinned as an ordered list, not a set, for the reason T9 gives."""
+        return ["window", self.count_key, "computed_at"]
+
+    def setUp(self):
+        super().setUp()
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        self.today = timezone.now().date()
+        self.addr1 = Account.create().address
+        self.addr2 = Account.create().address
+        self.addr3 = Account.create().address
+        self.addr4 = Account.create().address
+
+        def row(days_ago, address):
+            self.model.objects.create(
+                **{
+                    "date": self.today - timedelta(days=days_ago),
+                    self.address_field: address,
+                }
+            )
+
+        # Same fixture as the T9 breakdown cases: addr1 is active on two
+        # days, so distinct-over-the-span and sum-of-days differ.
+        row(0, self.addr3)
+        row(1, self.addr1)
+        row(2, self.addr1)
+        row(2, self.addr2)
+        # today-3 is absent from the rollup; today-10 is outside 7d.
+        row(10, self.addr4)
+
+    def _get(self, params):
+        return self.client.get(reverse(self.route), params, **self.auth_header)
+
+    def _day(self, days_ago):
+        from datetime import timedelta
+
+        return (self.today - timedelta(days=days_ago)).isoformat()
+
+    # ── case 1 of 3: absent ──────────────────────────────────────────
+
+    def test_range_absent_response_is_unchanged(self):
+        """No `from`, no `to` — the pre-T10 response, keys in order and
+        `window` still the requested window string rather than null."""
+        response = self._get({"window": "7d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), self.keys_without_range)
+        self.assertEqual(body["window"], "7d")
+        # Distinct over the 7d window: addr1 (two days), addr2, addr3.
+        self.assertEqual(body[self.count_key], 3)
+        self.assertIsNotNone(body["computed_at"])
+
+    # ── case 2 of 3: valid ───────────────────────────────────────────
+
+    def test_range_returns_the_distinct_count_over_exactly_that_range(self):
+        """A COUNT(DISTINCT …) over the requested span and nothing else:
+        the closed range excludes both the days after `to` and the days
+        before `from`, and counts a repeat address once."""
+        for date_from, date_to, expected in (
+            (10, 0, 4),  # every seeded day: addr1..addr4
+            (10, 2, 3),  # drops addr3 (today) and addr1's today-1 row
+            (2, 2, 2),  # single day, two rows: addr1 + addr2
+            (10, 10, 1),  # single day, one row: addr4
+            (9, 3, 0),  # a span with no rows at all
+        ):
+            with self.subTest(date_from=date_from, date_to=date_to):
+                response = self._get(
+                    {"from": self._day(date_from), "to": self._day(date_to)}
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                body = json.loads(response.content)
+                self.assertEqual(body[self.count_key], expected)
+                # The range won, so no window applies to this number.
+                self.assertIsNone(body["window"])
+                self.assertEqual(list(body.keys()), self.keys_without_range)
+
+    def test_one_sided_range_leaves_the_other_side_unbounded(self):
+        """Either bound alone is valid, and the window stops applying as
+        soon as one of them is supplied."""
+        from_only = json.loads(self._get({"from": self._day(1)}).content)
+        # today-1 and today: addr1 + addr3.
+        self.assertEqual(from_only[self.count_key], 2)
+        self.assertIsNone(from_only["window"])
+
+        to_only = json.loads(self._get({"to": self._day(2)}).content)
+        # Everything up to today-2, including the out-of-window today-10.
+        self.assertEqual(to_only[self.count_key], 3)
+        self.assertIsNone(to_only["window"])
+
+    def test_range_wins_over_window(self):
+        """§4.5: "when both a range and `window` are supplied the range
+        wins". Asserted on the number, which only the range can produce —
+        7d alone gives 3 — and on `window` being reported as null."""
+        windowed = json.loads(self._get({"window": "7d"}).content)
+        self.assertEqual(windowed[self.count_key], 3)
+
+        response = self._get(
+            {"window": "7d", "from": self._day(10), "to": self._day(0)}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        # addr4 is 10 days old: inside the range, outside the 7d window.
+        self.assertEqual(body[self.count_key], 4)
+        self.assertIsNone(body["window"])
+
+        # And the other way round: a range narrower than the window.
+        narrow = json.loads(
+            self._get(
+                {"window": "90d", "from": self._day(2), "to": self._day(2)}
+            ).content
+        )
+        self.assertEqual(narrow[self.count_key], 2)
+
+    def test_range_length_is_not_capped(self):
+        """Q21, applied to the range: no cap, in either direction."""
+        response = self._get({"from": self._day(3650), "to": self._day(0)})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(body[self.count_key], 4)
+
+    def test_ranged_cold_read_does_not_serve_the_cached_window_scalar(self):
+        """The Redis cold-window fallback holds a rolling *window* number.
+        Serving it for a range request would answer a different question,
+        so a range that selects no rows returns the honest zero payload."""
+        self.redis.set(
+            self.redis_prefix + "30d",
+            json.dumps(
+                {
+                    "window": "30d",
+                    self.count_key: 7,
+                    "computed_at": "2026-05-18T00:00:00+00:00",
+                }
+            ),
+        )
+
+        response = self._get({"from": self._day(9), "to": self._day(3)})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(body[self.count_key], 0)
+        self.assertIsNone(body["computed_at"])
+        self.assertIsNone(body["window"])
+
+    # ── case 3 of 3: invalid, in its three distinct forms ────────────
+
+    def test_unparseable_from_returns_400_naming_from(self):
+        for value in self.unparseable_bounds:
+            with self.subTest(value=value):
+                response = self._get({"from": value, "to": self._day(0)})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, value
+                )
+                error = json.loads(response.content)["error"]
+                self.assertEqual(error, "from must be an ISO date (YYYY-MM-DD)")
+
+    def test_unparseable_to_returns_400_naming_to(self):
+        for value in self.unparseable_bounds:
+            with self.subTest(value=value):
+                response = self._get({"from": self._day(10), "to": value})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, value
+                )
+                error = json.loads(response.content)["error"]
+                self.assertEqual(error, "to must be an ISO date (YYYY-MM-DD)")
+
+    def test_from_after_to_returns_400_naming_from_and_to(self):
+        for date_from, date_to in ((0, 1), (2, 10), (0, 3650)):
+            with self.subTest(date_from=date_from, date_to=date_to):
+                response = self._get(
+                    {"from": self._day(date_from), "to": self._day(date_to)}
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                error = json.loads(response.content)["error"]
+                self.assertEqual(error, "from must not be after to")
+
+    def test_equal_bounds_are_a_valid_single_day_range(self):
+        """`from == to` is the boundary of the previous case and is not an
+        error: a one-day closed range."""
+        response = self._get({"from": self._day(2), "to": self._day(2)})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(json.loads(response.content)[self.count_key], 2)
+
+    def test_a_range_does_not_waive_the_window_validation(self):
+        """Precedence decides which days are counted, not which parameters
+        are checked: an invalid `window` is still a 400, and it is reported
+        before the range because it is the more basic error."""
+        response = self._get(
+            {"window": "5d", "from": self._day(10), "to": self._day(0)}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("window", json.loads(response.content)["error"])
+
+        # Two things wrong at once still reports `window` first.
+        response = self._get({"window": "5d", "from": "not-a-date"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("window", json.loads(response.content)["error"])
+
+    # ── range × breakdown=day (T9's series over a T10 span) ──────────
+
+    def test_range_with_breakdown_day_series_covers_exactly_the_range(self):
+        response = self._get(
+            {"from": self._day(10), "to": self._day(2), "breakdown": "day"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertEqual(
+            list(body.keys()),
+            self.keys_without_range + ["window_start", "window_end", "days"],
+        )
+        # The bounds are the range asked for, not a window off today.
+        self.assertEqual(body["window_start"], self._day(10))
+        self.assertEqual(body["window_end"], self._day(2))
+        # Newest-first, one entry per day present in the rollup: today and
+        # today-1 are past `to`, today-3 is absent rather than zero-filled.
+        self.assertEqual(
+            body["days"],
+            [
+                {"date": self._day(2), self.count_key: 2},
+                {"date": self._day(10), self.count_key: 1},
+            ],
+        )
+
+    def test_range_with_breakdown_day_values_are_not_additive(self):
+        """Contract invariant 3 over a range — T9's
+        `test_per_day_values_are_not_additive`, extended to a span that is
+        not a window. Neither number may be derived from the other: the
+        series sums to 5 while the distinct count over the same span is 4,
+        because addr1 is active on two of those days."""
+        response = self._get(
+            {"from": self._day(10), "to": self._day(0), "breakdown": "day"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(len(body["days"]), 4)
+        self.assertEqual(sum(d[self.count_key] for d in body["days"]), 5)
+        self.assertEqual(body[self.count_key], 4)
+
+    def test_to_only_range_with_breakdown_day_reports_no_lower_bound(self):
+        """The one case where `window_start` is null: nothing bounds the
+        read below, so there is no honest date to name."""
+        response = self._get({"to": self._day(2), "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertIsNone(body["window_start"])
+        self.assertEqual(body["window_end"], self._day(2))
+        self.assertEqual(
+            [d["date"] for d in body["days"]], [self._day(2), self._day(10)]
+        )
+        self.assertEqual(body[self.count_key], 3)
+
+    def test_ranged_cold_read_with_breakdown_day_returns_empty_days(self):
+        """A range with no rows keeps T9's cold-read contract: `days`
+        present and empty, bounds still describing the request."""
+        response = self._get(
+            {"from": self._day(9), "to": self._day(3), "breakdown": "day"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(body["days"], [])
+        self.assertEqual(body["window_start"], self._day(9))
+        self.assertEqual(body["window_end"], self._day(3))
+        self.assertEqual(body[self.count_key], 0)
+        self.assertIsNone(body["computed_at"])
+
+
+class TestActiveSafesDateRange(_ActiveRangeMixin, APITestCase):
+    route = "v2:analytics:analytics-active-safes"
+    address_field = "safe_address"
+    count_key = "active_safes"
+    redis_prefix = AnalyticsService.REDIS_ACTIVE_SAFES_PREFIX
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveSafe
+
+        return DailyActiveSafe
+
+
+class TestActiveOwnersDateRange(_ActiveRangeMixin, APITestCase):
+    route = "v2:analytics:analytics-active-owners"
+    address_field = "owner_address"
+    count_key = "active_owners"
+    redis_prefix = AnalyticsService.REDIS_ACTIVE_OWNERS_PREFIX
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveOwner
+
+        return DailyActiveOwner
+
+
+class TestSafeCreationsRangeStaysLenient(AnalyticsTestMixin, APITestCase):
+    """`/safe-creations/` keeps its lenient `parse_datetime` bounds: an
+    unusable bound is silently *ignored*, never a 400. That is existing
+    contract and spec §6 explicitly leaves it alone, so T10's strict
+    `YYYY-MM-DD` parsing was deliberately **not** shared with this
+    endpoint. Pinned here so a later "harmonise the date parsing" edit
+    fails a test instead of quietly changing a deployed contract.
+
+    Correction to the wording in §4.5/§6, established while writing this:
+    at Django 5.2 + Python 3.12 a *date-only* bound is not ignored — since
+    Django 5.0 `parse_datetime` tries `datetime.fromisoformat` first, and
+    that accepts `2026-05-01` (and `20260501`), so a date-only bound here
+    is honoured as midnight. What is silently ignored is a bound
+    `parse_datetime` cannot use at all (`not-a-date`, `2026-13-01`,
+    `2026-02-30` — the last returns `None` rather than raising, so there is
+    no 500 either). Both halves are pinned below; the out-of-scope
+    decision is unaffected, only the reason given for it.
+    """
+
+    def _seed_day_series(self, series):
+        payload = {"series": series, "computed_at": "2026-05-18T00:00:00+00:00"}
+        self.redis.set(AnalyticsService.REDIS_SAFE_CREATIONS, json.dumps(payload))
+
+    def _both_days(self):
+        self._seed_day_series(
+            [
+                {"period": "2026-04-15", "count": 1},
+                {"period": "2026-05-04", "count": 3},
+            ]
+        )
+
+    def test_unusable_bounds_are_ignored_not_rejected(self):
+        """The lenient half. Each of these would be a 400 naming the
+        parameter on `/active-safes/` and `/active-owners/`; here they are
+        dropped and filter nothing."""
+        for value in ("not-a-date", "2026-13-01", "2026-02-30", ""):
+            with self.subTest(value=value):
+                self._both_days()
+                response = self.client.get(
+                    reverse("v2:analytics:analytics-safe-creations"),
+                    {"interval": "day", "from": value, "to": value},
+                    **self.auth_header,
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK, value)
+                self.assertEqual(
+                    response.data,
+                    [
+                        {"period": "2026-04-15", "count": 1},
+                        {"period": "2026-05-04", "count": 3},
+                    ],
+                )
+
+    def test_date_only_bounds_are_honoured_as_midnight(self):
+        """The correction. `parse_datetime` resolves a date-only bound at
+        this Django/Python pin, so the range does filter — which is why
+        this endpoint is left exactly as it is rather than being described
+        as ignoring such bounds."""
+        self._both_days()
+        response = self.client.get(
+            reverse("v2:analytics:analytics-safe-creations"),
+            {"interval": "day", "from": "2026-05-01", "to": "2026-05-15"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [{"period": "2026-05-04", "count": 3}])
 
 
 class TestActiveOwnersRollupReadPath(AnalyticsTestMixin, APITestCase):
