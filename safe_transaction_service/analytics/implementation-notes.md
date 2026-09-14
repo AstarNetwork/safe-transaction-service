@@ -1087,3 +1087,649 @@ yet — custom ranges keep falling back to 90d until such a path exists.
 This is the producer half standing alone, which the merge order in the
 workspace contract allows precisely because the parameter-absent response
 is unchanged.
+
+# Part 8 — Native balance: from a nightly full recompute to an incremental rollup
+
+## What was actually broken
+
+`compute_tvl_task` fanned out a 16-shard chord every night at 03:15. Each
+shard ran `BALANCE_BATCH_SQL` over its 1/16 of the address space — a sum
+of the **entire** native-transfer history of those Safes, every night.
+That is O(all history) per run, and the chain only ever gets longer.
+
+Measured on `transaction-ethereum.safe.protofire.io`, 2026-09-11:
+
+```
+GET /api/v2/analytics/tvl/
+{"computed_at":"2026-09-11T03:44:08Z","total_shards":16,"partial_shards":16,
+ "erc20_token_count":36737,"native_balance_wei":"0","total_safes_with_balance":0}
+```
+
+Sixteen of sixteen shards failing, every run since 09-09. 463 174 Safes /
+16 ≈ 28 900 addresses per shard, six batches of 5000 each, against a
+`task_timeout(LOCK_TIMEOUT)` of 900 s. Sonic (6928 Safes) passes today
+but showed `partial_shards: 6` on 09-06 — the same ceiling, further away.
+
+Tuning the timeout does not fix a workload that grows linearly with the
+age of the chain. Neither does adding shards: 256 two-nibble shards would
+buy one more doubling and cost 256 concurrent slots the pool does not
+have. The work itself had to stop being proportional to history.
+
+So: keep a per-Safe running total, and each night add only what happened
+since last night. `SafeNativeBalance` + one `AnalyticsWatermark` row.
+A run now costs O(rows in the new blocks), and `partial_shards` stops
+being a thing that can happen at all.
+
+## The confirmation boundary is the whole design
+
+This is the one decision everything else hangs off.
+
+Every other analytics rollup recomputes a whole UTC day from scratch and
+therefore self-heals: re-run the day, get the right answer, nobody needs
+to know what went wrong. A running total does not have that property. An
+increment applied from rows that later vanish cannot be un-applied,
+because the rows are gone.
+
+And they do vanish. `reorg_service.recover_from_reorg` (`history/services/
+reorg_service.py:178-180`) does `EthereumBlock.objects.filter(number__gte=
+reorg_block).delete()`, and the FK cascade takes `EthereumTx` and
+`InternalTx` with it. No tombstone, no audit trail — just fewer rows than
+there were.
+
+So the rollup only ever consumes blocks a reorg cannot reach:
+
+```python
+head = min(MAX(number) WHERE confirmed, MAX(number) - settings.ETH_REORG_BLOCKS)
+```
+
+Both terms, deliberately, because they fail differently:
+
+- `confirmed` is the indexer's own statement that it has stopped
+  re-checking a block (`check_reorgs` sets it at
+  `number <= current - eth_reorg_blocks`). It is the authoritative
+  signal — but only on a deployment where that task is actually running.
+- the depth subtraction is an independent backstop that needs no task to
+  be alive.
+
+Taking the *minimum* means the rollup stalls (correctly, visibly) rather
+than advancing on either signal alone. A stalled `check_reorgs` shows up
+as a rollup that quietly stops moving and nothing else would report it,
+so `native_balance_head_block` logs a WARNING when the confirmed head
+falls more than `10 × ETH_REORG_BLOCKS` behind the depth bound.
+
+If the watermark is ever found *ahead* of the safe head, the run refuses
+outright and logs ERROR pointing at `--restart`. That state means blocks
+this rollup already applied were deleted — a reorg deeper than the
+confirmation zone, or a database restore. It is not something to be
+clever about: the whole service's data has moved, not just ours.
+
+## Seeding is bounded by the OLD watermark, not by the head
+
+A Safe enters `history_safecontract` when the indexer gets to it, which
+can be well after the transfers it already received. Every run therefore
+starts by seeding Safes with no rollup row — and the bound on that seed
+is the run's *incoming* watermark `W`, not `head`:
+
+```
+  W ──────────────────────────────────────► head
+  ├─ (1) SEED   missing Safes, blocks <= W
+  ├─ (2) DELTA  one pass over (W, head], applied with +=
+  └─ (3) MARK   watermark := head
+```
+
+Bound it at `head` and any transfer inside `(W, head]` gets counted
+twice — once by the seed, once by the delta. Bound it at the Safe's
+creation block and everything it received before the indexer noticed it
+is lost forever. `W` is the only bound that counts every block exactly
+once, and both failure modes are silent, which is why there are tests for
+each direction (`TestSafeIndexedMidWindow`).
+
+Steps (2) and (3) share a transaction. A crash between them either loses
+the range or applies it twice, and a signed running total cannot tell the
+difference afterwards. With them atomic, a re-run at the same watermark
+is a no-op — that is the entire idempotency story, and `TestAtomicity`
+pins it.
+
+Step (1) is deliberately *outside* that transaction: the seed insert is
+`ON CONFLICT DO NOTHING`, so a failure after it leaves rows the next run
+simply finds already present.
+
+## Every Safe gets a row, including zero-balance ones
+
+"Absent from `analytics_safenativebalance`" is the signal the seed step
+keys on. If Safes with no native flow were omitted, every single run
+would rediscover the entire fleet as "new" and re-seed it — the
+full-history recompute, back again, wearing a different hat. So the
+backfill and the seed both write a row per Safe, `balance_wei = 0`
+included. On Ethereum that is ~463k rows, which is nothing.
+
+## The sign is stored, the clamp is on read
+
+`BALANCE_BATCH_SQL` sums `CASE WHEN balance > 0 THEN balance ELSE 0 END`
+and counts `FILTER (WHERE balance > 0)`. Negative balances happen — an
+outgoing transfer is indexed and the matching incoming one is not yet —
+and the old code clamped them per-Safe at aggregation time.
+
+The rollup stores the true signed balance and applies the identical clamp
+at read time:
+
+```sql
+SELECT COALESCE(SUM(CASE WHEN balance_wei > 0 THEN balance_wei ELSE 0 END), 0),
+       COUNT(*) FILTER (WHERE balance_wei > 0)
+FROM analytics_safenativebalance
+```
+
+Clamping on write would make an indexing gap permanent: a row floored at
+zero can never be lifted back into the positive by the missing incoming
+transfer, because the deficit it should cancel is gone. And because the
+read-side clamp is byte-for-byte what the shards did, the numbers on
+`/tvl/` do not move when the producer switches —
+`TestTvlReadsTheRollup.test_native_numbers_match_the_shard_path_they_replace`
+asserts exactly that, running both paths over the same fixture.
+
+## Why the delta joins `history_ethereumtx` and the seed does not
+
+`InternalTx.block_number` is a plain `PositiveIntegerField` with no index
+(`history/models.py:1170`, absent from `Meta.indexes`). A range filter on
+it is a sequential scan of tens of millions of rows.
+
+The delta is driven *by the block window*, so it has to anchor on
+something indexed on that dimension: `history_ethereumtx.block_id`
+(`history_ethereumtx_block_id_92e7f70e`), joining `history_internaltx` on
+the FK afterwards. This is the same idiom, and the same reason, as
+`_METRIC_CORE_MULTISIG_COUNT_SUM_SQL` — whose comment (`tasks.py:981-988`)
+records the ~40 min/day the ORM form cost before it.
+
+The seed is driven *by an address list*, so the block is a residual
+filter and can use `it.block_number` directly, keeping the proven partial
+covering indexes (`history_internal_transfer_idx` /
+`history_internal_transfer_from`, which even carry `block_number` in
+their `INCLUDE`). That asymmetry is load-bearing on one assumption:
+`it.block_number == etx.block_id` for every row. It holds by
+construction — `InternalTx.build_from_trace` sets
+`block_number=ethereum_tx.block_id` (`history/models.py:866`) and
+`safe_events_indexer` sets it from the log's own `blockNumber`
+(`indexers/safe_events_indexer.py:567`). If that ever stops being true,
+the seed and the delta will disagree about who owns a block boundary.
+
+## The delta is an UPDATE, and that is load-bearing
+
+The delta statement can only ever update rows that already exist. The
+seed owns row creation, because only the seed knows to compute the
+balance below the watermark first.
+
+An upsert here looks natural and is wrong. A Safe the indexer writes into
+`history_safecontract` *between* this run's seed query and the delta
+statement — seconds to minutes apart on a busy chain, so not exotic —
+would get a row holding only `(W, head]`. Everything it received below
+`W` would be missing, and it would never be seeded again, because a row
+now exists. Silent, permanent undercount.
+
+As an `UPDATE … FROM`, such a Safe is simply skipped this run and seeded
+correctly by the next one, whose watermark covers the window it just
+missed. `TestIncrementalMatchesFullRecompute.test_the_delta_never_creates_a_row`
+pins it by patching the seed's result set to empty.
+
+The join against the rollup also carries the "is it a Safe" filter for
+free — rows only ever come from the seed, which selects from
+`history_safecontract` — and probes the rollup PK once per distinct
+counterparty rather than once per transfer row. `IN (SELECT address FROM
+history_safecontract)` would materialise ~460k rows on Ethereum.
+
+## Orphan rows: known, counted, not repaired
+
+`SafeContract.ethereum_tx` is `on_delete=CASCADE` from `EthereumTx`,
+which cascades from `EthereumBlock` — so `recover_from_reorg` deletes
+Safes, not just transfers. A rollup row for a deleted Safe stays behind
+and keeps contributing a balance that is itself real (it came from
+confirmed blocks) to an address that is no longer a Safe.
+
+It needs a reorg that removes a Safe creation while leaving its funding
+below the confirmation zone intact, so it is rare. The drift check counts
+these rows and logs WARNING; `--restart` is the repair. Counted rather
+than deleted for the same reason the balance drift is only reported: until
+one has been seen in the wild, "delete it" is a guess about what the row
+means.
+
+**Not verified at scale.** Local EXPLAIN runs against empty tables, so it
+confirms syntax and that the access paths exist, not that the planner
+picks them under production statistics. No index was added to
+`history_internaltx` — that would be a deliberate crossing of the scope
+boundary, and the `etx.block_id` anchor is the documented way around it.
+If the delta turns out to be slow on Ethereum, that is the finding to
+raise, not a detail to fix quietly.
+
+## The task lives in `tasks.py`, and that is not cosmetic
+
+`config/settings/base.py` (~line 316) routes only
+`safe_transaction_service.analytics.tasks.*` and `…tasks_shards.*` to the
+`contracts` queue. A new `tasks_balances.py` would have gone to the
+default queue and been silently never consumed — no error, no log, just a
+rollup that never advances. Putting the task in `tasks.py` avoids
+touching the routing table at all, so this change needs no edit to
+`config/settings/base.py`.
+
+Two files outside `analytics/` are touched, both documented exceptions:
+`history/management/commands/setup_service.py` for the two beat entries
+(`compute_native_balance_rollup_task` daily 03:05, ten minutes ahead of
+`compute_tvl_task`; `check_native_balance_drift_task` Sundays 05:00).
+
+## The chord is kept, and is now the fallback
+
+Options were: make `finalize_tvl_snapshot` a plain task, or keep the
+chord for ERC20's sake. Took the first — the chord existed only to
+parallelise the native side, and the native side no longer needs
+parallelising. `compute_tvl_task` reads the rollup (milliseconds) and
+calls `dispatch_tvl_finalize`, which dispatches `finalize_tvl_snapshot`
+directly. No chord, no fan-out, and no result backend in a TVL run at all
+— which also removes the *"Starting chords requires a result backend to
+be configured"* failure mode from this path entirely.
+
+But `dispatch_tvl_chord`, `compute_native_balance_shard`,
+`reduce_native_balance_shards`, `_calculate_native_balances_from_db` and
+`BALANCE_BATCH_SQL` all stay, for three reasons:
+
+1. **Un-backfilled instances.** `compute_tvl_task` falls back to the
+   chord when the rollup has no watermark. An instance that has migrated
+   but not yet run `backfill_native_balances` keeps serving the number it
+   served before rather than a zero — which matters because a zero and
+   "a fleet holding nothing" are indistinguishable in the payload.
+   The fleet upgrades at different times; this is what lets the deploy
+   and the backfill be separate events.
+2. **The drift check** recomputes against `_NATIVE_BALANCE_SEED_SQL`,
+   which is the same family. An independent reference has to exist.
+3. Deleting a working fallback to save a diff is a bad trade on a
+   producer that ~111 staging services poll.
+
+## `/tvl/` payload: two keys added, none removed
+
+Workspace contract: adding a key is safe, removing or renaming one is
+breaking and must land consumer-first. So:
+
+- `partial_shards` **stays**, and the rollup path writes `0` — exactly
+  what the hub reads as "complete" when it gates USD pricing
+  (`collectors/tx_service.py:874-906`) and filters dashboard rows
+  (`dashboard/data.py:710`, `:758`).
+- `total_shards` **stays** at `0`. The hub reads it nowhere (checked by
+  grep), but a key nobody reads is still a key that cannot be removed
+  from the producer first.
+
+Both are vestigial on the rollup path. What actually describes a run now
+is additive:
+
+- `native_source`: `"rollup"` | `"shards"` | `null`. The `null` is the
+  phase-1 placeholder, which previously relied on `total_shards == 0` to
+  mark itself as never-computed — a discriminator the rollup path took
+  away. `computed_at: null` remains the primary cold-read signal
+  (contract invariant 1) and is unaffected.
+- `native_updated_to_block`: the block the native side is complete
+  through. This is the one that pays for itself in triage: "how stale is
+  this number" is now answerable from the payload, without reading worker
+  logs or opening a shell.
+
+`EMPTY_TVL_PAYLOAD` gains both as `null` so a cold read stays
+shape-identical to a warm one.
+
+No hub change is required or included. The hub ignores unknown keys, and
+every key it reads today still means what it meant.
+
+## Backfill: the only place the full recompute still happens
+
+`manage.py backfill_native_balances` does the one full pass, inline, with
+no Celery anywhere near it — which is the entire point, because
+`task_timeout` is what kills the shards and nothing here is a task.
+
+Progress is the rollup table itself: a row is a Safe already computed.
+Crash, re-run, it skips what is done. No Redis manifest (unlike
+`backfill_daily_metrics`) because the table is already a perfectly good
+journal.
+
+`_resolve_head` is the subtle part. Two passes at two different blocks
+would leave rows complete through different heights, and one watermark
+cannot describe both — the earlier rows would silently lose everything in
+between. So:
+
+- **interrupted first run** (rows exist, no watermark): resume at the
+  block those rows are stamped with, not at today's head.
+- **already-watermarked rollup**: top up Safes that have no row, at the
+  existing watermark, and leave the watermark alone. This is the same
+  operation the nightly seed step does, available by hand.
+- **rows stamped at two different blocks with no watermark**: refuse.
+  The lower block double-counts, the higher one skips, and guessing
+  between them is worse than stopping. `--restart`.
+- `--at-block` above the safe head: refused, for the reason in the
+  confirmation-boundary section.
+
+`--restart` `TRUNCATE`s the table and drops the watermark.
+
+`warm_analytics_cache` gained the rollup task, ordered before `tvl`. Its
+`_is_fresh` probe now tolerates a `None` Redis key — the rollup's
+freshness lives in a Postgres watermark, not a Redis payload, so it is
+never skipped by `--skip-if-fresh`. It does not need to be: the task
+no-ops when there is nothing new to consume. The ordering is a hint
+rather than a guarantee (both are fire-and-forget dispatches) and does
+not need to be one — a TVL run that overtakes the rollup publishes
+yesterday's native side and the next run catches up.
+
+## `--celery`: the same walk, driven from the worker
+
+Inline stays the default. `--celery` was added because a run over a
+250k-Safe chain outlives the shell that starts it, and `nohup` is a weaker
+answer than "it is on the queue".
+
+**Why this is safe under `task_timeout` when the 16 TVL shards are not.**
+That is the obvious objection, since the timeout is the whole reason this
+branch exists. The difference is the unit of work. A TVL shard owns 1/16 of
+the address space and sums its *entire history* — ~29k addresses on
+Ethereum, unbounded in the chain's age, and it does not finish in 900 s. A
+backfill chunk owns 5000 addresses, which is the batch size
+`BALANCE_BATCH_SQL` was measured at: seconds. The shard's work grows with
+the chain, the chunk's does not. Shrink `--chunk-size` if a chain ever
+proves otherwise.
+
+**Not a chord, unlike `backfill_daily_metrics`.** The dates of a daily
+backfill are known up front, so it can build a manifest listing every
+chunk and fan each one out as a `group`. The native-balance walk is a
+keyset cursor over `history_safecontract.address` — chunk *n+1*'s starting
+address is not known until chunk *n* has run. So each task dispatches its
+own successor, and the manifest carries a cursor plus a running aggregate
+instead of a precomputed chunk list. One chunk is in flight at any time,
+which is the same concurrency guarantee the daily backfill gets from its
+chord chaining, reached more simply.
+
+**The cursor lives in Redis, not in the task signature.** `(run_id)` is
+the whole signature. Putting the address in the arguments would have been
+simpler, but then a lost message is unrecoverable — you cannot re-dispatch
+a chunk you cannot describe. Reading the cursor from the manifest means
+any chunk can be re-dispatched by run id alone.
+
+**Manifest writes happen before `apply_async`, never after.** Under eager
+mode the entire remaining chain executes inside that call, so a write
+afterwards would clobber newer state with a stale copy. Exactly the lesson
+already recorded on `_dispatch_backfill_chunk`.
+
+**A failing chunk stops the chain rather than raising.** The manifest gets
+`state="failed"` and the message, `--status` shows it, and re-running
+resumes — rows already written are skipped, so the cost of a retry is one
+index probe per finished Safe. Raising would have produced a retry storm
+against a database that is, by hypothesis, already unhappy.
+
+**A closed run ignores further chunks.** `backfill_native_balance_chunk`
+returns immediately when `state != "running"`. This is the one way a
+duplicated or late-redelivered message could corrupt a run — by re-walking
+from a cursor that has already moved — and
+`test_chunk_task_is_inert_once_the_run_is_closed` pins it.
+
+Both modes now share `seed_missing_native_balances` and
+`write_native_balance_watermark`, so "resume" and "do not move a watermark
+that is not mine" mean the same thing in each. The watermark rules from
+`_resolve_head` are unchanged and still enforced by the command before
+either mode starts — `--celery` does not get its own head resolution.
+
+`--status` reports both halves: the table (what is done) and the most
+recent run manifest (where the cursor is). They can disagree legitimately —
+a finished run plus later rows from the nightly seed step — and that is
+why they are printed separately rather than reconciled.
+
+## Drift check: observability first, no self-healing
+
+`check_native_balance_drift_task`, Sundays 05:00. Samples 2000 random
+rollup rows and recomputes them from scratch at the watermark, logging
+WARNING with the mismatch count, the total and worst |diff|, and the five
+worst addresses. It also counts orphan rows (see above) in the same pass.
+
+Bounded **at the watermark**, not at the current head: the rollup only
+claims completeness through the watermark, so anything above it is the
+next run's work, not drift. If the watermark moves while the check is
+running, the round is skipped — that is a race, not a discrepancy anybody
+can act on.
+
+Deliberately not self-healing on the first iteration. Repairing means
+deciding which of the two numbers is right, and until real drift has been
+observed we do not know what produces it. `ORDER BY random()` over
+`TABLESAMPLE` for the same reason: a sequential scan plus sort is tens of
+ms once a week, and `TABLESAMPLE`'s bias toward physically clustered rows
+is the wrong trade for a check whose job is to find an anomaly.
+
+## Rollout
+
+1. `migrate` — two empty tables, nothing reads them.
+2. `manage.py backfill_native_balances` (inline, `nohup`, `--status` to
+   watch). Until it finishes and writes the watermark, `/tvl/` keeps
+   using the chord.
+3. Nothing else. The next `compute_tvl_task` picks the rollup up on its
+   own; `native_source` in the payload says which producer ran.
+
+Verified against Sonic staging, whose current chord output is honest
+(`partial_shards: 0`, `native_balance_wei:
+1030423823669599423227126788`, `total_safes_with_balance: 628`) —
+`native_balance_wei` after the backfill must match it exactly.
+
+## What `makemigrations` also wanted, and did not get
+
+Migration 0008 omits four `AlterField` operations turning the `Daily*`
+rollup PKs from `AutoField` into `BigAutoField`. That drift predates this
+branch — `makemigrations analytics --check` reports it on `staging`
+without any of these changes — and rewriting four rollup tables is not
+this change's business.
+
+## Tests — `tests/test_native_balance_rollup.py` (new)
+
+Grouped by the failure each class defends against:
+
+- `TestHeadBlock` — confirmed flag bounds the head; reorg depth bounds
+  it; neither present ⇒ `None`.
+- `TestIncrementalMatchesFullRecompute` — the headline property, over
+  three successive windows with both signs, plus Safe-to-Safe transfers
+  netting out and non-Safe counterparties never getting a row.
+- `TestIdempotency` — a second run with no new blocks moves nothing;
+  zero-balance Safes are not re-seeded every run.
+- `TestSafeIndexedMidWindow` — both directions of the seed bound: a Safe
+  whose transfers predate its `history_safecontract` row keeps them, and
+  a transfer inside `(W, head]` is counted once, not twice.
+- `TestConfirmationBoundary` — an unconfirmed block is not consumed, and
+  is picked up on the run after it confirms.
+- `TestNegativeBalances` — stored signed, excluded from both aggregates,
+  and back in the positive once the missing transfer is indexed.
+- `TestAtomicity` — a failure between the delta and the watermark leaves
+  neither, and the retry applies the range exactly once.
+- `TestRefusalPaths` — uninitialised, watermark ahead of head, too many
+  Safes to seed: all refuse loudly and change nothing.
+- `TestBackfillCommand` — full pass, handover, resume, restart, and each
+  `_resolve_head` refusal.
+- `TestTvlReadsTheRollup` — the payload keeps every pre-existing key,
+  gains the two new ones, and produces the same native numbers as the
+  shard path it replaces.
+- `TestChunkedCeleryBackfill` — `--celery` lands on the same rows, the
+  same stamps and the same watermark as inline; the manifest accounts
+  for every Safe; a failing chunk stops the chain and writes no
+  watermark; a closed run ignores a redelivered chunk.
+- `TestDriftCheck` — clean rollup is quiet, a corrupted row is reported
+  with its magnitude, above-watermark activity is not drift, and an
+  orphan row is reported.
+
+The reference in the equality assertions is
+`_calculate_native_balances_from_db`, which is what `TestNativeBalanceShards`
+verified the chord against — so "incremental == sequential == chord"
+closes transitively.
+
+---
+
+# Part 9 — `breakdown=day` on `/token-volume/`
+
+The fourth endpoint to grow the opt-in parameter, and the first where the
+series is nested rather than flat. It exists so the hub's "Top 10 ERC20
+tokens" card can carry a real range (7d / 30d / 90d / custom) instead of
+the hardwired 30-day window it shows today: the producer hands over
+per-day rows, the hub sums whichever days its range covers.
+
+## This reverses decision Q20, on purpose
+
+`phase-b-data-gaps.md` §4.5 says, in as many words, "`/token-volume/`
+gets **no** `breakdown` parameter. It stays a top-tokens list without a
+time series (owner decision, Q20)". That decision is now superseded — the
+card needs a range and there is no other source for one — and the spec
+row should be read as history, not as current contract.
+
+It was the right call at the time for the reason Q20 gives: the ERC20
+*daily* series comes from `/tx-volume/`'s `erc20_transfers` column, so
+nothing needed per-day token rows. What changed is that a *per-token*
+range breakdown was asked for, and `DailyMetric.erc20_transfers` is a
+single number per day with no token dimension.
+
+The consumer-side guard `test_the_probe_is_sent_on_exactly_three_reads`
+(hub, `tests/test_tx_collector_new_endpoints.py`) asserts the old
+decision and will fail the moment the hub starts probing this endpoint.
+That is the hub PR's job, not this one's; it is named here so the failure
+reads as expected rather than as a surprise.
+
+## Why this endpoint can have a breakdown at all
+
+`transfer_count` is an **additive** count. `DailyTokenVolume` is unique
+per `(date, token_address)` and a window read is already a plain `SUM`
+over the day rows (`_token_volume_from_rollup`), so exposing those rows
+lets a consumer re-aggregate over any sub-range and get the same answer
+the producer would.
+
+This is exactly what contract invariant 3 forbids for the T9 series: the
+active-\* rollups are per-day `COUNT(DISTINCT …)` and summing them is
+wrong. The distinction is the whole reason the hub-side plan works, and
+it is worth restating whenever a fourth breakdown is proposed — the
+question to ask is not "does the rollup have day rows" but "is the
+column additive".
+
+## The per-day cap is the one real design decision
+
+An uncapped series is not shippable. The rollup holds a row per
+`(date, token)` and a busy chain has thousands of tokens a day, so a
+90-day response would be tens of thousands of entries.
+
+So each day carries its **own** top-N, N = `TOP_TOKENS_LIMIT` = 20, and
+the payload says so in `days_token_cap`.
+
+Sizing, since it is the argument for 20 rather than 10 or 50. A day's
+token entry is ~140 bytes of JSON, so a 90-day series costs ~250 KB at
+20, ~630 KB at 50, ~125 KB at 10. The hub polls ~111 staging deployments
+a cycle, i.e. ~28 MB a cycle at 20 against ~70 MB at 50. The hub renders
+a top-10, so 20 is twice the depth it draws — headroom for a token that
+ranks 11th on some days and 6th on others — without spending the cycle on
+tokens nothing displays.
+
+**The consequence, stated because it must not be discovered later.**
+Summing the series is exact for a token that makes its day's top-20 and
+**understates** one that never does: the perpetual 21st, busy every day
+and listed on none. The error is one-directional — the series can miss
+volume, never invent it — so a range ranking built from it is right at
+the head and thins out in the tail. For the hub's top-10 this is
+invisible. For anything that wants a *total*, the scalar
+`total_erc20_transfers` beside the series is the uncapped number and is
+what should be used.
+
+`days_token_cap` ships on every `breakdown=day` response including a cold
+one, so the key set does not depend on whether there were rows and the
+cap is never inferred from `len(tokens)` — which would read a quiet day
+as a shallow one.
+
+## The cap is applied in SQL, and the tie-break is load-bearing
+
+`ROW_NUMBER() OVER (PARTITION BY date ORDER BY transfer_count DESC,
+token_address ASC)` filtered to `<= cap` (Django `Window` + `RowNumber`,
+filterable since 4.2). The point is that the capped-out rows are never
+*fetched*, not merely never serialised — capping in Python would still
+drag 450k rows out of Postgres on a 90-day read of a busy chain to emit
+1800.
+
+`token_address ASC` is not decoration. Without a tie-break, which token
+survives a tie at the cap boundary is whatever the planner returned
+first, and a consumer diffing two cycles would see tokens appear and
+vanish with no underlying change.
+`test_a_tie_at_the_cap_boundary_is_broken_by_address` pins it.
+
+## `window_end` is **today**, same as the active-\* pair
+
+This read is `date__gte=since` with no upper bound, so the window
+includes a partial current UTC day and the bounds say so —
+`since … today`, not `since … yesterday`. Part 6 made the same call for
+`/active-safes/` and `/active-owners/` for the same reason: reporting
+yesterday for consistency with `/tx-volume/` would be a lie about which
+days the series can contain, and `test_breakdown_day_series_shape` seeds
+a row dated today to pin that the current day really is served.
+
+This is the asymmetry the workspace contract's endpoint table records,
+and the reason a `token-volume` 30d total is not comparable to a
+`tx-volume` 30d total. Realigning it stays out of scope.
+
+## One `since`, computed once, passed down
+
+`_token_volume_rollup_queryset(since)` is now the single filter both
+halves read, and `_token_volume_from_rollup` takes `since` from the
+caller instead of deriving its own `timezone.now().date()`.
+
+That is not tidying. With two derivations, a request that crosses UTC
+midnight between them would aggregate one span and report the bounds of
+another — a once-a-day off-by-one that would be invisible in tests and
+unexplainable in production.
+
+## The cold path serves a scalar and an empty series
+
+Unlike `/tx-volume/`, this endpoint has a live `ERC20Transfer` fallback,
+so "cold rollup" here does **not** mean an empty payload. The scalar half
+is served live and `days` is `[]`.
+
+That combination is the honest one: an empty `days` is a statement about
+the rollup, never about activity.
+`test_breakdown_day_on_cold_rollup_returns_empty_days` seeds live
+transfers precisely so the two halves disagree, and asserts both.
+
+One nuance worth recording: on that path the scalar comes from
+`timestamp__gte=now - N days`, whose lower edge is the current time of
+day rather than midnight, while `window_start` reports `today - N`. The
+bounds describe the *requested* window, and with `days` empty there is no
+series for them to disagree with — but a consumer that one day starts
+reading `window_start` as the scalar's true lower bound should know it is
+not one on this path.
+
+## Shape: `{date, tokens: [...]}`, and the token is a `top_tokens` entry
+
+Day entries are keyed `date` (ISO `YYYY-MM-DD`), matching T8/T9 and
+unlike `/safe-creations/`'s `period`. Each day's `tokens` entry carries
+the same four keys as a scalar `top_tokens` entry — `address`, `symbol`,
+`transfer_count`, `total_value` — so a consumer parses one shape in both
+halves of the payload.
+
+`symbol` is resolved in **one** `IN (...)` over every address in the
+whole response (`get_token_symbols`, Part 4), not per day. Unknown is
+`null`, never the address, same contract as everywhere else.
+
+A day absent from the rollup is absent from `days`, never zero-filled: a
+gap means "not computed", not "no transfers".
+
+## `TOP_TOKENS_LIMIT` replaces three literals
+
+The scalar `top_tokens` slice on both read paths and the new per-day cap
+were all `20`. They are now one constant, so the relationship is stated
+rather than being a coincidence: a consumer summing the per-day series to
+rank tokens over its own range needs each day at least as deep as the
+ranking it draws.
+
+## Tests
+
+`test_views_v2.py`, three new classes, 15 cases (6 of them subtests):
+
+- `TestTokenVolumeDayBreakdown` — the three §5 cases (absent / valid /
+  invalid), the series shape (order, the served partial current day, the
+  today-2 gap, the out-of-window day, symbol pass-through), the
+  `top_tokens` key set on day entries, the not-capped window, and
+  `test_breakdown_day_sums_to_the_window_total`, which pins the
+  additivity the whole feature rests on.
+  `test_breakdown_day_adds_the_series_and_changes_nothing_else` diffs the
+  `breakdown=day` body key-by-key against the no-parameter body from the
+  same fixture, skipping only `computed_at`.
+- `TestTokenVolumeDayBreakdownCap` — 25 tokens on one day: the cap keeps
+  the N busiest in order, the scalar half still counts all 25 (it is
+  aggregated, not summed from the series), and a tie at the boundary goes
+  to the lower address.
+- `TestTokenVolumeDayBreakdownColdRollup` — the cold half of the rollup
+  pairing, plus a second case pinning that the *no-parameter* response
+  through the live fallback did not grow anything when that branch gained
+  its conditional.

@@ -189,6 +189,14 @@ TASKS = [
         cron=CronDefinition(minute=0, hour=3),  # Daily at 03:00 - 0 3 * * *
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_native_balance_rollup_task",
+        description=(
+            "Advance the incremental native-balance rollup (daily at 03:05, "
+            "ahead of compute_tvl_task so TVL reads a fresh one)"
+        ),
+        cron=CronDefinition(minute=5, hour=3),  # Daily at 03:05 - 5 3 * * *
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.analytics.tasks.compute_tvl_task",
         description="Precompute TVL aggregates (daily at 03:15)",
         cron=CronDefinition(minute=15, hour=3),  # Daily at 03:15 - 15 3 * * *
@@ -197,6 +205,14 @@ TASKS = [
         name="safe_transaction_service.analytics.tasks.compute_safe_creations_task",
         description="Compute Safe creations day-grain time series (daily at 04:30)",
         cron=CronDefinition(minute=30, hour=4),  # 30 4 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.check_native_balance_drift_task",
+        description=(
+            "Sample the native-balance rollup against a from-scratch "
+            "recompute and report disagreement (every Sunday at 05:00)"
+        ),
+        cron=CronDefinition(minute=0, hour=5, day_of_week=0),  # 0 5 * * 0
     ),
 ]
 

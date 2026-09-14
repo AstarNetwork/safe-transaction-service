@@ -2219,3 +2219,350 @@ class TestSnapshotReadPath(AnalyticsTestMixin, APITestCase):
         self.assertEqual(response.data["native_balance_wei"], "100")
         self.assertEqual(response.data["erc20_token_count"], 3)
         self.assertIsNotNone(response.data["computed_at"])
+
+
+class TestTokenVolumeDayBreakdown(AnalyticsTestMixin, APITestCase):
+    """The opt-in `breakdown=day` parameter on `/token-volume/`.
+
+    Same three §5 cases as T8 (absent / valid / invalid) plus the
+    rollup-served / cold-rollup pairing, and the two things that are new
+    here: the series is a *nested* per-day top-N rather than a flat row,
+    and it ships the cap that bounds it.
+    """
+
+    # The scalar payload as it shipped before this task, in emission
+    # order. The `breakdown`-absent response must still be exactly this —
+    # that is the property that lets the producer half deploy on its own,
+    # so it is pinned as an ordered list, not as a set.
+    KEYS_WITHOUT_BREAKDOWN = [
+        "window",
+        "total_erc20_transfers",
+        "unique_tokens",
+        "top_tokens",
+        "computed_at",
+    ]
+
+    def setUp(self):
+        super().setUp()
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        from safe_transaction_service.analytics.models import DailyTokenVolume
+
+        self.today = timezone.now().date()
+        self.known = TokenFactory(symbol="USDC")
+        self.unknown = Account.create().address
+
+        def row(days_ago, address, count, value):
+            DailyTokenVolume.objects.create(
+                date=self.today - timedelta(days=days_ago),
+                token_address=address,
+                transfer_count=count,
+                transfer_value=value,
+            )
+
+        # Today is a *partial* day and this read has no upper bound, so it
+        # must be served — the divergence from `/tx-volume/`.
+        row(0, self.known.address, 5, 50)
+        row(1, self.known.address, 3, 900)
+        row(1, self.unknown, 10, 100)
+        # today-2 is deliberately absent from the rollup.
+        row(3, self.unknown, 1, 7)
+        # Outside a 30d window, inside a 365d one.
+        row(40, self.known.address, 77, 1)
+
+    def _get(self, params):
+        return self.client.get(
+            reverse("v2:analytics:analytics-token-volume"),
+            params,
+            **self.auth_header,
+        )
+
+    def test_breakdown_absent_response_is_unchanged(self):
+        """Case 1 of 3: no parameter, no new keys — in the same order."""
+        response = self._get({"window": "30d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), self.KEYS_WITHOUT_BREAKDOWN)
+        for absent in ("days", "days_token_cap", "window_start", "window_end"):
+            self.assertNotIn(absent, body)
+        # The pre-task numbers for this fixture, unchanged: today counts,
+        # today-40 does not.
+        self.assertEqual(body["total_erc20_transfers"], 19)
+        self.assertEqual(body["unique_tokens"], 2)
+
+    def test_breakdown_day_adds_the_series_and_changes_nothing_else(self):
+        """Case 2 of 3: the parameter is purely additive. Compared
+        key-by-key against the response the same fixture produces without
+        it, so a change to any existing value fails here."""
+        scalar = json.loads(self._get({"window": "30d"}).content)
+        response = self._get({"window": "30d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertEqual(
+            list(body.keys()),
+            self.KEYS_WITHOUT_BREAKDOWN
+            + ["window_start", "window_end", "days", "days_token_cap"],
+        )
+        for key in self.KEYS_WITHOUT_BREAKDOWN:
+            if key == "computed_at":
+                # Stamped at read time; equal values would be a coincidence.
+                continue
+            self.assertEqual(body[key], scalar[key], key)
+
+    def test_breakdown_day_series_shape(self):
+        from datetime import timedelta
+
+        body = json.loads(self._get({"window": "30d", "breakdown": "day"}).content)
+
+        self.assertEqual(
+            body["window_start"], (self.today - timedelta(days=30)).isoformat()
+        )
+        # Today, not yesterday: this read has no upper bound and the
+        # partial current day is inside the window it reports.
+        self.assertEqual(body["window_end"], self.today.isoformat())
+
+        days = body["days"]
+        # Newest-first; one entry per day *present in the rollup*, so
+        # today-2 is absent rather than zero-filled and today-40 is
+        # outside the window.
+        self.assertEqual(
+            [d["date"] for d in days],
+            [
+                self.today.isoformat(),
+                (self.today - timedelta(days=1)).isoformat(),
+                (self.today - timedelta(days=3)).isoformat(),
+            ],
+        )
+        # Each day carries its own ranking, busiest first — the unknown
+        # token outranks the known one on today-1 and only there.
+        self.assertEqual(
+            days[1],
+            {
+                "date": (self.today - timedelta(days=1)).isoformat(),
+                "tokens": [
+                    {
+                        "address": self.unknown,
+                        "symbol": None,
+                        "transfer_count": 10,
+                        "total_value": "100",
+                    },
+                    {
+                        "address": self.known.address,
+                        "symbol": "USDC",
+                        "transfer_count": 3,
+                        "total_value": "900",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(days[0]["tokens"][0]["transfer_count"], 5)
+
+    def test_breakdown_day_entries_carry_the_top_tokens_key_set(self):
+        """A day's token is the same shape as a scalar `top_tokens` entry,
+        so a consumer reads one shape in both halves of the payload."""
+        body = json.loads(self._get({"window": "30d", "breakdown": "day"}).content)
+        expected = sorted(["address", "symbol", "transfer_count", "total_value"])
+        self.assertEqual(sorted(body["top_tokens"][0].keys()), expected)
+        for day in body["days"]:
+            for token in day["tokens"]:
+                self.assertEqual(sorted(token.keys()), expected)
+
+    def test_breakdown_day_sums_to_the_window_total(self):
+        """The property the whole breakdown rests on: `transfer_count` is
+        additive, so summing the days reproduces the scalar window value.
+
+        True here because this fixture has fewer tokens per day than the
+        cap; `days_token_cap` is what tells a consumer when it stops being
+        true (see `TestTokenVolumeDayBreakdownCap`).
+        """
+        body = json.loads(self._get({"window": "30d", "breakdown": "day"}).content)
+        summed = sum(
+            token["transfer_count"] for day in body["days"] for token in day["tokens"]
+        )
+        self.assertEqual(summed, body["total_erc20_transfers"])
+
+    def test_breakdown_day_ships_the_cap(self):
+        from safe_transaction_service.analytics.services.analytics_service import (
+            TOP_TOKENS_LIMIT,
+        )
+
+        body = json.loads(self._get({"window": "30d", "breakdown": "day"}).content)
+        self.assertEqual(body["days_token_cap"], TOP_TOKENS_LIMIT)
+
+    def test_breakdown_day_window_is_not_capped(self):
+        """Spec Q21 — a long window is served, not rejected or clamped,
+        and `window` is echoed back verbatim (it is not validated on this
+        endpoint). The per-day cap bounds the response, the window does
+        not."""
+        from datetime import timedelta
+
+        body = json.loads(self._get({"window": "365d", "breakdown": "day"}).content)
+        self.assertEqual(body["window"], "365d")
+        self.assertEqual(
+            body["window_start"], (self.today - timedelta(days=365)).isoformat()
+        )
+        # today-40 is inside a 365d window and outside a 30d one.
+        self.assertEqual(len(body["days"]), 4)
+
+    def test_breakdown_invalid_returns_400(self):
+        """Case 3 of 3. Any value but `day`, including an empty one."""
+        for value in ("week", "month", "hour", "", "Day", "day,week"):
+            with self.subTest(breakdown=value):
+                response = self._get({"window": "30d", "breakdown": value})
+                self.assertEqual(
+                    response.status_code, status.HTTP_400_BAD_REQUEST, value
+                )
+                self.assertIn("breakdown", json.loads(response.content)["error"])
+
+
+class TestTokenVolumeDayBreakdownCap(AnalyticsTestMixin, APITestCase):
+    """The per-day cap: what it keeps, and which token it drops on a tie.
+
+    The rollup holds a row per `(date, token)`, so the cap is the only
+    thing standing between a 90-day series and tens of thousands of
+    entries. It is applied in SQL, and which token survives it has to be
+    deterministic rather than planner-dependent.
+    """
+
+    def _get(self):
+        return json.loads(
+            self.client.get(
+                reverse("v2:analytics:analytics-token-volume"),
+                {"window": "30d", "breakdown": "day"},
+                **self.auth_header,
+            ).content
+        )
+
+    def test_each_day_is_capped_at_the_advertised_depth(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        from safe_transaction_service.analytics.models import DailyTokenVolume
+        from safe_transaction_service.analytics.services.analytics_service import (
+            TOP_TOKENS_LIMIT,
+        )
+
+        day = timezone.now().date() - timedelta(days=1)
+        # Strictly descending counts, so the expected survivors are exact.
+        counts = {}
+        for i in range(TOP_TOKENS_LIMIT + 5):
+            address = Account.create().address
+            counts[address] = 100 - i
+            DailyTokenVolume.objects.create(
+                date=day, token_address=address, transfer_count=100 - i
+            )
+
+        body = self._get()
+        tokens = body["days"][0]["tokens"]
+        self.assertEqual(len(tokens), TOP_TOKENS_LIMIT)
+        self.assertEqual(body["days_token_cap"], TOP_TOKENS_LIMIT)
+        # The N busiest, in order — not an arbitrary N.
+        self.assertEqual(
+            [t["transfer_count"] for t in tokens],
+            sorted(counts.values(), reverse=True)[:TOP_TOKENS_LIMIT],
+        )
+        # The window total still counts every token, capped or not: the
+        # scalar half is aggregated, not summed from the series.
+        self.assertEqual(body["total_erc20_transfers"], sum(counts.values()))
+        self.assertEqual(body["unique_tokens"], len(counts))
+
+    def test_a_tie_at_the_cap_boundary_is_broken_by_address(self):
+        """Two tokens with the same count straddle the cap. The lower
+        address wins, every time — the documented tie-break, so a consumer
+        diffing two cycles does not see phantom churn."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        from safe_transaction_service.analytics.models import DailyTokenVolume
+        from safe_transaction_service.analytics.services.analytics_service import (
+            TOP_TOKENS_LIMIT,
+        )
+
+        day = timezone.now().date() - timedelta(days=1)
+        for i in range(TOP_TOKENS_LIMIT - 1):
+            DailyTokenVolume.objects.create(
+                date=day, token_address=Account.create().address, transfer_count=100 - i
+            )
+        tied = [Account.create().address, Account.create().address]
+        for address in tied:
+            DailyTokenVolume.objects.create(
+                date=day, token_address=address, transfer_count=1
+            )
+
+        tokens = self._get()["days"][0]["tokens"]
+        self.assertEqual(len(tokens), TOP_TOKENS_LIMIT)
+        self.assertEqual(tokens[-1]["address"].lower(), min(a.lower() for a in tied))
+
+
+class TestTokenVolumeDayBreakdownColdRollup(AnalyticsTestMixin, APITestCase):
+    """The cold half of the rollup pairing: `days` is present and empty,
+    never omitted. That is what keeps "old producer, key absent"
+    distinguishable from "new producer, no rows yet" for the hub's
+    feature detection.
+
+    Unlike `/tx-volume/`, this endpoint *does* have a live fallback, so
+    the test seeds live transfers to pin the harder statement: the scalar
+    half is served from them while the series stays empty. An empty
+    `days` means "the rollup is cold", never "there were no transfers".
+    """
+
+    def test_breakdown_day_on_cold_rollup_returns_empty_days(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        token = Account.create().address
+        ERC20TransferFactory(address=token, value=100)
+        ERC20TransferFactory(address=token, value=200)
+
+        response = self.client.get(
+            reverse("v2:analytics:analytics-token-volume"),
+            {"window": "30d", "breakdown": "day"},
+            **self.auth_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+
+        self.assertIn("days", body)
+        self.assertEqual(body["days"], [])
+        # The live path served the scalar half: empty `days` is a
+        # statement about the rollup, not about activity.
+        self.assertEqual(body["total_erc20_transfers"], 2)
+        self.assertEqual(len(body["top_tokens"]), 1)
+        # The bounds and the cap describe the request, so they still ship.
+        today = timezone.now().date()
+        self.assertEqual(body["window_start"], (today - timedelta(days=30)).isoformat())
+        self.assertEqual(body["window_end"], today.isoformat())
+        self.assertIn("days_token_cap", body)
+
+    def test_breakdown_absent_on_cold_rollup_is_still_unchanged(self):
+        """The live fallback grew a conditional; the no-parameter response
+        through it must not have grown anything."""
+        from eth_account import Account
+
+        ERC20TransferFactory(address=Account.create().address, value=100)
+
+        body = json.loads(
+            self.client.get(
+                reverse("v2:analytics:analytics-token-volume"),
+                {"window": "30d"},
+                **self.auth_header,
+            ).content
+        )
+        self.assertEqual(
+            list(body.keys()),
+            TestTokenVolumeDayBreakdown.KEYS_WITHOUT_BREAKDOWN,
+        )

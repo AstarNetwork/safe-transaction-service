@@ -4,9 +4,10 @@ import time
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta
 from functools import cache
+from itertools import groupby
 
-from django.db.models import Count, DecimalField, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Count, DecimalField, F, Sum, Value, Window
+from django.db.models.functions import Coalesce, RowNumber
 from django.utils import timezone
 
 from safe_transaction_service import __version__
@@ -16,6 +17,22 @@ from safe_transaction_service.history.models import (
 from safe_transaction_service.utils.redis import get_redis
 
 logger = logging.getLogger(__name__)
+
+#: How deep every ``top_tokens`` list goes, and the per-day cap under
+#: ``breakdown=day`` — where it ships to the consumer as ``days_token_cap``
+#: so a summed series is never mistaken for a complete one.
+#:
+#: One constant for both so the relationship is stated rather than being a
+#: coincidence of two literals: a consumer that sums the per-day series to
+#: rank tokens over its own range needs each day to be at least as deep as
+#: the ranking it draws, and the hub draws a top-10.
+#:
+#: 20 is also what keeps the breakdown affordable. A day's token entry runs
+#: ~140 bytes of JSON, so a 90-day series costs ~250 KB at 20, ~630 KB at 50
+#: and ~125 KB at 10. The hub polls ~111 deployments a cycle: 20 buys twice
+#: the depth it renders for ~28 MB a cycle, where 50 would spend ~70 MB on
+#: tokens nothing displays.
+TOP_TOKENS_LIMIT = 20
 
 
 @cache
@@ -112,6 +129,111 @@ def _append_day_breakdown(
     return payload
 
 
+def _token_volume_rollup_queryset(since: date):
+    """The one ``DailyTokenVolume`` filter both halves of ``/token-volume/``
+    read: the scalar window aggregate and the ``breakdown=day`` series.
+
+    ``date__gte`` with **no upper bound**, which is the read this endpoint
+    has always done and is why its window includes a partial current UTC
+    day (the asymmetry the workspace contract's endpoint table records;
+    ``/tx-volume/`` is the one that stops at ``date__lt=today``).
+
+    It exists so the two halves cannot drift apart: `since` is computed
+    once per request and passed down, so a request that crosses UTC
+    midnight cannot aggregate one span and report the bounds of another.
+    """
+    from safe_transaction_service.analytics.models import DailyTokenVolume
+
+    return DailyTokenVolume.objects.filter(date__gte=since)
+
+
+def _daily_top_tokens(queryset, cap: int) -> list[dict]:
+    """Each day's own top-`cap` tokens over the ``DailyTokenVolume``
+    rollup, newest-first, one entry per day *present in the rollup*.
+
+    Powers the opt-in ``breakdown=day`` series on ``/token-volume/``.
+    Entry shape is ``{"date", "tokens"}`` where every token carries the
+    same four keys as a scalar ``top_tokens`` entry — ``address``,
+    ``symbol``, ``transfer_count``, ``total_value`` — so a consumer reads
+    one shape in both halves of the payload.
+
+    **The cap is per day, and it is lossy in one direction.** The rollup
+    holds a row per ``(date, token)``, so an uncapped 90-day series on a
+    busy chain would be tens of thousands of entries; the cap is applied
+    in SQL (``ROW_NUMBER() OVER (PARTITION BY date …)``) so those rows are
+    never fetched, not merely never serialised. The consequence a caller
+    must know, and the reason ``days_token_cap`` ships beside the series:
+    summing the days is exact for a token that makes its day's top-`cap`
+    and **understates** one that never does — the perpetual 21st, busy
+    every day and listed on none. It cannot invent volume, only miss it,
+    so a range ranking built from this series is right at the top and
+    thins out at the tail.
+
+    Ordering is ``transfer_count`` desc with ``token_address`` as the
+    tie-break, in the window and again on the outer select, so which
+    token survives the cap is deterministic rather than whatever the
+    planner returned first.
+
+    Symbols are resolved in one ``IN (...)`` over the whole response
+    rather than per day (`get_token_symbols`), and an unknown token is
+    ``null`` — never its own address, same contract as `top_tokens`.
+
+    A day absent from the rollup is absent here, never zero-filled: a gap
+    means "not computed", not "no transfers". Contract invariant 3 does
+    not bite — ``transfer_count`` is an additive count, not a distinct
+    one, which is the single property this whole breakdown rests on.
+    """
+    rows = list(
+        queryset.annotate(
+            rank=Window(
+                expression=RowNumber(),
+                partition_by=[F("date")],
+                order_by=[F("transfer_count").desc(), F("token_address").asc()],
+            )
+        )
+        .filter(rank__lte=cap)
+        .values("date", "token_address", "transfer_count", "transfer_value")
+        .order_by("-date", "-transfer_count", "token_address")
+    )
+    symbols = get_token_symbols(row["token_address"] for row in rows)
+    return [
+        {
+            "date": day.isoformat(),
+            "tokens": [
+                {
+                    "address": row["token_address"],
+                    "symbol": symbols.get(row["token_address"]),
+                    "transfer_count": int(row["transfer_count"] or 0),
+                    "total_value": str(int(row["transfer_value"] or 0)),
+                }
+                for row in group
+            ],
+        }
+        for day, group in groupby(rows, key=lambda row: row["date"])
+    ]
+
+
+def _append_token_day_breakdown(
+    payload: dict, since: date, until: date, day_rows: list[dict], cap: int
+) -> dict:
+    """`_append_day_breakdown` plus the one key that is specific to
+    ``/token-volume/``: ``days_token_cap``, appended last.
+
+    It ships on every ``breakdown=day`` response including a cold one, so
+    the key set does not depend on whether there were rows — a consumer
+    feature-detecting on ``days_token_cap`` gets the same answer either
+    way — and so the cap is never inferred from ``len(tokens)``, which
+    would read a quiet day as a shallow one.
+
+    Exists as a wrapper rather than two statements at each call site so
+    the emission order (``window_start``, ``window_end``, ``days``,
+    ``days_token_cap``) is fixed in one place for both return paths.
+    """
+    _append_day_breakdown(payload, since, until, day_rows)
+    payload["days_token_cap"] = cap
+    return payload
+
+
 def get_token_symbols(addresses: Iterable[str]) -> dict[str, str | None]:
     """Read-time join of ERC20 addresses against the upstream ``tokens_token``
     table (``safe_transaction_service.tokens.models.Token``).
@@ -185,10 +307,15 @@ EMPTY_TVL_PAYLOAD: dict = {
     "native_balance_wei": "0",
     "erc20_token_count": 0,
     "top_tokens": [],
-    # 0/0 distinguishes "snapshot never computed" from a real partial run
-    # (where total_shards == 16 and partial_shards > 0).
+    # Vestigial since the native balance became an incremental rollup —
+    # it has no shards and a real run writes 0/0 here too. Kept because
+    # the hub reads `partial_shards` (USD pricing is gated on it being 0)
+    # and removing a payload key is a breaking change that has to land
+    # consumer-first. `computed_at: None` is what marks a cold read.
     "partial_shards": 0,
     "total_shards": 0,
+    "native_source": None,
+    "native_updated_to_block": None,
     "computed_at": None,
 }
 
@@ -911,13 +1038,72 @@ class AnalyticsService:
 
     # ── A.8 Token Volume (direct query — fast enough, not cached) ────
 
-    def get_token_volume(self, window: str) -> dict:
+    def get_token_volume(self, window: str, breakdown: str | None = None) -> dict:
+        """Top ERC20 tokens over a window, rollup-first with a live
+        cold-window fallback.
+
+        `breakdown` is opt-in and additive, the same contract T8 set on
+        `/tx-volume/` and T9 on the two active-* reads: it is ``None``
+        for every caller that does not ask, and then this returns exactly
+        the payload it always has — same keys, same order. With
+        ``breakdown="day"`` four keys are appended, in this order:
+        `window_start` / `window_end`, `days`, and `days_token_cap`.
+
+        **`window_end` is today, not yesterday.** This read is
+        ``date__gte=since`` with no upper bound
+        (`_token_volume_rollup_queryset`), so the window includes a
+        partial current UTC day and the bounds say so. `/tx-volume/`'s
+        `today-N … yesterday` would be a lie about which days the series
+        can contain — the same divergence Part 6 records for
+        `/active-safes/`.
+
+        `days` carries each day's **own** top-`TOP_TOKENS_LIMIT` tokens,
+        not a per-day slice of the window's ranking, and
+        `days_token_cap` ships that depth so a consumer summing the
+        series knows where it stops. Summing is exact for a token inside
+        its day's top-N and understates a token that is always just
+        outside it; it can never overstate. See `_daily_top_tokens`.
+
+        This is the reason the breakdown is possible at all:
+        `transfer_count` is an additive count, so days may be summed —
+        unlike the DAU series of T9, where contract invariant 3 forbids
+        exactly that.
+
+        A cold rollup returns ``"days": []`` — present and empty, never
+        omitted — which is what keeps "producer predates the parameter"
+        (key absent) apart from "producer has no rows yet" (key empty).
+        The scalar half of that response still comes from the live
+        `ERC20Transfer` aggregation, whose lower bound is ``now - N
+        days`` rather than midnight; `window_start` describes the
+        requested window, and with `days` empty there is no series for it
+        to disagree with.
+
+        `window` is unvalidated here (`_parse_window` falls back to 30)
+        and is not capped under ``breakdown=day`` (spec Q21), so the
+        response grows linearly with it — bounded per day by
+        `days_token_cap`, not by the window.
+        """
         days = _parse_window(window)
         if days is None:
             days = 30
 
-        payload = self._token_volume_from_rollup(window, days)
+        # One `since` for the whole request: the aggregate, the series and
+        # the bounds must describe the same span even across UTC midnight.
+        today = timezone.now().date()
+        since = today - timedelta(days=days)
+
+        payload = self._token_volume_from_rollup(window, since)
         if payload is not None:
+            if breakdown == "day":
+                _append_token_day_breakdown(
+                    payload,
+                    since,
+                    today,
+                    _daily_top_tokens(
+                        _token_volume_rollup_queryset(since), TOP_TOKENS_LIMIT
+                    ),
+                    TOP_TOKENS_LIMIT,
+                )
             return payload
         logger.info("analytics.rollup.cold_window key=token_volume_%s", window)
 
@@ -933,12 +1119,12 @@ class AnalyticsService:
                 transfer_count=Count("*"),
                 total_value=Sum("value"),
             )
-            .order_by("-transfer_count")[:20]
+            .order_by("-transfer_count")[:TOP_TOKENS_LIMIT]
         )
 
         symbols = get_token_symbols(t["address"] for t in top_tokens)
 
-        return {
+        payload = {
             "window": window,
             "total_erc20_transfers": total_transfers,
             "unique_tokens": unique_tokens,
@@ -953,19 +1139,25 @@ class AnalyticsService:
             ],
             "computed_at": timezone.now(),
         }
+        if breakdown == "day":
+            # Cold rollup, not a quiet chain: the series is empty because
+            # there are no rollup rows to build it from, and the live
+            # aggregation above has no per-day grain to borrow.
+            _append_token_day_breakdown(payload, since, today, [], TOP_TOKENS_LIMIT)
+        return payload
 
-    def _token_volume_from_rollup(self, window: str, days: int) -> dict | None:
+    def _token_volume_from_rollup(self, window: str, since: date) -> dict | None:
         """Build the same payload from ``analytics_daily_token_volume``.
+
+        Takes `since` from the caller rather than deriving it, so the
+        scalar aggregate, the ``breakdown=day`` series and the reported
+        window bounds are all the same span.
 
         Returns None when the rollup is cold for the requested window so
         the caller can fall through to the live aggregation.
         """
-        from safe_transaction_service.analytics.models import DailyTokenVolume
-
-        today = timezone.now().date()
-        since = today - timedelta(days=days)
         rows = list(
-            DailyTokenVolume.objects.filter(date__gte=since)
+            _token_volume_rollup_queryset(since)
             .values("token_address")
             .annotate(
                 transfer_count=Sum("transfer_count"),
@@ -977,7 +1169,7 @@ class AnalyticsService:
             return None
         total_transfers = sum(int(r["transfer_count"] or 0) for r in rows)
         unique_tokens = len(rows)
-        top = rows[:20]
+        top = rows[:TOP_TOKENS_LIMIT]
         symbols = get_token_symbols(t["token_address"] for t in top)
         return {
             "window": window,

@@ -207,3 +207,79 @@ class AnalyticsSnapshot(models.Model):
 
     def __str__(self) -> str:
         return f"AnalyticsSnapshot({self.name})"
+
+
+class SafeNativeBalance(models.Model):
+    """Per-Safe native-token balance, maintained incrementally.
+
+    Replaces the nightly full recompute of every Safe's native balance
+    (the 16-shard chord over ``BALANCE_BATCH_SQL``, which summed the
+    *entire* transfer history on every run and stopped finishing at all
+    on Ethereum-sized chains). One row per Safe; each incremental run
+    applies only the net native flow of the blocks it has not consumed
+    yet, so a run costs O(new rows) instead of O(all history).
+
+    ``balance_wei`` is the **signed** net flow, not the clamped one.
+    Incomplete indexing can make it negative (the outgoing transfer is
+    indexed, the matching incoming one is not yet); clamping at write
+    time would make that permanent, because a later incoming row could
+    never lift the row back above zero. The clamp therefore lives at
+    *read* time — ``SUM(CASE WHEN balance_wei > 0 …)`` /
+    ``COUNT(*) FILTER (WHERE balance_wei > 0)`` — which is exactly what
+    ``BALANCE_BATCH_SQL`` did per-Safe, so the numbers on
+    ``/api/v2/analytics/tvl/`` do not move.
+
+    ``updated_to_block`` is the block this row's balance is complete
+    through. It is a per-row provenance stamp and the backfill's resume
+    journal, *not* the authority on what has been consumed — that is the
+    single ``AnalyticsWatermark(name='native_balance')`` row. A Safe with
+    no native flow in a given window keeps its old ``updated_to_block``
+    and is still correct.
+
+    A row exists for **every** ``SafeContract``, including Safes that
+    have never moved native value (``balance_wei = 0``). "Absent from
+    this table" therefore means "created since the last run" and is the
+    signal the incremental seed step keys on; if zero-balance Safes were
+    omitted, every run would try to re-seed the whole fleet.
+
+    No index beyond the PK on purpose: the only read is a full-table
+    ``SUM`` + ``COUNT FILTER``, which is a sequence scan whatever indexes
+    exist (tens of ms over ~460k rows on Ethereum). Add one only with a
+    measurement to point at.
+    """
+
+    safe_address = EthereumAddressBinaryField(primary_key=True)
+    balance_wei = models.DecimalField(max_digits=80, decimal_places=0, default=0)
+    updated_to_block = models.PositiveIntegerField()
+
+    def __str__(self) -> str:
+        return f"SafeNativeBalance({self.safe_address}@{self.updated_to_block})"
+
+
+class AnalyticsWatermark(models.Model):
+    """How far an incremental analytics rollup has consumed the chain.
+
+    One row per rollup; currently only ``name='native_balance'``, written
+    by ``compute_native_balance_rollup_task`` and seeded by the
+    ``backfill_native_balances`` management command.
+
+    Deliberately *not* a key inside ``AnalyticsSnapshot``: that table is
+    the cache of payloads the views hand back, keyed by endpoint name and
+    overwritten wholesale by each compute. A watermark is compute state —
+    read before the work, written after it, inside the same transaction
+    as the work — and conflating the two would put a correctness-critical
+    cursor inside a blob that any view refresh may replace.
+
+    ``block_number`` is the **last block already applied** (inclusive), so
+    the next run consumes ``(block_number, head]``.
+    """
+
+    name = models.CharField(max_length=64, primary_key=True)
+    block_number = models.PositiveIntegerField()
+    computed_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"AnalyticsWatermark({self.name}={self.block_number})"

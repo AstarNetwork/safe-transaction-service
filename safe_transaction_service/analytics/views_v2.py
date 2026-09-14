@@ -267,7 +267,20 @@ class AnalyticsTvlView(APIView):
 
 
 class AnalyticsTokenVolumeView(APIView):
-    """A.8 — Token volume metrics by window (direct query)."""
+    """A.8 — Token volume metrics by window (direct query).
+
+    ``breakdown`` is optional and the only accepted value is ``day``,
+    exactly as on ``/tx-volume/`` (phase-B T8) down to the error wording.
+    Omitting it returns the scalar payload byte-identically;
+    ``breakdown=day`` appends the per-day top-N series and the
+    ``days_token_cap`` that describes its depth.
+
+    ``window`` stays unvalidated here — ``_parse_window`` falls back to 30
+    on anything it cannot parse — and is not capped under
+    ``breakdown=day`` (spec Q21). What bounds the response instead is the
+    per-day cap, which is why that cap is a payload key rather than an
+    implementation detail.
+    """
 
     swagger_schema = None
     renderer_classes = (JSONRenderer,)
@@ -277,5 +290,8 @@ class AnalyticsTokenVolumeView(APIView):
     @extend_schema(exclude=True)
     def get(self, request, format=None):
         window = request.query_params.get("window", "30d")
+        breakdown = request.query_params.get("breakdown")
+        if breakdown is not None and breakdown != "day":
+            return Response({"error": "breakdown must be: day"}, status=400)
         analytics_service = get_analytics_service()
-        return Response(analytics_service.get_token_volume(window))
+        return Response(analytics_service.get_token_volume(window, breakdown=breakdown))

@@ -3,8 +3,10 @@ import json
 import logging
 import time
 from datetime import date
+from decimal import Decimal
 
-from django.db import connection
+from django.conf import settings
+from django.db import connection, transaction
 from django.db.models import Count, F, Max, Min, Q
 from django.db.models.functions import Trunc
 from django.utils import timezone
@@ -24,6 +26,7 @@ from redis.exceptions import LockError
 from safe_transaction_service.analytics import tasks_shards  # noqa: F401
 from safe_transaction_service.analytics.models import (
     AnalyticsSnapshot,
+    AnalyticsWatermark,
     DailyActiveOwner,
     DailyActiveSafe,
     DailyMetric,
@@ -43,6 +46,7 @@ from safe_transaction_service.history.models import (
     MultisigConfirmation,
     MultisigTransaction,
     SafeContract,
+    SafeMasterCopy,
 )
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
@@ -742,21 +746,27 @@ def compute_safe_segments_task(self):
 def compute_tvl_task(self):
     """Fire-and-forget driver for the TVL pipeline.
 
-    Writes a phase-1 placeholder snapshot only if none exists yet, then
-    dispatches the chord ``(16 native shards) → reduce → finalize_tvl_snapshot``
-    on the ``contracts`` queue and returns immediately. The final
-    snapshot is written by ``finalize_tvl_snapshot`` when the chord
-    resolves — see ``analytics.tasks_shards.finalize_tvl_snapshot``.
+    Writes a phase-1 placeholder snapshot only if none exists yet, gets
+    the native side, and dispatches ``finalize_tvl_snapshot`` on the
+    ``contracts`` queue to do the ERC20 aggregation and write the real
+    snapshot. Returns immediately either way — success of the heavy work
+    is observable via the snapshot's ``computed_at`` advancing past the
+    placeholder. (The shape before that was a blocking ``.get()`` on the
+    chord, which hung indefinitely on gevent workers + Redis result
+    backend.)
 
-    The previous shape blocked on ``.get()`` waiting for the chord, which
-    hung indefinitely on gevent workers + Redis result backend. The new
-    shape is event-driven: success of the heavy aggregation is observable
-    via the snapshot's ``computed_at`` advancing past the placeholder.
+    The native side is normally a millisecond read of the incremental
+    rollup. On an instance that has migrated but not yet run
+    ``manage.py backfill_native_balances`` the rollup has no watermark,
+    and we fall back to the 16-shard chord — the number it served before,
+    rather than a zero. That fallback is the only reason the shard
+    machinery is still here.
     """
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             from safe_transaction_service.analytics.tasks_shards import (
                 dispatch_tvl_chord,
+                dispatch_tvl_finalize,
             )
 
             started = time.time()
@@ -771,25 +781,825 @@ def compute_tvl_task(self):
                     "native_balance_wei": "0",
                     "erc20_token_count": 0,
                     "top_tokens": [],
-                    # 0/0 marks this as a "never-computed" placeholder so
-                    # consumers can distinguish it from a real partial run
-                    # written by `finalize_tvl_snapshot`.
+                    # 0/0 marked this as a "never-computed" placeholder
+                    # back when a real run wrote 16 into `total_shards`.
+                    # The rollup path writes 0/0 too, so the discriminator
+                    # is now `computed_at` (null on a cold read) and
+                    # `native_source` (null here, set by a real run).
                     "partial_shards": 0,
                     "total_shards": 0,
+                    "native_source": None,
+                    "native_updated_to_block": None,
                     "computed_at": timezone.now().isoformat(),
                 }
                 _write_snapshot("tvl", placeholder)
                 logger.info("compute_tvl_task: phase1 placeholder snapshot written")
 
-            # Phase 2 — fire-and-forget. The chord callback
-            # (`finalize_tvl_snapshot`) does the ERC20 aggregation and
-            # writes the real snapshot when shards + reduce resolve.
-            dispatch_tvl_chord()
+            # Phase 2 — fire-and-forget. `finalize_tvl_snapshot` does the
+            # ERC20 aggregation and writes the real snapshot.
+            rollup = read_native_balance_rollup()
+            if rollup is None:
+                logger.info(
+                    "analytics.rollup.cold_window key=native_balance — no "
+                    "watermark, falling back to the 16-shard chord. Run "
+                    "`manage.py backfill_native_balances` to switch this "
+                    "instance over."
+                )
+                dispatch_tvl_chord()
+                logger.info(
+                    "compute_tvl_task: chord dispatched in %.2fs",
+                    time.time() - started,
+                )
+                return True
+
+            dispatch_tvl_finalize(
+                {
+                    "balance_wei": rollup["balance_wei"],
+                    "safes_with_balance": rollup["safes_with_balance"],
+                    # No shards on this path; 0/0 is what the hub reads as
+                    # a complete run. Kept because dropping a payload key
+                    # is a breaking change that has to land consumer-first.
+                    "partial_shards": 0,
+                    "total_shards": 0,
+                    "native_source": "rollup",
+                    "native_updated_to_block": rollup["updated_to_block"],
+                }
+            )
             logger.info(
-                "compute_tvl_task: chord dispatched in %.2fs",
+                "compute_tvl_task: finalize dispatched in %.2fs from the "
+                "rollup (native_wei=%d safes_with_balance=%d "
+                "updated_to_block=%d over %d rows)",
                 time.time() - started,
+                rollup["balance_wei"],
+                rollup["safes_with_balance"],
+                rollup["updated_to_block"],
+                rollup["safe_rows"],
             )
             return True
+
+
+# ───────────────── Incremental native-balance rollup ──────────────────
+#
+#   watermark W ─────────────────────────────────────────► head
+#   ├─ (1) SEED   Safes absent from the rollup, balance summed over
+#   │             blocks ≤ W only — NOT ≤ head. A Safe created mid-window
+#   │             only enters `history_safecontract` when the indexer
+#   │             gets to it; seeding it at `head` and then applying the
+#   │             delta would count (W, head] twice, seeding it at W and
+#   │             applying the delta counts every block exactly once.
+#   ├─ (2) DELTA  one pass over (W, head], applied with `+=` ─┐ same
+#   └─ (3) MARK   watermark := head ─────────────────────────┴ transaction
+#
+# (2) and (3) share a transaction because a crash between them either
+# loses the range or applies it twice, and a signed running total cannot
+# tell the difference afterwards. With them atomic, re-running at the
+# same watermark is a no-op — which is the whole idempotency story.
+
+NATIVE_BALANCE_WATERMARK = "native_balance"
+
+# Addresses per round-trip in the seed step. The same 5000 the legacy
+# `BALANCE_BATCH_SQL` loop uses — it is what the `= ANY(...)` plan was
+# measured on.
+NATIVE_BALANCE_SEED_BATCH_SIZE = 5000
+
+# Ceiling on how many never-seen Safes one incremental run will seed.
+# A normal day brings hundreds (Ethereum runs ~250-350 new Safes/day).
+# Tens of thousands means the rollup was never backfilled or the table
+# was truncated — which is exactly the full-history recompute this
+# rollup exists to stop doing inside a nightly task. Refuse loudly
+# instead of grinding for hours and timing out anyway.
+NATIVE_BALANCE_MAX_SEED_PER_RUN = 50_000
+
+# `MAX(number)` over confirmed blocks and over all blocks. The first is
+# an index-scan-backward over the PK stopping at the first confirmed row
+# (the unconfirmed tail is ETH_REORG_BLOCKS deep at most), the second is
+# the PK maximum — both sub-ms.
+_NATIVE_BALANCE_HEAD_SQL = """
+SELECT
+    (SELECT MAX(number) FROM history_ethereumblock WHERE confirmed),
+    (SELECT MAX(number) FROM history_ethereumblock)
+"""
+
+# Per-address net native flow over blocks <= `%s`, for an explicit
+# address list. Same shape as `BALANCE_BATCH_SQL` and the same plan:
+# both legs are driven by the partial covering indexes
+# `history_internal_transfer_idx` / `history_internal_transfer_from`
+# (`(to|_from, timestamp) INCLUDE (ethereum_tx_id, block_number) WHERE
+# call_type = 0 AND value > 0`), so the block bound is a residual filter
+# on a column the index already carries, not a second access path.
+#
+# The bound here is `it.block_number`, while the delta below bounds on
+# `etx.block_id`. The two are equal by construction — every writer of
+# `InternalTx` sets `block_number` from the transaction's own block
+# (`history/models.py` `build_from_trace`, `safe_events_indexer`) — and
+# the asymmetry is deliberate: this query is driven by the address, so
+# the block is a filter; the delta is driven by the block, and
+# `InternalTx.block_number` has no index to drive it with.
+_NATIVE_BALANCE_SEED_SQL = """
+    SELECT addr, SUM(CASE WHEN direction = 1 THEN value ELSE -value END) AS balance
+    FROM (
+        SELECT it."to" AS addr, it.value, 1 AS direction
+        FROM history_internaltx it
+        WHERE it."to" = ANY(%s)
+          AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
+          AND it.block_number <= %s
+        UNION ALL
+        SELECT it."_from" AS addr, it.value, -1 AS direction
+        FROM history_internaltx it
+        WHERE it."_from" = ANY(%s)
+          AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
+          AND it.block_number <= %s
+    ) transfers
+    GROUP BY addr
+"""
+
+# Bulk insert of seeded rows. `unnest` of three parallel arrays beats
+# both `executemany` (a round-trip per row) and a generated VALUES list
+# (a parameter per cell). `DO NOTHING`, not `DO UPDATE`: a row that
+# already exists is already correct through its own `updated_to_block`,
+# and overwriting it with a balance computed at this run's watermark
+# would silently rewind it.
+_NATIVE_BALANCE_SEED_INSERT_SQL = """
+INSERT INTO analytics_safenativebalance (safe_address, balance_wei, updated_to_block)
+SELECT * FROM unnest(%s::bytea[], %s::numeric[], %s::integer[])
+ON CONFLICT (safe_address) DO NOTHING
+"""
+
+# Safes the rollup has never seen — an anti-join against the rollup PK.
+# A row exists for every Safe the rollup has processed, zero-balance
+# ones included, so this returns only genuinely new Safes.
+_NATIVE_BALANCE_UNSEEDED_SQL = """
+SELECT sc.address
+FROM history_safecontract sc
+WHERE NOT EXISTS (
+    SELECT 1 FROM analytics_safenativebalance b WHERE b.safe_address = sc.address
+)
+LIMIT %s
+"""
+
+# The whole incremental step, as one statement.
+#
+# Driven from `history_ethereumtx.block_id` (FK-indexed), never from
+# `history_internaltx.block_number` — that column carries no index
+# (`history/models.py`, absent from `Meta.indexes`), so a range filter
+# on it is a sequential scan of tens of millions of rows. This is the
+# same idiom, and the same reason, as
+# `_METRIC_CORE_MULTISIG_COUNT_SUM_SQL` below: anchor on `etx.block_id`
+# so the block window prunes `etx` before the join.
+#
+# **The `LATERAL` is load-bearing, not a stylistic choice.** Written as a
+# plain `JOIN … ON it.ethereum_tx_id = etx.tx_hash`, PostgreSQL picks a
+# hash join and scans the whole of `history_internaltx` as the probe
+# side, which on Ethereum is 53M rows — every night, for a window of one
+# day. Measured on the Ethereum production database, 2026-09-12:
+#
+#   plain JOIN     Parallel Hash Join + Parallel Seq Scan, cost 19.1M
+#   + seqscan off  Parallel Hash Join + Bitmap Heap Scan, cost 22.4M
+#   LATERAL        Nested Loop + Index Scan on ethereum_tx_id,
+#                  1601 ms for 720 blocks (~15 s for a day)
+#
+# The index it needs (`history_internaltx_ethereum_tx_id_e6ac35ab`)
+# exists and always did — the planner simply refuses to use it here,
+# because it estimates 621 internal transactions per Ethereum
+# transaction where the real number is 5. A 124x cardinality error makes
+# the nested loop look five times more expensive than the table scan.
+# `LATERAL` does not argue with that estimate; it removes the choice, so
+# the estimate stops mattering. Do not "simplify" this back into a JOIN.
+#
+# An UPDATE, not an upsert, and that is load-bearing: **the delta must
+# never create a row**. The seed owns row creation, because only the seed
+# knows to compute the balance below the watermark first. If the delta
+# could insert, a Safe the indexer writes into `history_safecontract`
+# between this run's seed query and this statement would get a row
+# holding only `(W, head]` — missing its entire history below W, and
+# never seeded again, because a row now exists. A silent, permanent
+# undercount. Restricting to rows that already exist means such a Safe
+# is simply skipped this run and seeded correctly by the next one.
+#
+# The join against the rollup also carries the "is it a Safe" filter for
+# free: rows only ever come from the seed, which selects from
+# `history_safecontract`. It probes the rollup PK once per distinct
+# counterparty rather than once per transfer row.
+_NATIVE_BALANCE_DELTA_SQL = """
+UPDATE analytics_safenativebalance b
+SET balance_wei = b.balance_wei + d.delta,
+    updated_to_block = %(head)s
+FROM (
+    SELECT flows.addr AS addr, SUM(flows.signed_value) AS delta
+    FROM history_ethereumtx etx
+    CROSS JOIN LATERAL (
+        SELECT it."to" AS addr, it.value AS signed_value
+        FROM history_internaltx it
+        WHERE it.ethereum_tx_id = etx.tx_hash
+          AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
+          AND it."to" IS NOT NULL
+        UNION ALL
+        SELECT it."_from" AS addr, -it.value AS signed_value
+        FROM history_internaltx it
+        WHERE it.ethereum_tx_id = etx.tx_hash
+          AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
+          AND it."_from" IS NOT NULL
+    ) flows
+    WHERE etx.block_id > %(watermark)s AND etx.block_id <= %(head)s
+    GROUP BY flows.addr
+) d
+WHERE b.safe_address = d.addr
+"""
+
+# Read side. Clamps negatives to zero in the SUM and excludes them from
+# the count — byte for byte the aggregate `BALANCE_BATCH_SQL` produced,
+# so switching `/tvl/` onto the rollup does not move the published
+# numbers.
+_NATIVE_BALANCE_TOTALS_SQL = """
+SELECT
+    COALESCE(SUM(CASE WHEN balance_wei > 0 THEN balance_wei ELSE 0 END), 0),
+    COUNT(*) FILTER (WHERE balance_wei > 0),
+    COUNT(*)
+FROM analytics_safenativebalance
+"""
+
+
+def _trace_indexer_block() -> int | None:
+    """How far the master-copies indexer has processed, or ``None`` when
+    the service has no relevant master copies configured.
+
+    ``MIN(SafeMasterCopy.tx_block_number)`` over the master copies this
+    network actually indexes — the same expression
+    ``IndexService.get_master_copies_current_indexing_block_number`` uses
+    to answer "is this service synced".
+    """
+    return SafeMasterCopy.objects.relevant().aggregate(position=Min("tx_block_number"))[
+        "position"
+    ]
+
+
+def native_balance_head_block() -> int | None:
+    """Highest block the rollup may consume: the newest one that is both
+    beyond a reorg's reach and actually indexed.
+
+    ``min(MAX(number) WHERE confirmed, MAX(number) - ETH_REORG_BLOCKS,
+    MIN(SafeMasterCopy.tx_block_number))``.
+
+    The first two are about reorgs: ``confirmed`` is the indexer's own
+    statement that it has stopped re-checking a block
+    (``reorg_service.check_reorgs`` sets it), while the depth term is an
+    independent backstop for deployments whose reorg task is not running
+    or is behind — there ``confirmed`` can sit at a stale height, and the
+    run simply stalls (correctly) instead of consuming a block that may
+    still vanish.
+
+    The third is about a different hazard entirely, and it is the one
+    that bites a freshly spun-up service. ``EthereumBlock`` rows are
+    created by *any* indexer — the ERC20 indexer makes a block and a
+    transaction the moment it meets a transfer — so block presence, and
+    ``confirmed`` with it, can run far ahead of the master-copies indexer
+    that actually writes ``InternalTx``. Consume a block whose internal
+    transactions have not been written yet and the rollup moves its
+    watermark past them forever: they are never revisited, and the
+    balance is silently short. Bounding on the trace indexer's own
+    position means the rollup waits for it instead.
+
+    On a synced service the third term does not bind — it sits at roughly
+    the same height as the other two. It only takes effect when the
+    indexer is genuinely behind: initial sync, a reindex, an outage.
+    ``None`` (no relevant master copies configured) is treated as "no
+    constraint": such a service indexes no internal transactions at all,
+    so there is nothing for this bound to protect.
+
+    Why this matters more here than anywhere else in analytics:
+    ``recover_from_reorg`` deletes ``EthereumBlock`` rows at or above the
+    reorg point and the FK cascade takes ``EthereumTx`` and ``InternalTx``
+    with them. A running total that had already absorbed those rows could
+    not be un-applied afterwards — the rows are gone. Every other
+    analytics rollup recomputes a whole day from scratch and self-heals;
+    this one does not, so it only ever consumes blocks a reorg cannot
+    reach.
+
+    Returns ``None`` when nothing is safe to consume yet (no block
+    indexed, none confirmed, or a chain shallower than
+    ``ETH_REORG_BLOCKS``).
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(_NATIVE_BALANCE_HEAD_SQL)
+        confirmed_head, tip = cursor.fetchone()
+    if confirmed_head is None or tip is None:
+        return None
+    depth_head = int(tip) - settings.ETH_REORG_BLOCKS
+    head = min(int(confirmed_head), depth_head)
+    indexed_head = _trace_indexer_block()
+    if indexed_head is not None and int(indexed_head) < head:
+        logger.info(
+            "native_balance.head: master-copies indexer is at %d, below the "
+            "reorg-safe head %d — consuming only what it has written",
+            indexed_head,
+            head,
+        )
+        head = int(indexed_head)
+    if head < 0:
+        return None
+    # When `confirmed` is the binding term and it lags the depth bound
+    # badly, say so: a stalled `check_reorgs` shows up here as a rollup
+    # that quietly stops advancing, and nothing else would report it.
+    lag = depth_head - int(confirmed_head)
+    if lag > settings.ETH_REORG_BLOCKS * 10:
+        logger.warning(
+            "native_balance.head: confirmed head %d is %d blocks behind the "
+            "reorg-depth bound %d — is check_reorgs running? The rollup only "
+            "advances as fast as blocks get confirmed.",
+            confirmed_head,
+            lag,
+            depth_head,
+        )
+    return head
+
+
+_SAFE_ADDRESSES_PAGE_SQL = """
+SELECT address FROM history_safecontract
+WHERE address > %s
+ORDER BY address
+LIMIT %s
+"""
+
+_SAFE_ADDRESSES_FIRST_PAGE_SQL = """
+SELECT address FROM history_safecontract
+ORDER BY address
+LIMIT %s
+"""
+
+
+def safe_addresses_after(after: bytes | None, limit: int) -> list[bytes]:
+    """One keyset page of ``SafeContract.address``, in PK order.
+
+    The single-page form of ``_iter_safe_addresses_keyset``, for the chunked
+    Celery backfill: each chunk is its own task, so the walk has to be
+    resumable from a cursor carried in the run manifest rather than from a
+    generator living in one process.
+
+    Returns address bytes, so the caller can hand them straight to
+    ``_seed_native_balances`` without a hex round-trip.
+    """
+    with connection.cursor() as cursor:
+        if after is None:
+            cursor.execute(_SAFE_ADDRESSES_FIRST_PAGE_SQL, [limit])
+        else:
+            cursor.execute(_SAFE_ADDRESSES_PAGE_SQL, [after, limit])
+        return [bytes(row[0]) for row in cursor.fetchall()]
+
+
+def seed_missing_native_balances(
+    address_bytes: list[bytes], upto_block: int
+) -> tuple[int, int]:
+    """Seed only the addresses that have no rollup row yet.
+
+    Returns ``(seeded, already_present)``. Shared by the inline command and
+    the chunked Celery task so "resume" means the same thing in both.
+    """
+    if not address_bytes:
+        return 0, 0
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT safe_address FROM analytics_safenativebalance "
+            "WHERE safe_address = ANY(%s)",
+            [address_bytes],
+        )
+        present = {bytes(row[0]) for row in cursor.fetchall()}
+    todo = [addr for addr in address_bytes if addr not in present]
+    _seed_native_balances(todo, upto_block)
+    return len(todo), len(present)
+
+
+def write_native_balance_watermark(head: int) -> bool:
+    """Hand the rollup over to the incremental task at ``head``.
+
+    No-op when a watermark already exists: that one belongs to the
+    incremental task, and moving it forward here would skip every block
+    between it and ``head`` for the Safes this run did not touch. Returns
+    whether it wrote.
+    """
+    if AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists():
+        return False
+    AnalyticsWatermark.objects.create(
+        name=NATIVE_BALANCE_WATERMARK,
+        block_number=head,
+        computed_at=timezone.now(),
+    )
+    return True
+
+
+def _unseeded_safe_addresses(limit: int) -> list[bytes] | None:
+    """Address bytes of Safes with no ``SafeNativeBalance`` row, at most
+    ``limit`` of them. ``None`` means there are more than ``limit`` — see
+    ``NATIVE_BALANCE_MAX_SEED_PER_RUN``.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(_NATIVE_BALANCE_UNSEEDED_SQL, [limit + 1])
+        rows = cursor.fetchall()
+    if len(rows) > limit:
+        return None
+    return [bytes(row[0]) for row in rows]
+
+
+def _seed_native_balances(address_bytes: list[bytes], upto_block: int) -> int:
+    """Create rollup rows for ``address_bytes`` holding their balance as of
+    ``upto_block``. Returns how many addresses were processed.
+
+    Every address gets a row, including the ones with no native flow at
+    all — see ``SafeNativeBalance``'s docstring: an absent row is the
+    "new Safe" signal, so a zero-balance Safe that never got one would be
+    re-seeded on every single run.
+    """
+    if not address_bytes:
+        return 0
+    for offset in range(0, len(address_bytes), NATIVE_BALANCE_SEED_BATCH_SIZE):
+        batch = address_bytes[offset : offset + NATIVE_BALANCE_SEED_BATCH_SIZE]
+        with connection.cursor() as cursor:
+            cursor.execute(
+                _NATIVE_BALANCE_SEED_SQL, [batch, upto_block, batch, upto_block]
+            )
+            balances = {bytes(addr): Decimal(bal) for addr, bal in cursor.fetchall()}
+            cursor.execute(
+                _NATIVE_BALANCE_SEED_INSERT_SQL,
+                [
+                    batch,
+                    [balances.get(addr, Decimal(0)) for addr in batch],
+                    [upto_block] * len(batch),
+                ],
+            )
+    return len(address_bytes)
+
+
+def _apply_native_balance_delta(watermark: int, head: int) -> int:
+    """Apply the net native flow of ``(watermark, head]`` to the rollup.
+    Returns the number of Safe rows the statement updated.
+
+    Only ever updates rows that already exist — see the SQL's comment.
+    A Safe with flow in this window but no rollup row yet is left for the
+    next run's seed step, which is the only step that knows to compute
+    its balance below the watermark first.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _NATIVE_BALANCE_DELTA_SQL, {"watermark": watermark, "head": head}
+        )
+        return cursor.rowcount
+
+
+def read_native_balance_rollup() -> dict | None:
+    """Clamped native-balance totals straight out of the rollup.
+
+    Returns ``{"balance_wei", "safes_with_balance", "safe_rows",
+    "updated_to_block"}``, or ``None`` when the rollup was never
+    initialised (no watermark row). Callers must fall back rather than
+    publish the zero: an empty rollup and a fleet holding nothing look
+    identical from the totals alone.
+    """
+    watermark = AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).first()
+    if watermark is None:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(_NATIVE_BALANCE_TOTALS_SQL)
+        balance_wei, safes_with_balance, safe_rows = cursor.fetchone()
+    return {
+        "balance_wei": int(balance_wei or 0),
+        "safes_with_balance": int(safes_with_balance or 0),
+        "safe_rows": int(safe_rows or 0),
+        "updated_to_block": watermark.block_number,
+    }
+
+
+def _cold_start_native_balance_rollup(head: int) -> AnalyticsWatermark | None:
+    """Initialise an empty rollup from inside the nightly run, when — and
+    only when — doing so is bounded work.
+
+    A newly spun-up transaction service has no Safes yet, or a handful, so
+    requiring a human to run `backfill_native_balances` on every new
+    network is friction with nothing behind it. Seeding a small fleet at
+    ``head`` and setting the watermark there is exactly what the backfill
+    command does, and at this size it is a sub-second query.
+
+    The ceiling is what keeps this honest. Above
+    ``NATIVE_BALANCE_MAX_SEED_PER_RUN`` we are no longer initialising a new
+    network, we are switching analytics on over an existing one with years
+    of history — the hour-long full recompute this whole rollup exists to
+    stop doing inside a nightly task. That case still refuses, loudly, and
+    still wants the command.
+
+    Returns the watermark row it created, or ``None`` if it declined.
+    """
+    unseeded = _unseeded_safe_addresses(NATIVE_BALANCE_MAX_SEED_PER_RUN)
+    if unseeded is None:
+        logger.error(
+            "native_balance.rollup: no '%s' watermark and more than %d Safes "
+            "to seed (~%d). That is analytics being switched on over an "
+            "existing service, not a new network coming up, and seeding it "
+            "here is the full-history recompute this rollup replaces. Run "
+            "`manage.py backfill_native_balances` once — it is inline, so no "
+            "task timeout applies to it.",
+            NATIVE_BALANCE_WATERMARK,
+            NATIVE_BALANCE_MAX_SEED_PER_RUN,
+            approx_count_or_exact(SafeContract, "history_safecontract"),
+        )
+        return None
+
+    # Seeded at `head`, not at 0: every Safe's whole history through `head`
+    # goes into its row, and the watermark then says so. Seeding at 0 would
+    # be equally correct and would make the first delta re-read the entire
+    # chain for nothing.
+    with transaction.atomic():
+        _seed_native_balances(unseeded, head)
+        watermark_row = AnalyticsWatermark.objects.create(
+            name=NATIVE_BALANCE_WATERMARK,
+            block_number=head,
+            computed_at=timezone.now(),
+        )
+    logger.info(
+        "native_balance.rollup: cold start — initialised %d Safes at block "
+        "%d. Subsequent runs are incremental.",
+        len(unseeded),
+        head,
+    )
+    return watermark_row
+
+
+def run_native_balance_rollup() -> dict | None:
+    """One incremental pass — seed, apply, mark. See the sketch above.
+
+    On an uninitialised rollup this also does the cold start, when the
+    fleet is small enough for that to be bounded work — see
+    ``_cold_start_native_balance_rollup``. A new network therefore needs no
+    manual backfill at all: the first nightly run brings the rollup up.
+
+    Returns a summary dict, or ``None`` when the run declined to do
+    anything: nothing safe to consume yet, too many Safes to seed from
+    cold, or a watermark ahead of the safe head. Every declining path
+    logs; the two that mean something is wrong log at ERROR.
+
+    Separate from the Celery task so the backfill command, the drift
+    check and the tests can drive it without a broker.
+    """
+    started = time.time()
+    head = native_balance_head_block()
+    if head is None:
+        logger.info(
+            "native_balance.rollup: no confirmed block within the reorg depth "
+            "yet; nothing to consume"
+        )
+        return None
+
+    watermark_row = AnalyticsWatermark.objects.filter(
+        name=NATIVE_BALANCE_WATERMARK
+    ).first()
+    if watermark_row is None:
+        cold_start = _cold_start_native_balance_rollup(head)
+        if cold_start is None:
+            return None
+        watermark_row = cold_start
+
+    watermark = watermark_row.block_number
+    if watermark > head:
+        logger.error(
+            "native_balance.rollup: watermark=%d is ahead of the safe head=%d. "
+            "Blocks this rollup already applied have been removed — a reorg "
+            "deeper than the confirmation zone, or a database restore — and "
+            "the rows needed to undo them went with them. Refusing to run; "
+            "rebuild with `manage.py backfill_native_balances --restart`.",
+            watermark,
+            head,
+        )
+        return None
+
+    with relaxed_statement_timeout():
+        unseeded = _unseeded_safe_addresses(NATIVE_BALANCE_MAX_SEED_PER_RUN)
+        if unseeded is None:
+            logger.error(
+                "native_balance.rollup: more than %d Safes have no rollup row. "
+                "That is a cold or truncated table, not a day's worth of new "
+                "Safes. Refusing to seed them here; run `manage.py "
+                "backfill_native_balances` instead.",
+                NATIVE_BALANCE_MAX_SEED_PER_RUN,
+            )
+            return None
+
+        # Seeded at the OLD watermark, deliberately, and outside the
+        # transaction below: seeding is idempotent (`DO NOTHING`), so a
+        # failure after it leaves rows the next run simply finds already
+        # present.
+        seeded = _seed_native_balances(unseeded, watermark)
+
+        with transaction.atomic():
+            touched = _apply_native_balance_delta(watermark, head)
+            AnalyticsWatermark.objects.update_or_create(
+                name=NATIVE_BALANCE_WATERMARK,
+                defaults={"block_number": head, "computed_at": timezone.now()},
+            )
+
+    summary = {
+        "watermark_from": watermark,
+        "watermark_to": head,
+        "blocks": head - watermark,
+        "seeded_safes": seeded,
+        "touched_safes": touched,
+    }
+    logger.info(
+        "native_balance.rollup: completed in %.2fs blocks=(%d, %d] seeded=%d "
+        "touched=%d",
+        time.time() - started,
+        watermark,
+        head,
+        seeded,
+        touched,
+    )
+    return summary
+
+
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def compute_native_balance_rollup_task(self):
+    """Advance the incremental native-balance rollup (daily at 03:05 UTC,
+    ten minutes ahead of ``compute_tvl_task`` so TVL reads a fresh one).
+
+    Lives in ``tasks.py`` rather than a module of its own on purpose:
+    ``config/settings/base.py`` routes only ``analytics.tasks.*`` and
+    ``analytics.tasks_shards.*`` to the ``contracts`` queue, so a new
+    module would land in the default queue and silently never run.
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            return run_native_balance_rollup()
+
+
+# ─────────────── Native-balance rollup drift check ────────────────
+#
+# A running total has no self-healing property: unlike every other
+# analytics rollup, nothing here recomputes a window from scratch and
+# quietly repairs it. One batch applied twice, or not at all, stays wrong
+# forever and looks exactly like a real number. So sample it against an
+# independent computation — the same `BALANCE_BATCH_SQL` family the
+# nightly chord used — and say so out loud when they disagree.
+#
+# Observability first, on purpose: this reports, it does not repair. A
+# self-healing version would have to decide *which* of the two numbers is
+# right, and until we have seen real drift we do not know what causes it.
+
+NATIVE_BALANCE_DRIFT_SAMPLE_SIZE = 2000
+
+# `ORDER BY random()` is a sequential scan plus a sort — tens of ms over
+# ~460k rows, once a week. `TABLESAMPLE` would be cheaper and biased
+# toward physically clustered rows, which is the wrong trade for a check
+# whose whole job is to find an anomaly someone else's bug created.
+_NATIVE_BALANCE_SAMPLE_SQL = """
+SELECT safe_address, balance_wei
+FROM analytics_safenativebalance
+ORDER BY random()
+LIMIT %s
+"""
+
+# Rollup rows whose Safe no longer exists. `SafeContract.ethereum_tx` is
+# `on_delete=CASCADE` from `EthereumTx`, which cascades from
+# `EthereumBlock` — so `recover_from_reorg` deletes Safes as well as
+# transfers, and a rollup row for one of them keeps contributing its
+# (real, confirmed-block) balance to a Safe that is no longer a Safe.
+# Rare: it needs a reorg that removes a Safe creation while leaving the
+# funding below the confirmation zone intact. Counted rather than
+# deleted, for the same reason the balance drift is only reported —
+# until one is seen in the wild, "delete it" is a guess.
+_NATIVE_BALANCE_ORPHANS_SQL = """
+SELECT COUNT(*)
+FROM analytics_safenativebalance b
+WHERE NOT EXISTS (
+    SELECT 1 FROM history_safecontract sc WHERE sc.address = b.safe_address
+)
+"""
+
+
+def check_native_balance_drift(
+    sample_size: int = NATIVE_BALANCE_DRIFT_SAMPLE_SIZE,
+) -> dict | None:
+    """Compare a random sample of rollup rows against a from-scratch
+    recompute at the watermark. Returns a summary, or ``None`` when there
+    was nothing to check.
+
+    The recompute is bounded at the watermark, not at the current head:
+    the rollup only claims to be complete through the watermark, so
+    anything above it is not drift, it is just the next run's work.
+    """
+    started = time.time()
+    watermark_row = AnalyticsWatermark.objects.filter(
+        name=NATIVE_BALANCE_WATERMARK
+    ).first()
+    if watermark_row is None:
+        logger.info("native_balance.drift: rollup not initialised, nothing to check")
+        return None
+    watermark = watermark_row.block_number
+
+    with relaxed_statement_timeout():
+        with connection.cursor() as cursor:
+            cursor.execute(_NATIVE_BALANCE_SAMPLE_SQL, [sample_size])
+            sample = {bytes(addr): Decimal(balance) for addr, balance in cursor}
+        if not sample:
+            logger.info("native_balance.drift: rollup is empty, nothing to check")
+            return None
+
+        addresses = list(sample)
+        recomputed: dict[bytes, Decimal] = {}
+        for offset in range(0, len(addresses), NATIVE_BALANCE_SEED_BATCH_SIZE):
+            batch = addresses[offset : offset + NATIVE_BALANCE_SEED_BATCH_SIZE]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    _NATIVE_BALANCE_SEED_SQL, [batch, watermark, batch, watermark]
+                )
+                recomputed.update({bytes(addr): Decimal(bal) for addr, bal in cursor})
+
+    # If the nightly run landed between the sample and the recompute, the
+    # rows we read describe a different watermark than the one we
+    # recomputed at. That is a race, not drift — say so and come back
+    # next week rather than reporting a difference nobody can act on.
+    if (
+        AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK)
+        .values_list("block_number", flat=True)
+        .first()
+        != watermark
+    ):
+        logger.info(
+            "native_balance.drift: the rollup advanced past block %d while the "
+            "check was running; skipping this round",
+            watermark,
+        )
+        return None
+
+    with connection.cursor() as cursor:
+        cursor.execute(_NATIVE_BALANCE_ORPHANS_SQL)
+        orphans = int(cursor.fetchone()[0] or 0)
+
+    mismatches = []
+    total_abs_diff = Decimal(0)
+    for address, stored in sample.items():
+        expected = recomputed.get(address, Decimal(0))
+        diff = stored - expected
+        if diff:
+            mismatches.append((address, stored, expected, diff))
+            total_abs_diff += abs(diff)
+
+    summary = {
+        "watermark": watermark,
+        "sampled": len(sample),
+        "mismatched": len(mismatches),
+        "total_abs_diff_wei": int(total_abs_diff),
+        "max_abs_diff_wei": (
+            int(max(abs(d) for *_, d in mismatches)) if mismatches else 0
+        ),
+        "orphan_rows": orphans,
+        "elapsed": round(time.time() - started, 2),
+    }
+
+    if orphans:
+        logger.warning(
+            "native_balance.drift: %d rollup rows have no Safe in "
+            "history_safecontract. A reorg that removed a Safe creation "
+            "leaves the row behind, still contributing its balance to the "
+            "totals. Rebuild with `manage.py backfill_native_balances "
+            "--restart` to drop them.",
+            orphans,
+        )
+
+    if mismatches:
+        worst = sorted(mismatches, key=lambda row: abs(row[3]), reverse=True)[:5]
+        logger.warning(
+            "native_balance.drift: %d of %d sampled Safes disagree with a "
+            "from-scratch recompute at block %d (total |diff| = %d wei, worst "
+            "= %d wei). Worst offenders: %s. The rollup cannot self-heal — "
+            "rebuild with `manage.py backfill_native_balances --restart` if "
+            "this is not a one-off.",
+            summary["mismatched"],
+            summary["sampled"],
+            watermark,
+            summary["total_abs_diff_wei"],
+            summary["max_abs_diff_wei"],
+            ", ".join(
+                f"0x{address.hex()} stored={stored} expected={expected}"
+                for address, stored, expected, _ in worst
+            ),
+        )
+    else:
+        logger.info(
+            "native_balance.drift: %d sampled Safes all agree at block %d (%.2fs)",
+            summary["sampled"],
+            watermark,
+            summary["elapsed"],
+        )
+    return summary
+
+
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT * 2)
+def check_native_balance_drift_task(self):
+    """Weekly sanity check on the incremental rollup (Sundays 05:00 UTC).
+
+    Reports only. See ``check_native_balance_drift``.
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            return check_native_balance_drift()
 
 
 @app.shared_task(bind=True)
