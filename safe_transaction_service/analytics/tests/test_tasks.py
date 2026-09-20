@@ -6,6 +6,7 @@ from django.test import TestCase
 from safe_transaction_service.analytics.models import (
     AnalyticsSnapshot,
     DailyActiveOwner,
+    DailyActiveSafe,
     DailyMetric,
 )
 from safe_transaction_service.analytics.services.analytics_service import (
@@ -422,6 +423,108 @@ class TestActiveSafesTask(TestCase):
         self.assertIsNotNone(
             redis.get(AnalyticsService.REDIS_ACTIVE_SAFES_PREFIX + "90d")
         )
+
+
+class TestSafesActiveInWindowRollupFirst(TestCase):
+    """`_safes_active_in_window` is rollup-first, mirroring
+    `_active_owners_in_window`.
+
+    Before this, it was the one of the two that computed from the live
+    `history_*` tables unconditionally, so the Redis window scalar it
+    populates and the `DailyActiveSafe` count the read path computes came
+    from two different sources and could legitimately disagree. Now that
+    the read path serves that Redis scalar ahead of the rollup on a
+    populated instance, the two must be the same number, which means this
+    helper has to read the rollup too.
+
+    The live three-leg scan stays as the cold-window fallback for a fresh
+    or un-backfilled instance, and says so in the log.
+    """
+
+    def setUp(self):
+        super().setUp()
+        get_redis().flushall()
+
+    def test_rollup_rows_answer_the_window_without_touching_the_live_path(self):
+        """Rollup populated: the count is a COUNT(DISTINCT safe_address)
+        over it and the ERC20 leg of the live path is never consulted.
+
+        The fixture seeds live activity the rollup does not know about, so
+        the two sources give different numbers (2 vs 1) — a regression to
+        the live path fails on the value as well as on the call assertion.
+        """
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        today = timezone.now().date()
+        addr1 = Account.create().address
+        addr2 = Account.create().address
+        DailyActiveSafe.objects.create(
+            date=today - timedelta(days=1), safe_address=addr1
+        )
+        # Same Safe on a second day — one distinct address, not two.
+        DailyActiveSafe.objects.create(
+            date=today - timedelta(days=2), safe_address=addr1
+        )
+        DailyActiveSafe.objects.create(
+            date=today - timedelta(days=2), safe_address=addr2
+        )
+        # Live activity absent from the rollup: the live path would say 1.
+        safe = SafeContractFactory()
+        MultisigTransactionFactory(safe=safe.address)
+
+        cutoff = timezone.now() - timezone.timedelta(days=7)
+        with patch(
+            "safe_transaction_service.analytics.tasks._erc20_active_safe_addrs",
+            return_value=set(),
+        ) as erc20_leg:
+            self.assertEqual(_safes_active_in_window(cutoff), 2)
+        erc20_leg.assert_not_called()
+
+    def test_cold_rollup_falls_back_to_the_live_three_leg_path(self):
+        """No rollup row covers the window — the live union still answers,
+        so a fresh instance keeps producing a number rather than a zero."""
+        from django.utils import timezone
+
+        safe = SafeContractFactory()
+        MultisigTransactionFactory(safe=safe.address)
+        self.assertEqual(DailyActiveSafe.objects.count(), 0)
+
+        cutoff = timezone.now() - timezone.timedelta(days=7)
+        with patch(
+            "safe_transaction_service.analytics.tasks._erc20_active_safe_addrs",
+            return_value=set(),
+        ) as erc20_leg:
+            self.assertEqual(_safes_active_in_window(cutoff), 1)
+        erc20_leg.assert_called_once()
+
+    def test_rollup_rows_outside_the_window_do_not_make_it_rollup_first(self):
+        """The cutoff gate is `date__gte`, not "the table has any row": a
+        rollup whose newest row predates the window is cold *for that
+        window* and must fall through to the live path."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        DailyActiveSafe.objects.create(
+            date=timezone.now().date() - timedelta(days=40),
+            safe_address=Account.create().address,
+        )
+        safe = SafeContractFactory()
+        MultisigTransactionFactory(safe=safe.address)
+
+        cutoff = timezone.now() - timezone.timedelta(days=7)
+        with patch(
+            "safe_transaction_service.analytics.tasks._erc20_active_safe_addrs",
+            return_value=set(),
+        ) as erc20_leg:
+            self.assertEqual(_safes_active_in_window(cutoff), 1)
+        erc20_leg.assert_called_once()
 
 
 class TestActiveOwnersTask(TestCase):

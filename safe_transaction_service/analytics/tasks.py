@@ -456,7 +456,43 @@ def _erc20_active_safe_addrs(cutoff, batch_size: int = 5000) -> set[str]:
 
 def _safes_active_in_window(cutoff) -> int:
     """Distinct count of Safes that produced multisig/module activity or
-    ERC20 movement at or after `cutoff`."""
+    ERC20 movement at or after `cutoff`.
+
+    Fast path: aggregate over the per-day ``DailyActiveSafe`` rollup — a
+    single ``COUNT(DISTINCT safe_address)`` over the date range, the same
+    number and the same shape the read path computes when it has to. This
+    mirrors `_active_owners_in_window`, which has been rollup-first since
+    the rollups landed; this one was the odd half of the pair, computing
+    from live ``history_*`` every time.
+
+    That asymmetry mattered once the read path started serving the Redis
+    scalar this function feeds ahead of the rollup: a Redis value built
+    from the live tables and a rollup value built from
+    ``analytics_dailyactivesafe`` answer slightly different questions
+    (`_compute_daily_active_safes` buckets by UTC day and only covers days
+    it has run for), so the same endpoint could return one or the other
+    depending on whether the key happened to be warm. Reading the rollup
+    here makes the two the same number by construction.
+
+    Cold-window fallback: no rollup row covers the window (fresh instance,
+    pre-backfill, or a long gap since the last daily run), so the live
+    three-leg union below runs and emits
+    ``analytics.rollup.cold_window``. Note the gate is ``date__gte`` on the
+    cutoff, not "the table is non-empty": a rollup whose newest row
+    predates the window is cold *for that window*.
+
+    Contract invariant 3 applies as everywhere else: this is a distinct
+    count over the span, never a sum of the per-day rows.
+    """
+    cutoff_date = cutoff.date() if hasattr(cutoff, "date") else cutoff
+    rollup_qs = DailyActiveSafe.objects.filter(date__gte=cutoff_date)
+    if rollup_qs.exists():
+        return rollup_qs.aggregate(n=Count("safe_address", distinct=True))["n"] or 0
+
+    logger.info(
+        "analytics.rollup.cold_window key=active_safes cutoff=%s",
+        cutoff_date,
+    )
     active: set[str] = set()
 
     # Multisig / module legs filter on block.timestamp / internal_tx.timestamp.
@@ -571,10 +607,13 @@ def _active_owners_in_window(cutoff, batch_size: int = 5000) -> int:
 
     Fast path: aggregate over the per-day ``DailyActiveOwner`` rollup
     populated by ``compute_daily_metrics_task`` — a single
-    ``COUNT(DISTINCT owner_address)`` over the date range, sub-100 ms
-    regardless of ``history_*`` size. Matches the semantic of the rollup
-    populator (owners with at least one confirmation on a tx executed
-    that UTC day).
+    ``COUNT(DISTINCT owner_address)`` over the date range, orders of
+    magnitude cheaper than the live join regardless of ``history_*``
+    size, though not free: it is seconds to tens of seconds on a large
+    rollup, which is why the read path prefers the Redis scalar this
+    function feeds (decision log, 2026-09-20). Matches the semantic of
+    the rollup populator (owners with at least one confirmation on a tx
+    executed that UTC day).
 
     Cold-window fallback: if the rollup has no rows covering the window
     (fresh instance / pre-backfill / a long gap since the last daily
@@ -597,7 +636,12 @@ def _active_owners_in_window(cutoff, batch_size: int = 5000) -> int:
     cutoff_date = cutoff.date() if hasattr(cutoff, "date") else cutoff
     rollup_qs = DailyActiveOwner.objects.filter(date__gte=cutoff_date)
     if rollup_qs.exists():
-        return rollup_qs.values("owner_address").distinct().count()
+        # `COUNT(DISTINCT owner_address)` rather than COUNT(*) over a
+        # SELECT DISTINCT subquery: same number, but the aggregate form
+        # goes through the (date, owner_address) unique index instead of
+        # sorting the (owner_address, date) one. See the 2026-09-20
+        # decision-log entry for the BASE numbers.
+        return rollup_qs.aggregate(n=Count("owner_address", distinct=True))["n"] or 0
 
     logger.info(
         "analytics.rollup.cold_window key=active_owners cutoff=%s",

@@ -2566,3 +2566,458 @@ class TestTokenVolumeDayBreakdownColdRollup(AnalyticsTestMixin, APITestCase):
             list(body.keys()),
             TestTokenVolumeDayBreakdown.KEYS_WITHOUT_BREAKDOWN,
         )
+
+
+class _ActiveWindowCountQueryShapeMixin(AnalyticsTestMixin):
+    """The window scalar on `/active-safes/` and `/active-owners/` must
+    compile to a `COUNT(DISTINCT <addr>)` aggregate, never to
+    `SELECT COUNT(*) FROM (SELECT DISTINCT <addr> ...)`.
+
+    Not a style preference. The two forms return the same number, so no
+    value assertion can tell them apart, but they get different plans: the
+    subquery form makes the planner walk the `(<addr>, date)` index and
+    sort/spill, which on BASE measured 122.6 s against 47.6 s for the
+    aggregate form over the `(date, <addr>)` unique index. With
+    `DB_STATEMENT_TIMEOUT` at 50 s the first one is cancelled and the view
+    500s every collection cycle, so the shape is the fix and the shape is
+    what gets pinned -- on the generated SQL, the only place it is visible.
+    """
+
+    route = None  # reversed route name
+    model = None  # DailyActiveSafe | DailyActiveOwner
+    address_field = None  # "safe_address" | "owner_address"
+    table = None  # the rollup's table name, to filter captured SQL
+
+    def setUp(self):
+        super().setUp()
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        self.today = timezone.now().date()
+        for days_ago in (1, 2, 2):
+            self.model.objects.create(
+                **{
+                    "date": self.today - timedelta(days=days_ago),
+                    self.address_field: Account.create().address,
+                }
+            )
+
+    def _day(self, days_ago):
+        from datetime import timedelta
+
+        return (self.today - timedelta(days=days_ago)).isoformat()
+
+    @property
+    def _both_read_shapes(self):
+        """The windowed read and the ranged one, which share the count
+        expression -- a regression on either is the same 500."""
+        return {
+            "window": {"window": "7d"},
+            "range": {"from": self._day(7), "to": self._day(0)},
+        }
+
+    def _rollup_sql(self, params):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(reverse(self.route), params, **self.auth_header)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        sql = [q["sql"] for q in captured.captured_queries if self.table in q["sql"]]
+        self.assertTrue(sql, "no query touched the rollup table")
+        return sql
+
+    def test_window_count_is_a_count_distinct_aggregate(self):
+        for label, params in self._both_read_shapes.items():
+            with self.subTest(read=label):
+                sql = self._rollup_sql(params)
+                self.assertTrue(
+                    any("COUNT(DISTINCT" in statement.upper() for statement in sql),
+                    sql,
+                )
+
+    def test_window_count_is_not_a_select_distinct_subquery(self):
+        for label, params in self._both_read_shapes.items():
+            with self.subTest(read=label):
+                for statement in self._rollup_sql(params):
+                    self.assertNotIn("SELECT DISTINCT", statement.upper(), statement)
+
+
+class TestActiveSafesWindowCountQueryShape(
+    _ActiveWindowCountQueryShapeMixin, APITestCase
+):
+    route = "v2:analytics:analytics-active-safes"
+    address_field = "safe_address"
+    table = "analytics_dailyactivesafe"
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveSafe
+
+        return DailyActiveSafe
+
+
+class TestActiveOwnersWindowCountQueryShape(
+    _ActiveWindowCountQueryShapeMixin, APITestCase
+):
+    route = "v2:analytics:analytics-active-owners"
+    address_field = "owner_address"
+    table = "analytics_dailyactiveowner"
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveOwner
+
+        return DailyActiveOwner
+
+
+class _ActiveRedisFirstMixin(AnalyticsTestMixin):
+    """For a standard `7d|30d|90d` window the read path is now
+    **Redis-first**: the precomputed window scalar
+    (`compute_daily_metrics_task` -> `_refresh_active_window_caches`) is
+    served when the key is there, and the rollup aggregate is what runs
+    when it is not.
+
+    The scalar is computed from the same rollup on a populated instance
+    (`_safes_active_in_window` / `_active_owners_in_window` are both
+    rollup-first), so this is a cheaper route to the same number, not a
+    second answer. The fixtures below seed the two sources to *differ*
+    only so each test can name which one produced the response.
+
+    The per-day series is never taken from Redis -- there are no per-day
+    rows behind that key -- so `breakdown=day` still reads the rollup.
+    Ranged reads do not consult Redis at all, which
+    `_ActiveRangeMixin.test_ranged_cold_read_does_not_serve_the_cached_window_scalar`
+    pins.
+    """
+
+    route = None  # reversed route name
+    model = None  # DailyActiveSafe | DailyActiveOwner
+    address_field = None  # "safe_address" | "owner_address"
+    count_key = None  # "active_safes" | "active_owners"
+    redis_prefix = None  # legacy rolling-window cache key prefix
+
+    CACHED_AT = "2026-09-19T01:00:00+00:00"
+
+    def setUp(self):
+        super().setUp()
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        self.today = timezone.now().date()
+        self.addr1 = Account.create().address
+        self.addr2 = Account.create().address
+
+    def _seed_rollup(self):
+        """Three rows inside the 30d window, two distinct addresses, one of
+        them on two days -- so the rollup answer is 2 while a sum of the
+        per-day series would be 3."""
+        from datetime import timedelta
+
+        for days_ago, address in ((1, self.addr1), (2, self.addr1), (2, self.addr2)):
+            self.model.objects.create(
+                **{
+                    "date": self.today - timedelta(days=days_ago),
+                    self.address_field: address,
+                }
+            )
+
+    def _seed_redis(self, key_window="30d", payload_window="30d", value=41):
+        self.redis.set(
+            self.redis_prefix + key_window,
+            json.dumps(
+                {
+                    "window": payload_window,
+                    self.count_key: value,
+                    "computed_at": self.CACHED_AT,
+                }
+            ),
+        )
+
+    def _get(self, params):
+        return self.client.get(reverse(self.route), params, **self.auth_header)
+
+    def _day(self, days_ago):
+        from datetime import timedelta
+
+        return (self.today - timedelta(days=days_ago)).isoformat()
+
+    # -- (i) cache present, rollup populated --------------------------
+
+    def test_cached_window_scalar_is_served_ahead_of_the_rollup_count(self):
+        """41 can only have come from Redis -- the rollup says 2 -- which is
+        what pins the ordering. `computed_at` is the cached one, not a
+        read-time stamp: the number was computed then, and saying otherwise
+        would report a stale value as fresh."""
+        self._seed_rollup()
+        self._seed_redis(value=41)
+
+        response = self._get({"window": "30d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), ["window", self.count_key, "computed_at"])
+        self.assertEqual(body["window"], "30d")
+        self.assertEqual(body[self.count_key], 41)
+        self.assertEqual(body["computed_at"], self.CACHED_AT)
+
+    def test_cached_scalar_does_not_replace_the_rollup_series(self):
+        """`breakdown=day` on the Redis-served path: the scalar comes from
+        the key, the series still comes from the rollup. Redis holds no
+        per-day rows, so serving an empty series here would drop a
+        breakdown the instance can actually produce."""
+        self._seed_rollup()
+        self._seed_redis(value=41)
+
+        response = self._get({"window": "30d", "breakdown": "day"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(
+            list(body.keys()),
+            [
+                "window",
+                self.count_key,
+                "computed_at",
+                "window_start",
+                "window_end",
+                "days",
+            ],
+        )
+        self.assertEqual(body[self.count_key], 41)
+        self.assertEqual(body["computed_at"], self.CACHED_AT)
+        self.assertEqual(body["window_end"], self.today.isoformat())
+        self.assertEqual(
+            body["days"],
+            [
+                {"date": self._day(1), self.count_key: 1},
+                {"date": self._day(2), self.count_key: 2},
+            ],
+        )
+
+    # -- (ii) cache absent, rollup populated --------------------------
+
+    def test_absent_cache_falls_back_to_the_rollup_count(self):
+        """No key: the rollup aggregate answers, exactly as before."""
+        self._seed_rollup()
+
+        response = self._get({"window": "30d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), ["window", self.count_key, "computed_at"])
+        self.assertEqual(body[self.count_key], 2)
+        self.assertIsNotNone(body["computed_at"])
+
+    # -- (iii) cache present for a different window -------------------
+
+    def test_cache_holding_another_window_is_ignored(self):
+        """A payload whose `window` disagrees with the request is not the
+        answer to this question -- the same guard the cold-window fallback
+        has always applied, kept on the fast path."""
+        self._seed_rollup()
+        self._seed_redis(key_window="30d", payload_window="7d", value=41)
+
+        response = self._get({"window": "30d"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(body[self.count_key], 2)
+        self.assertIsNotNone(body["computed_at"])
+
+    # -- (iv) neither source has anything -----------------------------
+
+    def test_no_cache_and_no_rollup_is_the_zero_payload(self):
+        """The contract's warming shape: zero with `computed_at: null`.
+
+        The cold-window `_redis_get_or_compute` path is still consulted --
+        asserted on the call -- and stubbed to return nothing, which is what
+        it does on a real cold instance inside one request. Left unstubbed,
+        the eager test Celery would run the compute inline and publish a
+        (still zero) scalar carrying a timestamp, a shape no deployment
+        returns synchronously.
+        """
+        with patch(
+            "safe_transaction_service.analytics.services.analytics_service"
+            "._redis_get_or_compute",
+            return_value=None,
+        ) as cold_window:
+            response = self._get({"window": "30d"})
+
+        cold_window.assert_called_once()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), ["window", self.count_key, "computed_at"])
+        self.assertEqual(body["window"], "30d")
+        self.assertEqual(body[self.count_key], 0)
+        self.assertIsNone(body["computed_at"])
+
+
+class TestActiveSafesRedisFirst(_ActiveRedisFirstMixin, APITestCase):
+    route = "v2:analytics:analytics-active-safes"
+    address_field = "safe_address"
+    count_key = "active_safes"
+    redis_prefix = AnalyticsService.REDIS_ACTIVE_SAFES_PREFIX
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveSafe
+
+        return DailyActiveSafe
+
+
+class TestActiveOwnersRedisFirst(_ActiveRedisFirstMixin, APITestCase):
+    route = "v2:analytics:analytics-active-owners"
+    address_field = "owner_address"
+    count_key = "active_owners"
+    redis_prefix = AnalyticsService.REDIS_ACTIVE_OWNERS_PREFIX
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveOwner
+
+        return DailyActiveOwner
+
+
+class _ActiveRangeStatementTimeoutMixin(AnalyticsTestMixin):
+    """A ranged read has no precomputed scalar behind it -- no Redis key, no
+    beat task -- so it is the one path that still aggregates over an
+    arbitrary span inside the request. On a chain where that span is wide
+    enough Postgres cancels the statement at `DB_STATEMENT_TIMEOUT`.
+
+    That must degrade to the contract's warming payload (zero,
+    `computed_at: null`, "retry next cycle") rather than 500: the hub
+    records a null and keeps collecting, where a 500 is an error it has to
+    alert on for a question it can simply ask again later. Only the
+    cancellation degrades -- every other `OperationalError` is a real fault
+    and still propagates, because swallowing those would turn a broken
+    connection into a silent zero.
+    """
+
+    route = None  # reversed route name
+    model = None  # DailyActiveSafe | DailyActiveOwner
+    address_field = None  # "safe_address" | "owner_address"
+    count_key = None  # "active_safes" | "active_owners"
+
+    TIMEOUT_MESSAGE = "canceling statement due to statement timeout"
+
+    def setUp(self):
+        super().setUp()
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from eth_account import Account
+
+        self.today = timezone.now().date()
+        # Rows in range, so the read reaches the aggregate rather than
+        # short-circuiting on the cold-rollup branch.
+        for days_ago in (1, 2):
+            self.model.objects.create(
+                **{
+                    "date": self.today - timedelta(days=days_ago),
+                    self.address_field: Account.create().address,
+                }
+            )
+
+    def _day(self, days_ago):
+        from datetime import timedelta
+
+        return (self.today - timedelta(days=days_ago)).isoformat()
+
+    def _ranged_get(self, params=None):
+        query = {"from": self._day(30), "to": self._day(0)}
+        query.update(params or {})
+        return self.client.get(reverse(self.route), query, **self.auth_header)
+
+    def _aggregate_raising(self, message):
+        from django.db import OperationalError
+
+        return patch(
+            "django.db.models.query.QuerySet.aggregate",
+            side_effect=OperationalError(message),
+        )
+
+    def test_statement_timeout_degrades_to_the_warming_payload(self):
+        with self._aggregate_raising(self.TIMEOUT_MESSAGE):
+            response = self._ranged_get()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(list(body.keys()), ["window", self.count_key, "computed_at"])
+        # The range won, so `window` is null here as on any ranged read.
+        self.assertIsNone(body["window"])
+        self.assertEqual(body[self.count_key], 0)
+        self.assertIsNone(body["computed_at"])
+
+    def test_statement_timeout_under_breakdown_day_still_emits_the_series_keys(self):
+        """`days` is present and empty on every cold-shaped response -- the
+        property that keeps "old producer, key absent" distinguishable from
+        "no rows to show" -- and a cancelled read is one of them."""
+        with self._aggregate_raising(self.TIMEOUT_MESSAGE):
+            response = self._ranged_get({"breakdown": "day"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = json.loads(response.content)
+        self.assertEqual(
+            list(body.keys()),
+            [
+                "window",
+                self.count_key,
+                "computed_at",
+                "window_start",
+                "window_end",
+                "days",
+            ],
+        )
+        self.assertEqual(body["days"], [])
+        self.assertEqual(body["window_start"], self._day(30))
+        self.assertEqual(body["window_end"], self._day(0))
+        self.assertEqual(body[self.count_key], 0)
+
+    def test_any_other_operational_error_still_propagates(self):
+        from django.db import OperationalError
+
+        with self._aggregate_raising("server closed the connection unexpectedly"):
+            with self.assertRaises(OperationalError):
+                self._ranged_get()
+
+    def test_a_windowed_read_does_not_swallow_the_cancellation(self):
+        """The degradation is scoped to the ranged path. A windowed read has
+        a Redis scalar and a beat task behind it, so a cancellation there is
+        a fault worth surfacing, not a "retry next cycle"."""
+        from django.db import OperationalError
+
+        with self._aggregate_raising(self.TIMEOUT_MESSAGE):
+            with self.assertRaises(OperationalError):
+                self.client.get(
+                    reverse(self.route), {"window": "30d"}, **self.auth_header
+                )
+
+
+class TestActiveSafesRangeStatementTimeout(
+    _ActiveRangeStatementTimeoutMixin, APITestCase
+):
+    route = "v2:analytics:analytics-active-safes"
+    address_field = "safe_address"
+    count_key = "active_safes"
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveSafe
+
+        return DailyActiveSafe
+
+
+class TestActiveOwnersRangeStatementTimeout(
+    _ActiveRangeStatementTimeoutMixin, APITestCase
+):
+    route = "v2:analytics:analytics-active-owners"
+    address_field = "owner_address"
+    count_key = "active_owners"
+
+    @property
+    def model(self):
+        from safe_transaction_service.analytics.models import DailyActiveOwner
+
+        return DailyActiveOwner

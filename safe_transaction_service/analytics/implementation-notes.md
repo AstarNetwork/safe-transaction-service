@@ -1733,3 +1733,200 @@ ranking it draws.
   pairing, plus a second case pinning that the *no-parameter* response
   through the live fallback did not grow anything when that branch gained
   its conditional.
+
+---
+
+# Part 10 — The active-\* window read path: `COUNT(DISTINCT)`, Redis-first, and a range that degrades (2026-09-20)
+
+`/api/v2/analytics/active-safes/` and `/active-owners/` were 500-ing on BASE
+every collection cycle. Not intermittently — every cycle, for the plain
+`window=30d` read, which is the one the hub makes on every pass.
+
+## What the query plans actually said
+
+The read path computed its window scalar as
+`windowed.values("safe_address").distinct().count()`. Django compiles that to
+
+```sql
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT "analytics_dailyactivesafe"."safe_address"
+    FROM "analytics_dailyactivesafe"
+    WHERE "analytics_dailyactivesafe"."date" >= '…'
+) subquery
+```
+
+On BASE, 30 d window:
+
+| form | plan | time |
+|---|---|---|
+| `COUNT(*)` over `SELECT DISTINCT …` | index-only scan on `analytics_das_safe_date_idx` `(safe_address, date)` → ~343 k heap fetches → Unique over an external merge sort that **spilled to temp** | **122.6 s** |
+| `COUNT(DISTINCT safe_address)` | scan on the `(date, safe_address)` unique index, hash aggregate, no spill | **47.6 s** |
+
+The subquery form makes the planner anchor on the `(safe_address, date)`
+index because the `DISTINCT` is on `safe_address`; the date predicate is then
+a filter rather than a range, so it fetches heap pages for rows it throws
+away and sorts what is left. The aggregate form lets it range-scan the
+`(date, safe_address)` unique index the rollup already has and fold the
+distinct into a hash aggregate.
+
+`config/settings/base.py` sets `statement_timeout = DB_STATEMENT_TIMEOUT`
+(50 s) on every connection. 122.6 s is cancelled at 50 s, the cancellation
+surfaces as `django.db.OperationalError: canceling statement due to
+statement timeout`, and the view returns 500. So the endpoint was not slow,
+it was *dead*.
+
+47.6 s is under the timeout and therefore "works", but it is not a number to
+serve from a request path either — it is 47 s of one gunicorn worker per
+call. The query shape alone was never going to be the whole fix.
+
+## Three changes, and why it takes all three
+
+**1. Query shape.** `aggregate(Count(<addr>, distinct=True))` replaces
+`values(<addr>).distinct().count()` in `AnalyticsService.get_active_safes`,
+`AnalyticsService.get_active_owners` and `_active_owners_in_window`
+(`tasks.py`). Same number, better plan, 2.6× on the measurement above. The
+contract-invariant-3 comments stay exactly where they were: the scalar is
+still its own distinct count and is still never a sum of the per-day series.
+
+This is pinned on the *generated SQL* — `CaptureQueriesContext`, assert
+`COUNT(DISTINCT` present and `SELECT DISTINCT` absent — because the two
+forms return the same value and no value-level assertion can tell them
+apart. A test that only checked the number would have passed against the
+form that 500s in production.
+
+**2. Redis-first for a standard window.** For a `7d|30d|90d` read with no
+`from`/`to`, the read path now does a plain `GET` on
+`analytics_active_safes_<window>` (resp. `…_owners_…`) *first*, via the new
+`_redis_peek`, and serves the cached scalar with the cached `computed_at`.
+That key has existed all along — `compute_daily_metrics_task` →
+`_refresh_active_window_caches` writes it nightly — but the read path only
+ever consulted it when the rollup was **empty**, so on any populated chain
+it was dead weight. A precomputed number that no request could reach.
+
+`_redis_peek` is deliberately not `_redis_get_or_compute`. The latter, on a
+miss, takes a SETNX lock, dispatches a Celery task and then blocks the
+request polling for up to `_COMPUTE_WAIT_SECONDS` (25 s). That is right for
+a cold endpoint with no other source; it is wrong for a fast path, where a
+miss means nothing worse than "compute it from the rollup instead". A miss
+here must not block and must not dispatch.
+
+Order of precedence for a standard window is now: cached scalar → rollup
+aggregate → `_redis_get_or_compute` cold-window fallback → zero payload with
+`computed_at: null`. The cached payload is ignored unless its own `window`
+key matches the request, which is the same guard the cold-window fallback
+has always applied — kept, because a key holding another window's answer is
+not a stale answer to this question, it is an answer to a different one.
+
+**The scalar and the rollup must agree, so `_safes_active_in_window` became
+rollup-first.** This is the semantic half of the change and the part most
+likely to be undone by accident later. `_active_owners_in_window` has been
+rollup-first with a live fallback since the rollups landed;
+`_safes_active_in_window` was not — it computed the three-leg live union
+over `history_multisigtransaction` / `history_moduletransaction` /
+`history_erc20transfer` every time. As long as the read path only served
+that key on a cold rollup, nobody could see the difference. Serving it ahead
+of the rollup would have made the same endpoint return a live-derived number
+or a rollup-derived number depending on whether the key happened to be warm,
+and those are not the same question: `_compute_daily_active_safes` buckets
+by UTC day and only covers days it has actually run for, while the live legs
+use a rolling `timestamp >= cutoff`. So `_safes_active_in_window` now reads
+`DailyActiveSafe` when a row covers the window, and keeps the live union as
+its cold-window fallback with the usual
+`analytics.rollup.cold_window key=active_safes cutoff=…` line.
+
+The gate is `date__gte=cutoff`, not "the table is non-empty": a rollup whose
+newest row predates the window is cold *for that window* and still has to
+fall through.
+
+Consequence worth stating plainly: on a populated instance the cached scalar
+is now up to a day stale by construction (it is written by the 01:00 beat
+task), where the rollup aggregate was computed at request time. Both read
+the same rows; the difference is only which day's run they reflect. That is
+the trade the hub already makes everywhere else — the workspace contract's
+"a hub number is at worst producer cadence + hub interval stale" — and it
+buys a 47 s query becoming a `GET`.
+
+**3. A ranged read degrades instead of 500-ing.** `from`/`to` is the one
+shape on these endpoints with nothing precomputed behind it: no Redis key,
+no beat task, an arbitrary span aggregated inside the request. Query shape
+helps it, but on a wide enough span over a large enough rollup it can still
+be cancelled. `get_active_safes` / `get_active_owners` now catch
+`OperationalError` around the ranged window count *and* the per-day series
+query, and when — and only when — it is a statement-timeout cancellation,
+return the contract's warming payload: zeros, `computed_at: null`, key set
+and order unchanged, `days` present-and-empty under `breakdown=day`. Logged
+at WARNING with the key and the range (`analytics.read.statement_timeout`),
+not INFO, because unlike `analytics.rollup.cold_window` this is not a normal
+state of a young instance.
+
+Every other `OperationalError` still propagates. A dropped connection or a
+dead server laundered into a zero is a worse failure than a 500 — the hub
+would store it and nothing would look wrong. The discrimination is
+`_is_statement_timeout`: psycopg's `QueryCanceled` (SQLSTATE 57014), checked
+on the exception and on its `__cause__` where Django puts the driver's
+original, falling back to matching the message text. The class is imported
+lazily (`_query_canceled_class`, `@cache`) rather than at module scope, so
+this module does not acquire a hard psycopg-3-vs-psycopg2 dependency for a
+helper only the read path touches.
+
+Scoped to the ranged path on purpose. A *windowed* read that gets cancelled
+has a Redis scalar and a beat task behind it; a cancellation there means
+something is wrong that the fallbacks should have prevented, and it should
+be visible rather than answered with a zero.
+
+## What this does not fix, and what ops still has to do
+
+None of the above is a substitute for the table being in a state Postgres
+can plan. Three follow-ups, all operational, none of them code:
+
+```sql
+VACUUM (ANALYZE) analytics_dailyactivesafe;
+VACUUM (ANALYZE) analytics_dailyactiveowner;
+```
+
+Run these on BASE and Berachain before drawing any conclusion from a fresh
+`EXPLAIN`. Both tables are insert-only and were backfilled in bulk, which is
+exactly the shape autovacuum is worst at: no dead tuples to trigger it, so
+the visibility map stays cold and every index-only scan degrades into heap
+fetches — the 343 k above. The numbers in the table were measured in that
+state, which is also the state production was in.
+
+- **Consider a per-table `autovacuum_vacuum_insert_scale_factor`** (PG 13+)
+  on both rollups so an insert-only table gets vacuumed on insert volume
+  rather than never. Default is 0.2 of the table plus 1000 rows; something
+  tighter is appropriate for a table that grows by ~250 k rows a day on BASE
+  and whose whole value is index-only scans.
+- **Raise `work_mem` for the analytics and Celery sessions.** The external
+  merge sort that spilled to temp in the bad plan is the visible symptom;
+  the compute tasks do larger aggregates than the read path and benefit
+  more. Session-scoped, not a global bump — the same reasoning
+  `relaxed_statement_timeout` uses for `statement_timeout`.
+
+## Tests
+
+`test_views_v2.py`, six new classes over three mixins (safes and owners get
+identical bodies, as with T9/T10):
+
+- `_ActiveWindowCountQueryShapeMixin` — the SQL-shape assertions above,
+  run over both the windowed and the ranged read since they share the
+  expression.
+- `_ActiveRedisFirstMixin` — the four cases: key present + rollup populated
+  (the response is the cached 41, not the rollup's 2, with the cached
+  `computed_at`); the same under `breakdown=day`, where the scalar is the
+  cached one and the series still comes from the rollup; key absent (rollup
+  answers); key present holding another `window` (ignored); neither source
+  (zero payload, `_redis_get_or_compute` still consulted — stubbed to return
+  `None`, because under eager-mode Celery it would otherwise run the compute
+  inline and publish a timestamped zero, a shape no real deployment returns
+  synchronously).
+- `_ActiveRangeStatementTimeoutMixin` — `QuerySet.aggregate` patched to
+  raise: the cancellation message degrades to the warming payload and keeps
+  emitting `days`; any other `OperationalError` propagates; a *windowed*
+  read does not swallow the cancellation.
+
+`test_tasks.py`, `TestSafesActiveInWindowRollupFirst` — rollup rows answer
+the window with `_erc20_active_safe_addrs` never called (the fixture seeds
+live activity the rollup does not know about, so the two sources give
+different numbers and a regression fails on the value too); a cold rollup
+still uses the live path; and a rollup whose only row predates the window is
+cold for that window.

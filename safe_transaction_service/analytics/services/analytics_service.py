@@ -4,8 +4,10 @@ import time
 from collections.abc import Callable, Iterable
 from datetime import date, datetime, timedelta
 from functools import cache
+from importlib import import_module
 from itertools import groupby
 
+from django.db import OperationalError
 from django.db.models import Count, DecimalField, F, Sum, Value, Window
 from django.db.models.functions import Coalesce, RowNumber
 from django.utils import timezone
@@ -126,6 +128,95 @@ def _append_day_breakdown(
     payload["window_start"] = since.isoformat() if since is not None else None
     payload["window_end"] = until.isoformat()
     payload["days"] = day_rows
+    return payload
+
+
+#: The message Postgres puts on the error it raises when it cancels a
+#: statement that outlived `statement_timeout` (SQLSTATE 57014). Matched on
+#: text because the class below is not guaranteed to be importable, and
+#: because Django wraps the driver exception in its own `OperationalError`
+#: whose `args` carry that same text.
+_STATEMENT_TIMEOUT_MESSAGE = "canceling statement due to statement timeout"
+
+
+@cache
+def _query_canceled_class() -> type[Exception] | None:
+    """psycopg's ``QueryCanceled`` (SQLSTATE 57014), or ``None`` where the
+    driver does not expose it.
+
+    Looked up lazily and cached rather than imported at module scope: this
+    module is imported by the Celery workers and by `manage.py` subcommands
+    on instances that may be running either psycopg 3 (what
+    `requirements.txt` pins) or psycopg2, and a hard import of the wrong one
+    would be an import-time failure for a helper only the read path needs.
+    """
+    for module_name in ("psycopg.errors", "psycopg2.errors"):
+        try:
+            return import_module(module_name).QueryCanceled
+        except (ImportError, AttributeError):
+            continue
+    return None
+
+
+def _is_statement_timeout(exc: BaseException) -> bool:
+    """True only for "Postgres cancelled this statement at
+    ``statement_timeout``" — not for any other `OperationalError`.
+
+    The distinction is the whole point of the caller: a cancellation is a
+    question that can be asked again next cycle, while a dropped connection
+    or a dead server is a fault that must not be laundered into a zero.
+
+    Two probes, either sufficient. The driver class is checked first
+    (including on ``__cause__``, which is where Django puts the original
+    when it re-raises as its own `OperationalError`); the message is the
+    fallback, and is what a test raising a bare
+    ``OperationalError(<message>)`` matches on.
+    """
+    query_canceled = _query_canceled_class()
+    if query_canceled is not None:
+        for candidate in (exc, exc.__cause__):
+            if isinstance(candidate, query_canceled):
+                return True
+    return _STATEMENT_TIMEOUT_MESSAGE in str(exc)
+
+
+def _cancelled_range_payload(
+    count_key: str,
+    since: date | None,
+    until: date | None,
+    today: date,
+    breakdown: str | None,
+) -> dict:
+    """The warming payload a ranged active-\\* read degrades to when
+    Postgres cancels its aggregate.
+
+    A ranged read is the one path on these two endpoints with no
+    precomputed scalar behind it — no Redis key, no beat task — so on a
+    wide span over a large rollup it is the one that can still exceed
+    `DB_STATEMENT_TIMEOUT` inside a request. Contract invariant 1 already
+    gives an honest shape for "no answer yet": zeros with
+    ``computed_at: None``, which the hub stores as-is and retries next
+    cycle. A 500 would instead be an error the hub has to alert on for a
+    question it could simply ask again, so the cancellation is mapped onto
+    that existing shape rather than onto a new one.
+
+    Key set and order are the ranged payload's, unchanged — ``window`` is
+    null because the range won, and ``days`` still ships present-and-empty
+    under ``breakdown=day`` for the reason `_append_day_breakdown` gives.
+    ``count_key`` doubles as the log's ``key=`` because on these two
+    endpoints the payload key and the metric name are the same string.
+
+    Logged at WARNING, not INFO: unlike `analytics.rollup.cold_window` this
+    is not a normal state of a young instance, it is a read that needs
+    either a narrower range or the ops follow-ups in the decision log
+    (VACUUM ANALYZE on the rollup, `work_mem`).
+    """
+    logger.warning(
+        "analytics.read.statement_timeout key=%s range=%s..%s", count_key, since, until
+    )
+    payload = {"window": None, count_key: 0, "computed_at": None}
+    if breakdown == "day":
+        _append_day_breakdown(payload, since, until or today, [])
     return payload
 
 
@@ -397,6 +488,24 @@ def _redis_get_or_compute(redis_key: str, task_callable: Callable) -> dict | Non
     return None
 
 
+def _redis_peek(redis_key: str) -> dict | None:
+    """One `GET`, and nothing else: the payload if the key is there, `None`
+    if it is not.
+
+    The deliberate opposite of `_redis_get_or_compute`, which on a miss
+    takes a lock, dispatches a Celery task and then blocks the request for
+    up to `_COMPUTE_WAIT_SECONDS` polling for a result. That is the right
+    behaviour for a *cold* endpoint with nothing else to fall back on; it
+    is the wrong behaviour for a fast path whose whole purpose is to be
+    cheap, where a miss simply means "compute it from the rollup instead".
+
+    So: a miss here must never block and never dispatch. Callers treat
+    `None` as "no cached scalar" and carry on down their existing path.
+    """
+    blob = get_redis().get(redis_key)
+    return json.loads(blob) if blob else None
+
+
 def _week_key(iso_period: str) -> str:
     """Map an ISO date string to its ISO-week key, e.g. '2026-W20'. Used
     as the deduplication key for bucketing rows."""
@@ -641,11 +750,28 @@ class AnalyticsService:
     ) -> dict:
         """Read the window-distinct active_safes count.
 
-        Single ``COUNT(DISTINCT safe_address)`` over the per-day
-        membership table for the requested window — sub-100 ms
-        regardless of ``history_*`` size. On a cold rollup we fall
-        through to the Redis-cached rolling-window value populated by
-        ``compute_daily_metrics_task``.
+        **Redis-first for a standard window.** The rolling-window scalar
+        `compute_daily_metrics_task` precomputes is served straight from
+        ``REDIS_ACTIVE_SAFES_PREFIX + window`` when the key is there —
+        one `GET`, no aggregate — and the rollup aggregate below is what
+        runs when it is not. The two agree by construction on a populated
+        instance: `_safes_active_in_window`, which writes that key, is
+        itself rollup-first (`analytics/tasks.py`), so the cached value is
+        the same ``COUNT(DISTINCT safe_address)`` computed off-request.
+        `computed_at` on that path is the cached one, so a stale number is
+        never reported as fresh.
+
+        Absent the key, the aggregate is a single
+        ``COUNT(DISTINCT safe_address)`` over the per-day membership table
+        for the requested window. It is *not* sub-100 ms on a large
+        rollup: on BASE the 30 d window measured ~47 s, which is why the
+        Redis path exists. What it replaced was worse — the equivalent
+        ``SELECT COUNT(*) FROM (SELECT DISTINCT …)`` took ~122 s there and
+        was cancelled by the 50 s `DB_STATEMENT_TIMEOUT`, so this read 500'd
+        every collection cycle (decision log, 2026-09-20). On a cold rollup
+        we fall through to the Redis-cached rolling-window value via
+        `_redis_get_or_compute`, which unlike the fast path above may
+        dispatch and wait.
 
         `breakdown` is opt-in and additive (phase-B T9). It is ``None``
         for every caller that does not ask, and then this method returns
@@ -674,11 +800,14 @@ class AnalyticsService:
         that ignored the parameters. Range length is not capped (spec Q21,
         applied to the range for the same reason).
 
-        A ranged read also does **not** fall through to the Redis
-        cold-window scalar: that value is a rolling *window* number, so
-        answering a range request with it would be a wrong answer rather
-        than a stale one. A cold rollup therefore returns the honest zero
-        payload with ``computed_at: None``.
+        A ranged read touches **neither** Redis path: the cached scalar is
+        a rolling *window* number, so answering a range request with it
+        would be a wrong answer rather than a stale one. A cold rollup
+        therefore returns the honest zero payload with
+        ``computed_at: None``. It is also the only path here with no
+        precomputed value behind it, so it is the one that can still be
+        cancelled at `DB_STATEMENT_TIMEOUT` — see `_cancelled_range_payload`
+        for what that degrades to.
         """
         from safe_transaction_service.analytics.models import DailyActiveSafe
 
@@ -689,24 +818,63 @@ class AnalyticsService:
         else:
             since, until = today - timedelta(days=_parse_window(window) or 30), None
         windowed = DailyActiveSafe.objects.filter(**_rollup_date_filters(since, until))
+
+        if not ranged:
+            cached = _redis_peek(self.REDIS_ACTIVE_SAFES_PREFIX + window)
+            if cached and cached.get("window") == window:
+                payload = {
+                    "window": window,
+                    "active_safes": cached.get("active_safes", 0),
+                    "computed_at": cached.get("computed_at"),
+                }
+                if breakdown == "day":
+                    # The scalar is cached; the series never is — Redis
+                    # holds no per-day rows — so it is still read from the
+                    # rollup, and is honestly empty when there are none.
+                    _append_day_breakdown(
+                        payload,
+                        since,
+                        today,
+                        _daily_distinct_counts(windowed, "safe_address", "active_safes")
+                        if windowed.exists()
+                        else [],
+                    )
+                return payload
+
         if windowed.exists():
-            # Invariant 3: the reported number is a COUNT(DISTINCT ...) over
-            # the rows of the span, ranged or not — never a sum of the
-            # per-day series below, which is its own separate distinct count
-            # over the same queryset.
-            count = windowed.values("safe_address").distinct().count()
+            try:
+                # Invariant 3: the reported number is a COUNT(DISTINCT ...)
+                # over the rows of the span, ranged or not — never a sum of
+                # the per-day series below, which is its own separate
+                # distinct count over the same queryset.
+                #
+                # `aggregate(Count(..., distinct=True))` and not
+                # `values(...).distinct().count()`: the second compiles to
+                # COUNT(*) over a SELECT DISTINCT subquery, which the
+                # planner answers off the (safe_address, date) index and a
+                # spilled sort. Same number, ~2.6x the time on BASE and
+                # over the statement timeout.
+                count = (
+                    windowed.aggregate(n=Count("safe_address", distinct=True))["n"] or 0
+                )
+                day_rows = (
+                    _daily_distinct_counts(windowed, "safe_address", "active_safes")
+                    if breakdown == "day"
+                    else []
+                )
+            except OperationalError as exc:
+                if not ranged or not _is_statement_timeout(exc):
+                    raise
+                return _cancelled_range_payload(
+                    "active_safes", since, until, today, breakdown
+                )
             payload = {
                 "window": None if ranged else window,
                 "active_safes": count,
                 "computed_at": timezone.now().isoformat(),
             }
             if breakdown == "day":
-                _append_day_breakdown(
-                    payload,
-                    since,
-                    until or today,
-                    _daily_distinct_counts(windowed, "safe_address", "active_safes"),
-                )
+                _append_day_breakdown(payload, since, until or today, day_rows)
             return payload
         logger.info(
             "analytics.rollup.cold_window key=active_safes_%s",
@@ -786,14 +954,26 @@ class AnalyticsService:
         """Distinct owners who confirmed any multisig tx executed in the
         window — confirmation-based active-owners semantic.
 
-        Window DAU is a single ``COUNT(DISTINCT owner_address)`` over
-        the per-day ``analytics_dailyactiveowner`` rollup — sub-100 ms
-        regardless of ``history_*`` size. Replaces the prior
-        ``DailyActiveSafe`` → ``SafeLastStatus`` lookup path which on
-        BASE took 9–28 s for the 30d window (and 504'd on cold deploys).
+        **Redis-first for a standard window**, exactly as on
+        ``/active-safes/``: the rolling-window scalar
+        `compute_daily_metrics_task` precomputes is served straight from
+        ``REDIS_ACTIVE_OWNERS_PREFIX + window`` when the key is there, with
+        its own ``computed_at``, and the aggregate below runs only when it
+        is not. `_active_owners_in_window`, which writes that key, has
+        always been rollup-first, so the two are the same number.
+
+        Absent the key, window DAU is a single
+        ``COUNT(DISTINCT owner_address)`` over the per-day
+        ``analytics_dailyactiveowner`` rollup. That replaced the prior
+        ``DailyActiveSafe`` → ``SafeLastStatus`` lookup path which on BASE
+        took 9–28 s for the 30d window (and 504'd on cold deploys); it is
+        much better but not free — the aggregate is seconds to tens of
+        seconds on a large rollup, which is what the Redis path is for
+        (decision log, 2026-09-20).
 
         On a cold rollup we fall through to the Redis-cached
-        rolling-window value populated by ``compute_daily_metrics_task``.
+        rolling-window value via `_redis_get_or_compute`, which unlike the
+        fast path above may dispatch a compute and wait for it.
 
         `breakdown` is opt-in and additive (phase-B T9), exactly as on
         ``/active-safes/``: ``None`` returns the payload this method has
@@ -815,11 +995,12 @@ class AnalyticsService:
         that ignored the parameters. Range length is not capped (spec Q21,
         applied to the range for the same reason).
 
-        A ranged read also does **not** fall through to the Redis
-        cold-window scalar: that value is a rolling *window* number, so
-        answering a range request with it would be a wrong answer rather
-        than a stale one. A cold rollup therefore returns the honest zero
-        payload with ``computed_at: None``.
+        A ranged read touches **neither** Redis path, for the reason
+        ``/active-safes/`` gives: the cached scalar is a rolling *window*
+        number and answering a range request with it would be a wrong
+        answer rather than a stale one. A cold rollup therefore returns the
+        honest zero payload with ``computed_at: None``, and a cancelled
+        aggregate degrades to the same shape (`_cancelled_range_payload`).
 
         `date_from` / `date_to` behave exactly as on ``/active-safes/``.
         """
@@ -832,22 +1013,58 @@ class AnalyticsService:
         else:
             since, until = today - timedelta(days=_parse_window(window) or 30), None
         windowed = DailyActiveOwner.objects.filter(**_rollup_date_filters(since, until))
+
+        if not ranged:
+            cached = _redis_peek(self.REDIS_ACTIVE_OWNERS_PREFIX + window)
+            if cached and cached.get("window") == window:
+                payload = {
+                    "window": window,
+                    "active_owners": cached.get("active_owners", 0),
+                    "computed_at": cached.get("computed_at"),
+                }
+                if breakdown == "day":
+                    # Scalar cached, series not — same split as
+                    # /active-safes/.
+                    _append_day_breakdown(
+                        payload,
+                        since,
+                        today,
+                        _daily_distinct_counts(
+                            windowed, "owner_address", "active_owners"
+                        )
+                        if windowed.exists()
+                        else [],
+                    )
+                return payload
+
         if windowed.exists():
-            # Invariant 3, as on /active-safes/: a COUNT(DISTINCT ...) over
-            # the span's rows, never a sum of `days`.
-            count = windowed.values("owner_address").distinct().count()
+            try:
+                # Invariant 3, as on /active-safes/: a COUNT(DISTINCT ...)
+                # over the span's rows, never a sum of `days`. Same reason
+                # for the aggregate form over `.values(...).distinct()` —
+                # the subquery shape is the one the planner runs badly.
+                count = (
+                    windowed.aggregate(n=Count("owner_address", distinct=True))["n"]
+                    or 0
+                )
+                day_rows = (
+                    _daily_distinct_counts(windowed, "owner_address", "active_owners")
+                    if breakdown == "day"
+                    else []
+                )
+            except OperationalError as exc:
+                if not ranged or not _is_statement_timeout(exc):
+                    raise
+                return _cancelled_range_payload(
+                    "active_owners", since, until, today, breakdown
+                )
             payload = {
                 "window": None if ranged else window,
                 "active_owners": count,
                 "computed_at": timezone.now().isoformat(),
             }
             if breakdown == "day":
-                _append_day_breakdown(
-                    payload,
-                    since,
-                    until or today,
-                    _daily_distinct_counts(windowed, "owner_address", "active_owners"),
-                )
+                _append_day_breakdown(payload, since, until or today, day_rows)
             return payload
         logger.info(
             "analytics.rollup.cold_window key=active_owners_%s",
