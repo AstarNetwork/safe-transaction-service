@@ -27,7 +27,7 @@ import json
 import logging
 import secrets
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from django.db import connection
 from django.db.models import Count, Sum
@@ -35,6 +35,11 @@ from django.utils import timezone
 
 from celery import app, chord, group
 
+from safe_transaction_service.analytics.catchup.day import DayStatus, compute_day
+from safe_transaction_service.analytics.catchup.gate import (
+    DayNotReady,
+    get_indexer_status,
+)
 from safe_transaction_service.analytics.services.db import relaxed_statement_timeout
 from safe_transaction_service.history.models import ERC20Transfer, SafeContract
 from safe_transaction_service.utils.celery import task_timeout
@@ -633,6 +638,24 @@ def backfill_chunk_key(run_id: str, chunk_index: int) -> str:
     return f"{BACKFILL_RUN_KEY_PREFIX}{run_id}:chunk:{chunk_index}"
 
 
+def backfill_heartbeat_key(run_id: str) -> str:
+    """A separate key from the run manifest, not a manifest field -- the
+    manifest has a single writer (the chord callback); shards run
+    concurrently and would lose updates to each other if they wrote a
+    manifest field directly. Same TTL as the manifest. See "Analytics
+    catch-up" in ``analytics/implementation-notes.md``.
+    """
+    return f"{backfill_run_key(run_id)}:heartbeat"
+
+
+def _write_backfill_heartbeat(run_id: str) -> None:
+    get_redis().set(
+        backfill_heartbeat_key(run_id),
+        timezone.now().isoformat(),
+        ex=BACKFILL_KEY_TTL_SECONDS,
+    )
+
+
 def new_backfill_run_id() -> str:
     return f"{timezone.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
 
@@ -672,10 +695,18 @@ def latest_backfill_run_id() -> str | None:
 
 
 def build_backfill_run(
-    dates: list[date | str], chunk_days: int, run_id: str | None = None
+    dates: list[date | str],
+    chunk_days: int,
+    run_id: str | None = None,
+    skip_settle_check: bool = False,
 ) -> dict:
     """Pure helper: the manifest for ``dates`` split into ``chunk_days``-sized
     chunks. Nothing is written or dispatched. ``chunk_days <= 0`` → one chunk.
+
+    ``skip_settle_check`` rides on the manifest (not just the first
+    dispatch call) because every later chunk is dispatched by
+    ``backfill_done`` on the worker, not by whoever called
+    ``start_backfill_run`` -- see ``_dispatch_backfill_chunk``.
     """
     if not dates:
         raise ValueError("backfill run needs at least one date")
@@ -709,6 +740,7 @@ def build_backfill_run(
         "total_days": len(days),
         "chunk_days": chunk_size,
         "chunk_count": len(chunks),
+        "skip_settle_check": skip_settle_check,
         "started_at": timezone.now().isoformat(),
         "finished_at": None,
         # Aggregate over *finished* chunks only.
@@ -749,11 +781,15 @@ def _dispatch_backfill_chunk(run: dict, chunk_index: int):
         stats_key=chunk["key"],
         run_id=run["run_id"],
         chunk_index=chunk_index,
+        skip_settle_check=run.get("skip_settle_check", False),
     )
 
 
 def start_backfill_run(
-    dates: list[date | str], chunk_days: int, run_id: str | None = None
+    dates: list[date | str],
+    chunk_days: int,
+    run_id: str | None = None,
+    skip_settle_check: bool = False,
 ) -> dict:
     """Persist a new run manifest, point ``BACKFILL_CURSOR_KEY`` at it and
     dispatch the first chunk. Returns the manifest as it stands after the
@@ -762,7 +798,9 @@ def start_backfill_run(
     Later chunks are dispatched by ``backfill_done`` on the worker, one
     after the other — the caller may exit immediately.
     """
-    run = build_backfill_run(dates, chunk_days, run_id=run_id)
+    run = build_backfill_run(
+        dates, chunk_days, run_id=run_id, skip_settle_check=skip_settle_check
+    )
     _save_backfill_run(run)
     _redis_set_json(
         BACKFILL_CURSOR_KEY,
@@ -836,44 +874,80 @@ def _advance_backfill_run(run_id: str, chunk_index: int, summary: dict) -> None:
 
 @app.shared_task()
 @task_timeout(timeout_seconds=LOCK_TIMEOUT * 4)
-def compute_daily_metric_shard(day_iso: str) -> dict:
-    """One backfill shard — compute and upsert the DailyMetric row plus all
-    narrow rollup tables for the given UTC day.
+def compute_daily_metric_shard(
+    day_iso: str, run_id: str | None = None, skip_settle_check: bool = False
+) -> dict:
+    """One backfill shard — compute (or retry) one UTC day through
+    `compute_day`, the same catch-up gate and completion marks the nightly
+    task and the sweeper use. See "Analytics catch-up" in
+    `analytics/implementation-notes.md`.
 
-    `_upsert_daily_metric` already runs the full inline populate path; this
-    is a thin Celery-task wrapper so ``dispatch_backfill`` can fan one chunk
-    out as a chord. Concurrency is bounded by the chunk size (one chunk in
-    flight per run), not by this task.
+    `run_id` and `skip_settle_check` are threaded in by the chunk
+    dispatcher (`_dispatch_backfill_chunk`), not chosen by this task:
+
+    - `run_id`, when given, is this shard's own backfill run. A heartbeat
+      (`backfill_heartbeat_key(run_id)`, same TTL as the manifest) is
+      written at start and finish, so the sweeper can tell a long-running
+      backfill from a dead one by *shard* activity rather than the run's
+      original `started_at`. A shard dispatched without `run_id` (a bare
+      `dispatch_backfill()` call) writes no heartbeat.
+    - `skip_settle_check` carries `backfill_daily_metrics
+      --skip-settle-check` down to this one day; the nightly task and the
+      sweeper never set it.
+
+    Concurrency is bounded by the chunk size (one chunk in flight per
+    run), not by this task. Exceptions never carry `str(exc)` into the
+    returned dict — it can end up in Redis (the manifest) and in
+    `--status` output, and an RPC error's text can hold a node URL or API
+    key; only the exception's class name is reported.
     """
-    # Local import — keeps the tasks_shards <-> tasks edge lazy so module
-    # import order in Celery autodiscovery doesn't matter.
-    from safe_transaction_service.analytics.tasks import _upsert_daily_metric
-
     day = _parse_iso_date(day_iso)
-    tz = timezone.get_current_timezone()
-    day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
-    day_end = day_start + timedelta(days=1)
+    if run_id:
+        _write_backfill_heartbeat(run_id)
     started = time.time()
     logger.info("compute_daily_metric_shard: starting day=%s", day_iso)
     try:
+        try:
+            status = get_indexer_status()
+        except DayNotReady:
+            status = None
         with relaxed_statement_timeout():
-            _upsert_daily_metric(day_start, day_end)
-    except Exception as e:  # noqa: BLE001 — per-day isolation
+            result = compute_day(day, status, skip_settle_check=skip_settle_check)
+    except Exception as exc:  # noqa: BLE001 — per-day isolation
         logger.exception(
             "compute_daily_metric_shard: failed after %.2fs day=%s",
             time.time() - started,
             day_iso,
         )
-        return {"date": day_iso, "ok": False, "error": str(e)}
+        return {"date": day_iso, "ok": False, "error": type(exc).__name__}
+    finally:
+        if run_id:
+            _write_backfill_heartbeat(run_id)
+
     elapsed = time.time() - started
+    if result.status == DayStatus.DEFERRED:
+        logger.info(
+            "compute_daily_metric_shard: deferred after %.2fs day=%s code=%s",
+            elapsed,
+            day_iso,
+            result.code,
+        )
+        return {
+            "date": day_iso,
+            "ok": False,
+            "status": "deferred",
+            "error": result.code,
+        }
     logger.info(
-        "compute_daily_metric_shard: completed in %.2fs day=%s",
+        "compute_daily_metric_shard: completed in %.2fs day=%s status=%s",
         elapsed,
         day_iso,
+        result.status.value,
     )
     return {
         "date": day_iso,
         "ok": True,
+        "status": result.status.value,
         "elapsed_seconds": round(elapsed, 2),
     }
 
@@ -962,6 +1036,7 @@ def dispatch_backfill(
     stats_key: str | None = None,
     run_id: str | None = None,
     chunk_index: int | None = None,
+    skip_settle_check: bool = False,
 ):
     """Build and submit ONE backfill chord — one shard per UTC day, chunk
     summary written to ``stats_key`` on completion. Returns the AsyncResult.
@@ -971,9 +1046,12 @@ def dispatch_backfill(
     this directly for a large range puts every day on the queue at once.
     """
     key = stats_key or BACKFILL_CURSOR_KEY
-    job = group(compute_daily_metric_shard.s(_iso(d)) for d in dates) | backfill_done.s(
-        key, run_id=run_id, chunk_index=chunk_index
-    )
+    job = group(
+        compute_daily_metric_shard.s(
+            _iso(d), run_id=run_id, skip_settle_check=skip_settle_check
+        )
+        for d in dates
+    ) | backfill_done.s(key, run_id=run_id, chunk_index=chunk_index)
     return job.apply_async(queue="contracts")
 
 
@@ -996,5 +1074,6 @@ __all__ = [
     "latest_backfill_run_id",
     "backfill_run_key",
     "backfill_chunk_key",
+    "backfill_heartbeat_key",
     "new_backfill_run_id",
 ]

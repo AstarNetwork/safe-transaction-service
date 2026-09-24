@@ -16,9 +16,8 @@ from django.core.management import CommandError, call_command
 from django.test import TestCase
 from django.utils import timezone
 
-from safe_transaction_service.analytics.management.commands.backfill_daily_metrics import (
-    select_failed_days,
-)
+from safe_transaction_service.analytics.catchup import select_failed_days
+from safe_transaction_service.analytics.catchup.day import DayResult, DayStatus
 from safe_transaction_service.analytics.models import DailyMetric
 from safe_transaction_service.analytics.tasks_shards import (
     BACKFILL_CURSOR_KEY,
@@ -36,12 +35,22 @@ from safe_transaction_service.analytics.tasks_shards import (
 from safe_transaction_service.history.tests.factories import SafeContractFactory
 from safe_transaction_service.utils.redis import get_redis
 
+from .catchup_gate_fixture import SettledGateMixin
+
 UPSERT_TARGET = "safe_transaction_service.analytics.tasks._upsert_daily_metric"
 COMMAND_MODULE = (
     "safe_transaction_service.analytics.management.commands.backfill_daily_metrics"
 )
 
 START = date(2026, 6, 10)
+
+#: `compute_day` -- which every shard and `--inline` day now goes through --
+#: always calls `_upsert_daily_metric(day_start, day_end, only=only)` and
+#: feeds the return value to `record_day_result`, which reads `.core_ok`,
+#: `.failed` and `.status.value` off it. A bare mock of `_upsert_daily_metric`
+#: must therefore return a real `DayResult`, not `unittest.mock`'s default
+#: `MagicMock` -- every `UPSERT_TARGET` patch below returns or produces one.
+DONE_RESULT = DayResult(status=DayStatus.DONE, core_ok=True, failed=())
 
 
 def _dates(n: int, start: date = START) -> list[date]:
@@ -55,7 +64,7 @@ def _clear_backfill_keys() -> None:
     redis.delete(*keys)
 
 
-class BackfillRedisMixin:
+class BackfillRedisMixin(SettledGateMixin):
     def setUp(self):
         super().setUp()
         _clear_backfill_keys()
@@ -75,7 +84,7 @@ class TestSequentialChunks(BackfillRedisMixin, TestCase):
         seen: list[date] = []
         violations: list[str] = []
 
-        def recording_upsert(day_start, day_end):
+        def recording_upsert(day_start, day_end, **kwargs):
             day = day_start.date()
             seen.append(day)
             run_id = latest_backfill_run_id()
@@ -84,7 +93,7 @@ class TestSequentialChunks(BackfillRedisMixin, TestCase):
             running = [i for i, s in enumerate(states) if s == "running"]
             if len(running) != 1:
                 violations.append(f"{day}: running chunks={running}")
-                return
+                return DONE_RESULT
             current = running[0]
             if any(s != "done" for s in states[:current]):
                 violations.append(f"{day}: earlier chunk not done {states}")
@@ -92,6 +101,7 @@ class TestSequentialChunks(BackfillRedisMixin, TestCase):
                 violations.append(f"{day}: later chunk already started {states}")
             if day.isoformat() not in run["chunks"][current]["days"]:
                 violations.append(f"{day}: not in running chunk {current}")
+            return DONE_RESULT
 
         with patch(UPSERT_TARGET, side_effect=recording_upsert):
             run = start_backfill_run(dates, chunk_days=2)
@@ -128,7 +138,7 @@ class TestSequentialChunks(BackfillRedisMixin, TestCase):
         )
 
     def test_chunk_days_zero_is_a_single_chunk(self):
-        with patch(UPSERT_TARGET):
+        with patch(UPSERT_TARGET, return_value=DONE_RESULT):
             run = start_backfill_run(_dates(5), chunk_days=0)
         self.assertEqual(run["chunk_count"], 1)
         self.assertEqual(run["chunk_days"], 5)
@@ -141,7 +151,7 @@ class TestPerChunkKeysAndAggregate(BackfillRedisMixin, TestCase):
 
     def test_each_chunk_writes_its_own_key(self):
         dates = _dates(5)
-        with patch(UPSERT_TARGET):
+        with patch(UPSERT_TARGET, return_value=DONE_RESULT):
             run = start_backfill_run(dates, chunk_days=2, run_id="test-run")
 
         self.assertEqual(run["run_id"], "test-run")
@@ -174,9 +184,10 @@ class TestPerChunkKeysAndAggregate(BackfillRedisMixin, TestCase):
         dates = _dates(6)
         bad = {dates[1], dates[4]}
 
-        def flaky_upsert(day_start, day_end):
+        def flaky_upsert(day_start, day_end, **kwargs):
             if day_start.date() in bad:
                 raise RuntimeError(f"boom {day_start.date()}")
+            return DONE_RESULT
 
         with patch(UPSERT_TARGET, side_effect=flaky_upsert):
             run = start_backfill_run(dates, chunk_days=3)
@@ -191,7 +202,9 @@ class TestPerChunkKeysAndAggregate(BackfillRedisMixin, TestCase):
             sorted(f["date"] for f in run["failures"]),
             ["2026-06-11", "2026-06-14"],
         )
-        self.assertIn("boom", run["failures"][0]["error"])
+        # The shard never puts an exception's text in the result -- only its
+        # class name -- so a failure's own message never surfaces here.
+        self.assertIn("RuntimeError", run["failures"][0]["error"])
         self.assertIsNotNone(run["started_at"])
         self.assertIsNotNone(run["finished_at"])
         self.assertEqual([c["failed"] for c in run["chunks"]], [1, 1])
@@ -204,7 +217,7 @@ class TestPerChunkKeysAndAggregate(BackfillRedisMixin, TestCase):
         run["chunks"][0]["state"] = "running"
         _save_backfill_run(run)
 
-        with patch(UPSERT_TARGET):
+        with patch(UPSERT_TARGET, return_value=DONE_RESULT):
             summary = backfill_done(
                 [None, {"date": "2026-06-11", "ok": True}],
                 stats_key=run["chunks"][0]["key"],
@@ -223,7 +236,7 @@ class TestPerChunkKeysAndAggregate(BackfillRedisMixin, TestCase):
         self.assertIsNotNone(run["finished_at"])
 
     def test_standalone_dispatch_backfill_keeps_legacy_cursor_summary(self):
-        with patch(UPSERT_TARGET):
+        with patch(UPSERT_TARGET, return_value=DONE_RESULT):
             dispatch_backfill(_dates(2))
         summary = get_redis().get(BACKFILL_CURSOR_KEY)
         self.assertIsNotNone(summary)
@@ -237,11 +250,15 @@ class TestWaitViaRedis(BackfillRedisMixin, TestCase):
     result is dropped under CELERY_IGNORE_RESULT=True. The command now
     detects completion by the chunk summary key appearing in Redis."""
 
-    def _start_without_executing(self, dates, chunk_days, run_id=None):
+    def _start_without_executing(
+        self, dates, chunk_days, run_id=None, skip_settle_check=False
+    ):
         """Stand-in for `start_backfill_run` that writes the manifest with
         chunk 0 running but never executes anything — like a real broker
         where the worker hasn't picked the chord up yet."""
-        run = build_backfill_run(dates, chunk_days, run_id=run_id)
+        run = build_backfill_run(
+            dates, chunk_days, run_id=run_id, skip_settle_check=skip_settle_check
+        )
         run["chunks"][0]["state"] = "running"
         run["chunks"][0]["dispatched_at"] = timezone.now().isoformat()
         _save_backfill_run(run)
@@ -352,7 +369,7 @@ class TestWaitViaRedis(BackfillRedisMixin, TestCase):
 
 class TestStatusAndFailedOnly(BackfillRedisMixin, TestCase):
     def test_status_prints_latest_and_explicit_run(self):
-        with patch(UPSERT_TARGET):
+        with patch(UPSERT_TARGET, return_value=DONE_RESULT):
             start_backfill_run(_dates(3), chunk_days=2, run_id="status-run")
 
         out = StringIO()
@@ -380,9 +397,12 @@ class TestStatusAndFailedOnly(BackfillRedisMixin, TestCase):
         now = timezone.now()
         complete, stale, missing = _dates(3)
         DailyMetric.objects.create(
-            date=complete, computed_at=now, multisig_txs_via_api=0
+            date=complete,
+            computed_at=now,
+            core_completed_at=now,
+            completed_at=now,
         )
-        DailyMetric.objects.create(date=stale, computed_at=now)  # split NULL
+        DailyMetric.objects.create(date=stale, computed_at=now)  # completed_at NULL
         self.assertEqual(
             select_failed_days([complete, stale, missing]), [stale, missing]
         )
@@ -392,15 +412,20 @@ class TestStatusAndFailedOnly(BackfillRedisMixin, TestCase):
         now = timezone.now()
         complete, stale, missing = _dates(3)
         DailyMetric.objects.create(
-            date=complete, computed_at=now, multisig_txs_via_api=1
+            date=complete,
+            computed_at=now,
+            core_completed_at=now,
+            completed_at=now,
         )
-        DailyMetric.objects.create(date=stale, computed_at=now)
+        DailyMetric.objects.create(date=stale, computed_at=now)  # completed_at NULL
         touched: list[date] = []
         out = StringIO()
-        with patch(
-            f"{COMMAND_MODULE}._upsert_daily_metric",
-            side_effect=lambda s, e: touched.append(s.date()),
-        ):
+
+        def _record_and_ok(day_start, day_end, **kwargs):
+            touched.append(day_start.date())
+            return DONE_RESULT
+
+        with patch(UPSERT_TARGET, side_effect=_record_and_ok):
             call_command(
                 "backfill_daily_metrics",
                 start=complete.isoformat(),
@@ -415,7 +440,9 @@ class TestStatusAndFailedOnly(BackfillRedisMixin, TestCase):
     def test_failed_only_nothing_to_do(self):
         now = timezone.now()
         d = START
-        DailyMetric.objects.create(date=d, computed_at=now, multisig_txs_via_api=0)
+        DailyMetric.objects.create(
+            date=d, computed_at=now, core_completed_at=now, completed_at=now
+        )
         out = StringIO()
         with patch(f"{COMMAND_MODULE}.start_backfill_run") as start_mock:
             call_command(

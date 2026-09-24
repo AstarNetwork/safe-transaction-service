@@ -1930,3 +1930,450 @@ live activity the rollup does not know about, so the two sources give
 different numbers and a regression fails on the value too); a cold rollup
 still uses the live path; and a rollup whose only row predates the window is
 cold for that window.
+
+---
+
+# Analytics catch-up
+
+Self-healing for `DailyMetric`: a day skipped by a DB/worker failure, or
+computed before the indexer actually reached it, is retried automatically
+instead of staying a silent hole. This section covers days. Snapshots
+(`summary` / `safe_segments` / `tvl`) get the same treatment and are
+covered in their own subsection below. It all lives in the new
+`analytics/catchup/` package (`__init__.py`, `day.py`, `gate.py`,
+`state.py`, `sweeper.py`, with `conf.py` as a sibling module) plus targeted
+edits to `tasks.py`, `tasks_shards.py`, `models.py`, a new `admin.py`, and
+one beat entry in `history/management/commands/setup_service.py`. Every
+code comment that points a reader here says `"Analytics catch-up" in
+analytics/implementation-notes.md` — that string is why this heading is
+exactly these two words.
+
+## Completion marks and what each gates
+
+`DailyMetric` gets two new nullable columns:
+
+- `core_completed_at` — the core aggregate (`_compute_daily_metric_core`)
+  and the `tx_volume` populator both succeeded, i.e. every column
+  `DailyMetric` itself exposes is trustworthy. This is the **read** gate:
+  `AnalyticsService.get_tx_volume` filters on it for both its scalar sum
+  and its `breakdown=day` series — a day that fails this stays out of
+  `/tx-volume/` entirely, which lowers the sum unless the caller also reads
+  `coverage_days`, which drops by exactly the excluded days. That is how
+  the under-count is disclosed rather than hidden; no alert and no
+  `source` field are involved.
+- `completed_at` — core **and all six** populators succeeded. This is the
+  **retry** gate: only the sweeper reads it, via `select_failed_days` — any
+  day without `completed_at`, whatever the reason, is "not done yet".
+
+A populator unrelated to `/tx-volume/` (`safe_app_txs`, `safe_creations`)
+failing leaves `core_completed_at` set and `completed_at` NULL:
+`/tx-volume/` serves the day normally while the sweeper keeps retrying just
+that populator. **This only touches `/tx-volume/`.** `/token-volume/`,
+`/active-safes/`, `/active-owners/`, `/safe-creations/` and
+`/multisig-transactions/by-origin/` read their own rollup tables
+(`DailyTokenVolume`, `DailyActiveSafe`, `DailyActiveOwner`,
+`DailySafeCreation`, `DailySafeAppTx`) directly and know nothing about
+either mark — a populator that fails partway through a day leaves that
+rollup partially written, and those five endpoints serve the partial rows,
+without `coverage_days` or any other disclosure, until a retry succeeds or
+the day gives up. Filtering those five by the day's marks was explicitly
+kept out of scope here.
+
+Both marks are cleared, never merely overwritten, as the *first*,
+separately committed step of any run that touches the core
+(`_upsert_daily_metric` — a plain `UPDATE` outside any transaction the rest
+of the function opens, plus `reset_core_ok` on the day's
+`AnalyticsCatchupState` row if one exists). A full recompute that dies
+partway therefore leaves the day looking "not computed" rather than
+"complete but partially rewritten" — readers never trust a half-updated row.
+
+**Honest zero.** `_compute_daily_metric_core`'s `start_block is None`
+branch only runs once the settle gate has already passed for the day, so
+"no blocks in the window" now means genuine inactivity, not "not indexed
+yet". It writes real zeros, including `multisig_txs_via_api = 0` /
+`multisig_txs_indexed_only = 0` (previously left `NULL`, with a comment
+claiming a "cron" would revisit it — that comment was wrong and is gone).
+This zero is **final**: nothing about a later reindex causes the sweeper to
+revisit the day, because `completed_at` is already set. The only way to
+force a recompute is `backfill_daily_metrics --start D --end D` without
+`--failed-only`. Worth restating because it is easy to read backwards:
+`via_api = 0` on a quiet chain reads on the hub dashboard as "API
+attribution complete" (`api_attribution_coverage_days` counts it), which is
+correct — zero executed txs means zero to attribute — but looks, at a
+glance, like the opposite of what "zero" usually signals.
+
+## The settle gate
+
+`ensure_day_settled(day, status)`, in `catchup/gate.py`, is a pure function
+over one already-fetched `IndexerStatus` snapshot — no I/O, no clock read,
+so every day a run checks is judged against the same indexer position. A
+day passes only if **both** hold:
+
+1. **indexed** — `status.position_ts` (the slower of the ERC20 and
+   master-copies indexer pipelines) is at or past `day_end + SETTLE_MINUTES`.
+   Otherwise `DayNotReady("day_not_ready")`.
+2. **processed** — no `InternalTxDecoded(processed=False)` row has an
+   internal-tx timestamp before `day_end`. Otherwise
+   `DayNotReady("processing_pending")`. This is the condition that keeps a
+   day from getting `core_completed_at` on data indexed but not yet turned
+   into `MultisigTransaction` / `SafeContract` rows by
+   `process_decoded_internal_txs_task`.
+
+`get_indexer_status()`, also in `catchup/gate.py`, fetches that snapshot
+once per run: the existing `IndexService.get_indexing_status()` call plus
+exactly one extra query — the oldest `InternalTxDecoded(processed=False)`
+row, ordered by timestamp — for that row and its Safe address. Any failure
+collapses to one of three fixed codes (`DAY_NOT_READY`,
+`PROCESSING_PENDING`, `INDEXER_STATUS_UNAVAILABLE`), and `get_indexer_status`
+itself raises the third `from None` so an RPC error's text (node URL, API
+key) never rides along in a log line, a shard's returned dict, or a
+backfill manifest.
+
+## `compute_day` — the single entry point
+
+`compute_day(day, status, *, only=None, skip_settle_check=False)`, in
+`catchup/day.py`, is the one function the nightly task, a backfill shard,
+`--inline` backfill and the sweeper all call to compute or retry a day. It
+runs the gate (unless `skip_settle_check`), then defers to
+`_upsert_daily_metric` for the actual populator run, and finally persists
+the outcome onto the day's `AnalyticsCatchupState` row via
+`record_day_result` if the sweeper has one for it (a day the sweeper has
+never seen — e.g. the nightly task's normal run on yesterday — has nothing
+to update). `status is None` means the caller already caught
+`DayNotReady(INDEXER_STATUS_UNAVAILABLE)` once this run; without
+`skip_settle_check` that defers the day exactly like a per-day gate
+failure, without spending a state row's attempt where one exists.
+
+`only`, a subset of `POPULATORS` (`active_safes`, `active_owners`,
+`token_volume`, `tx_volume`, `safe_app_txs`, `safe_creations`), retries
+just those populators on a day that already has a `DailyMetric` row; a full
+run (`only=None`) always reclears and reruns the core. `only ∩
+CORE_INPUTS` (`{active_safes, active_owners}`) forces the core to rerun
+too, because it reads its `active_safes_daily` / `active_owners_daily`
+counts from those two rollups — retrying either alone without the core
+would leave the core's own counters stale. `_upsert_daily_metric` raises
+`ValueError` for an unknown populator name, an empty `only`, or `only` on a
+day with no existing `DailyMetric` row at all.
+
+## The hourly sweeper
+
+`analytics_catchup_task` is a thin `@app.shared_task` wrapper with an
+explicit `name="safe_transaction_service.analytics.tasks.
+analytics_catchup_task"` — it has to live in `tasks.py`, not in the
+`catchup` package, because Celery's `autodiscover_tasks()` only scans
+`<app>.tasks` and the `analytics.tasks.*` → `contracts` queue route matches
+on registered name, not on defining module. It runs hourly at `:20`, one
+`CeleryTaskConfiguration` in `setup_service.py` (`cron=CronDefinition
+(minute=20)`), after the 01:00 nightly task. It takes the *same* lock the
+nightly task uses (`only_one_running_task(compute_daily_metrics_task,
+lock_timeout=LOCK_TIMEOUT * 4 + 300)`), so the two can never race the same
+`DailyMetric` row; a skip logs INFO `analytics.catchup:
+skipped_reason=locked`. The wrapper itself does nothing else — locking and
+the `ENABLE_ANALYTICS` check live here, and `catchup.run_catchup()` does
+the actual work, one pass, in this order:
+
+1. Read settings — `ImproperlyConfigured` aborts the whole run with ERROR
+   `analytics.catchup.bad_config` and **no** summary line (the missing-line
+   alert is the signal).
+2. Fetch `get_indexer_status()` once, reused below.
+3. **Catch up days.** Skip entirely (`skipped_reason="backfill"`) if a live
+   Celery backfill run overlaps the window. Otherwise: candidate days are
+   `[today-WINDOW_DAYS, today-1]` without `completed_at`, not older than
+   the instance's first `DailyMetric` row; a bare `AnalyticsCatchupState`
+   row is created for each new candidate (this is what makes it eligible
+   for `expired` later). Then, in order: exclude days at `attempts >=
+   MAX_ATTEMPTS` (logging `gave_up` once per day); exclude days whose
+   `next_attempt_at` hasn't arrived; run the gate on what's left (a gate
+   failure costs no attempt, just an `analytics.daily.deferred` log and a
+   `last_state` update); take the oldest `MAX_DAYS_PER_RUN` (default 1)
+   that passed. For each selected day, bump its attempt counter — a
+   separately committed `UPDATE … RETURNING attempts` — *before* calling
+   `compute_day`, so a crash mid-compute (including a `BaseException`)
+   still counts the attempt. `only=failed_steps` is passed when the state
+   row says `core_ok` and lists failed populators; otherwise it's a full
+   recompute.
+4. Check the stuck-processing watchdog (same status snapshot as step 2).
+5. Check for days that fell out of the window without ever completing.
+6. Prune `kind="day"` state rows older than two windows.
+7. Log the one summary line, INFO `analytics.catchup: days_fixed=[…]
+   days_deferred=[…] days_incomplete=[…] days_given_up=[…] days_expired=[…]
+   skipped_reason=…` — every path through `run_catchup` except step 1's
+   failure reaches this line, which is the "sweeper is alive" heartbeat an
+   operator/alert reads.
+
+**Attempts and backoff.** `record_attempt` sets `next_attempt_at = now +
+2**(n-1)` hours for attempt `n`, so attempts 1..5 (the default
+`MAX_ATTEMPTS`) land 1, 2, 4, 8 hours apart — the fifth at least 15h after
+the first, comfortably inside a 14-day window. `only=` retries are decided
+by the state row's **`core_ok`** field, not by whether `core_completed_at`
+is set on `DailyMetric` — see divergences below for why that distinction
+matters.
+
+**`gave_up` / `expired` / `processing_stuck`** are one-time markers, each a
+`gave_up_logged_at` / `expired_logged_at` / `stuck_logged_at` column on
+`AnalyticsCatchupState`, set with `UPDATE … WHERE <column> IS NULL` and
+logged only when that update's `rowcount == 1` (`mark_gave_up`,
+`mark_expired_once`, `mark_processing_stuck_once`, all in
+`catchup/state.py`). Because the table is Postgres, not Redis, these
+markers — and the attempt counter and backoff timer next to them — survive
+a Redis flush; an alert that already fired does not fire again just
+because the cache was cleared. `expired` scans
+`[today-WINDOW_DAYS-3, today-WINDOW_DAYS-1]` but only reports days that
+have a `kind="day"` state row — a day the sweeper genuinely never saw
+(first deploy, or an instance younger than the window) is silently
+excluded rather than reported as a false `expired`. `processing_stuck`
+fires once when the *value* of `status.oldest_unprocessed_ts` (stored in
+`observed_value` as a Unix timestamp — see divergences) hasn't changed
+**and** the count of unprocessed rows hasn't dropped for
+`PROCESSING_STUCK_HOURS`; an empty queue in a single run resets nothing and
+logs nothing, which is deliberate — it keeps upstream's `fix_out_of_order`
+reshuffle from flickering the marker.
+
+## Settings — `conf.py`
+
+`get_catchup_settings()` reads `environ.Env()` and validates on **first
+call only**, cached via `functools.cache`; importing `analytics` or
+running `django.setup()` never triggers it, because `ENABLE_ANALYTICS`
+alone would leave analytics permanently in `INSTALLED_APPS` and a typo'd
+env var would otherwise take the whole tx-service down at boot. Every
+caller is analytics code: `run_catchup`, `compute_day` (indirectly, through
+`ensure_day_settled`), `get_indexer_status`, and the
+`analytics_settle_status` / `backfill_daily_metrics` commands. A bad value
+raises `ImproperlyConfigured("analytics: invalid value for <VAR_NAME>")` —
+the variable name only, never its value — and `run_catchup` turns that into
+ERROR `analytics.catchup.bad_config setting=<VAR> reason=invalid_value`
+with no summary line that run.
+
+| Env | Default | Constraint |
+|---|---|---|
+| `ANALYTICS_DAY_SETTLE_MINUTES` | 30 | ≥ 0 |
+| `ANALYTICS_CATCHUP_WINDOW_DAYS` | 14 | ≥ 2 |
+| `ANALYTICS_CATCHUP_MAX_DAYS_PER_RUN` | 1 | ≥ 1 |
+| `ANALYTICS_CATCHUP_MAX_ATTEMPTS` | 5 | ≥ 1, and `2**(MAX_ATTEMPTS-1) - 1 < WINDOW_DAYS * 24` |
+| `ANALYTICS_CATCHUP_BACKFILL_STALE_HOURS` | 6 | ≥ 1 |
+| `ANALYTICS_CATCHUP_PROCESSING_STUCK_HOURS` | 6 | ≥ 1 |
+| `ANALYTICS_CATCHUP_SNAPSHOT_STALE_HOURS` | 26 | ≥ 1 |
+
+The last row is already read and validated (`CatchupSettings` carries all
+seven fields), but nothing consumes it until the snapshot sweeper lands.
+
+## Divergences from the original design
+
+- **Backfill liveness heartbeat is a separate Redis key, not a manifest
+  field.** The run manifest has exactly one writer (the chunk chord's
+  callback); a shard writing `heartbeat_at` into it directly would race
+  that writer and lose updates. Instead `compute_daily_metric_shard` writes
+  `backfill_heartbeat_key(run_id)` (same TTL as the manifest) at start and
+  finish, and the sweeper's `_backfill_is_live` reads that key first,
+  falling back to the manifest's `started_at` for runs dispatched before
+  this deploy (no `run_id`, so no heartbeat at all).
+- **"No relevant master copies" is its own check, not folded into "no
+  `IndexingStatus` row."** `get_indexer_status` does
+  `SafeMasterCopy.objects.relevant().count()` before calling
+  `get_indexing_status()`, because upstream silently substitutes the chain
+  head and reports "synced" when there are no relevant master copies
+  (`IndexService.get_master_copies_indexing_status`,
+  `history/services/index_service.py:131-141` — `Min(...)` over an empty
+  queryset is `None`, so `master_copies_block_number` falls back to
+  `current_block_number` and the synced check trivially passes). Without
+  this separate check an instance with no master copies would pass the
+  gate every day.
+- **`ENABLE_ANALYTICS=False` now silences the sweeper and the nightly
+  task.** Previously the flag only gated the URLs; `setup_service`
+  registers both beat tasks on every instance regardless. Both now check
+  the flag first and exit with a fixed INFO line
+  (`analytics.daily.skipped_disabled` / `analytics.catchup:
+  skipped_reason=analytics_disabled`) **without** calling
+  `get_catchup_settings()` — so a bad catch-up env var on a
+  `ENABLE_ANALYTICS=False` instance is invisible, by design.
+- **`core_ok` is a field, written only by `compute_day`.** Added to
+  `AnalyticsCatchupState` (nullable bool) so a retry decides whether to
+  pass `only=failed_steps` by reading this field, not by checking
+  `DailyMetric.core_completed_at` directly. Whichever caller invokes
+  `compute_day` — nightly task, shard, `--inline`, sweeper — writes
+  `core_ok` and `failed_steps` together, inside `_upsert_daily_metric`; the
+  sweeper only ever reads them. This stops a manual full backfill's
+  failures from silently diverging from what the sweeper thinks failed:
+  without it, a day stuck failing `tx_volume` (which blocks
+  `core_completed_at`) would get a full recompute five times a day instead
+  of one retry of just the broken populator.
+- **`processing_stuck` tracks the oldest row's *timestamp*, not its
+  primary key.** `observed_value` (a `BigIntegerField`) stores
+  `int(status.oldest_unprocessed_ts.timestamp())`, reusing the one value
+  `get_indexer_status()` already fetched rather than adding a second query
+  for the row's id — `get_indexer_status()` stays at exactly one
+  `InternalTxDecoded` query. `observed_count` (a new field) is a separate
+  `COUNT` the sweeper runs on top of it; the reset rule is "the id changed,
+  or the count dropped below the stored minimum" — a same-id,
+  non-decreasing count keeps the clock running.
+- **`catchup` is a package,** `analytics/catchup/{__init__,gate,day,state,
+  sweeper}.py` (a `snapshots.py` module joins it for the snapshot sweeper),
+  not the single `catchup.py` module first sketched. `__init__.py`
+  re-exports the public names; every module in the package imports `tasks`
+  lazily, inside function bodies only — `tasks.py` imports `catchup` at
+  module level (it needs `compute_day`), so a module-level import back
+  would be circular.
+- **The nightly task skips days already `completed_at`.**
+  `compute_daily_metrics_task` checks `DailyMetric.objects.filter(date=day,
+  completed_at__isnull=False).exists()` before touching a day, counting it
+  in `days_skipped_done`. This task also serves as the cold-read path
+  behind `/active-safes/` and `/active-owners/`, so with `SETTLE_MINUTES`
+  small the sweeper could compute "yesterday" at `:20` before the 01:00
+  cron gets to it; without the skip, the 01:00 run would clear that day's
+  marks and hide it from `/tx-volume/` for the duration of a needless
+  recompute.
+- **An unreadable backfill cursor reads as "no live backfill."** Any shape
+  `_backfill_is_live` can't extract a `run_id` and a manifest from —
+  including the legacy standalone `dispatch_backfill()`'s bare
+  chunk-summary blob at the same Redis key — is treated as absence, not as
+  an error to special-case.
+
+## Operator recipes
+
+- **`python manage.py analytics_settle_status`** — read-only: indexer
+  positions (ERC20, master copies, relevant count), the oldest unprocessed
+  row, the gate's latest-passing / first-failing day and why, every window
+  day's marks + attempts + `next_attempt_at` + `failed_steps` +
+  gave_up/expired flags, the processing watchdog row, and whether
+  `get_catchup_settings()` currently validates. Never prints a node URL or
+  raw RPC text; unexpected failures are reported by exception class name
+  only.
+- **`backfill_daily_metrics --start D --end D`** (no `--failed-only`) is a
+  full recompute and the *only* way to fix an `expired` day or revisit an
+  honest zero — the sweeper never touches a day once it has `completed_at`.
+- **`--failed-only`** restricts a range to days without `completed_at` —
+  works in both Celery and `--inline` mode, and is what `select_failed_days`
+  is for.
+- **`--skip-settle-check`** bypasses the gate for an explicit range known
+  to be fully indexed; every skipped day logs WARNING
+  `analytics.daily.settle_check_skipped day=… by=backfill`. Not a routine
+  flag — a day computed this way gets `completed_at` on possibly-partial
+  data and the sweeper will never revisit it.
+- **Don't run a long `--inline` backfill on a large chain while the
+  sweeper is active.** Only the most recent Celery-mode run is visible to
+  the sweeper (via its manifest); `--inline` writes no manifest at all, so
+  the sweeper has no way to know one is in flight and could pick the same
+  day. Safe in the sense that populators are idempotent upserts, but
+  wasteful, and noted in `--help`.
+
+**Log literals the alerts key on** — keep these spellings stable:
+`analytics.catchup:` (the one summary line, INFO, every `run_catchup` pass
+except a `bad_config` abort — it also carries `snapshots_dispatched=[…]
+snapshots_given_up=[…]`, see "Snapshots" below), `analytics.catchup.gave_up`
+(fires with `day=<date>` for a day and with `snapshot=<name>` for a
+snapshot), `analytics.catchup.expired`, `analytics.catchup.processing_stuck`,
+`analytics.catchup.bad_config`, `analytics.catchup.stale_backfill` (all
+ERROR except the last, which is WARNING); `analytics.daily.deferred`
+(WARNING), `analytics.daily.skipped_locked` / `analytics.daily.
+skipped_disabled` (INFO), `analytics.daily.settle_check_skipped` (WARNING).
+These are dotted-style (`analytics.foo.bar`) rather than `tasks.py`'s usual
+`func_name: message` convention, matching the one dotted precedent already
+in the app (`analytics.rollup.cold_window`) — deliberate, because Grafana
+alerts match on the literal string and existing logs were left alone.
+
+## Known limitations
+
+- **gevent `Timeout` can outlive the lock.** `only_one_running_task`'s
+  context manager can be unwound by a gevent `Timeout` while the underlying
+  SQL keeps running server-side until `relaxed_statement_timeout` (30 min).
+  A second writer for the same day is possible in that window. Not fixed —
+  `utils/tasks.py` is out of scope — and not harmful beyond wasted work and
+  an extra attempt, because every populator upsert is idempotent.
+- **A long `--inline` backfill is invisible to the sweeper**, as above —
+  documented, not solved; the sweeper could in principle pick the same day
+  a running `--inline` backfill is on, again safe only because of
+  idempotency.
+- **Partial rollups on the five non-`tx-volume` endpoints during a failed
+  populator.** As covered above, `/token-volume/`, `/active-safes/`,
+  `/active-owners/`, `/safe-creations/` and `/by-origin/` have no
+  equivalent of `core_completed_at` filtering and will serve whatever rows
+  a partially-failed populator managed to write until a retry succeeds or
+  the day gives up — with no `coverage_days`-style disclosure on those
+  five. Extending the mark-based filter to them was explicitly left out of
+  scope here.
+
+## Migration `0009`
+
+One migration adds both `DailyMetric` columns, creates
+`AnalyticsCatchupState`, and backfills existing `DailyMetric` rows: every
+row gets `core_completed_at = completed_at = computed_at` **except** rows
+with `date >= CATCHUP_MIGRATION_CUTOFF` (a constant, `date(2026, 9, 22)` —
+the day of the incident that motivated this whole mechanism) **and**
+`multisig_txs_via_api IS NULL` (the marker, carried over from migration
+`0007`, for "the tx-volume populator never actually ran for this row") —
+those are left with both columns NULL so the sweeper picks them up as
+catch-up candidates instead of trusting a stale zero. See
+`backfill_catchup_columns` in that migration file for the exact query. The
+cutoff is a literal in the migration file, not `timezone.now()` or an env
+var, so re-running or inspecting the migration gives the same answer
+regardless of when or where it runs. Reverse is a no-op for data — nothing
+to undo beyond the schema reversal itself.
+
+## Snapshots
+
+`summary`, `safe_segments` and `tvl` are `AnalyticsSnapshot` rows, computed
+by their own tasks (`compute_summary_task` / `compute_safe_segments_task` /
+`compute_tvl_task`) rather than by anything in `catchup/day.py` — a snapshot
+has no `compute_day`-style shared entry point; the nightly beat schedule and
+the sweeper both just call one of the three existing tasks. `sweep_snapshots`
+(`catchup/snapshots.py`), called from `run_catchup` after the day catch-up,
+the processing-stuck check and the expired check, walks the three names in
+a fixed order and dispatches at most one refresh per name per pass.
+
+**Staleness.** `is_snapshot_stale(name, stale_hours, now)` — public, also
+used by `warm_analytics_cache` below — treats a name as stale when there is
+no `AnalyticsSnapshot` row at all, or `computed_at` is older than
+`SNAPSHOT_STALE_HOURS` (default 26h, `conf.py`); for `tvl` specifically it's
+also stale when `payload["native_source"] is None`, the placeholder
+`compute_tvl_task` writes before dispatching its finalize chord. A normal
+rollup run can legitimately write `partial_shards`/`total_shards` of `0`/`0`
+too, so that pair alone isn't the discriminator — only `native_source is
+None` is.
+
+**The in-flight mark.** Each of the three tasks sets
+`analytics:snapshot:dispatched:<name>` (`SET … EX 10800`, 3h) themselves, at
+the very start of a run, regardless of whether beat or the sweeper triggered
+it. This exists because `compute_tvl_task` releases its own
+`only_one_running_task` lock right after dispatching the finalize chord, not
+when the chord itself finishes reducing — without a separate mark the
+sweeper would see that lock free and dispatch a second TVL run while the
+first chord is still reducing. The sweeper never dispatches while the mark
+is set, and when it does dispatch, claims the mark itself first via `SET
+NX` — closing the race against a task whose own start-of-run mark lands in
+between the sweeper's check and its dispatch. A set `refresh_lock`
+(`analytics_snapshot:<name>:refresh_lock`, the cold-read path's own SETNX
+lock in `AnalyticsService._maybe_dispatch_refresh`, 30 min TTL) blocks a
+dispatch the same way — also read as "something is already refreshing
+this."
+
+**Attempts and backoff.** `AnalyticsCatchupState(kind="snapshot", key=name)`
+is the sweeper's own bookkeeping for a snapshot, entirely separate from the
+in-flight mark and never touched by the tasks themselves. Same backoff
+formula as a day's row — `2**(n-1)` hours per attempt, bumped in one commit
+before the dispatch — and the same one-time marker pattern for giving up,
+logged once as ERROR `analytics.catchup.gave_up snapshot=<name>
+attempts=<n>`. Unlike a day, a snapshot row older than 24h that still isn't
+fresh gets `attempts`, the backoff timer and the `gave_up` marker reset
+together — new day, new attempts — rather than staying given up
+permanently, so a stably broken `finalize_tvl_snapshot` costs at most
+`MAX_ATTEMPTS` TVL runs a day, not just once ever. A snapshot that turns
+fresh again has its bookkeeping row deleted outright, the same as a day that
+completes.
+
+**Summary line.** `run_catchup`'s one INFO summary line carries
+`snapshots_dispatched=[…] snapshots_given_up=[…]` alongside the day fields
+— see the log-literals list above. `sweep_snapshots` runs unconditionally
+on every pass, including one where the day catch-up itself was skipped
+(locked, a live backfill, `ENABLE_ANALYTICS=False` never reaches this far at
+all) — none of those reasons involve the snapshot tasks.
+
+**`warm_analytics_cache --skip-if-fresh`.** Used to check whether a Redis
+key (`AnalyticsService.REDIS_SUMMARY` / `REDIS_SAFE_SEGMENTS` / `REDIS_TVL`)
+held a payload newer than `--fresh-window-hours` — those keys are never
+written by anything in the app any more, so the check never actually
+skipped these three. It now calls `is_snapshot_stale` with
+`SNAPSHOT_STALE_HOURS`, the same rule the sweeper uses, so the command and
+the sweeper never disagree about whether one of the three needs a refresh.
+The other tasks the command dispatches (`active_safes`, `active_owners`,
+`transactions_per_safe_app`, `native_balance_rollup`, `safe_creations`) are
+unchanged — still probed against their own cached Redis payload.

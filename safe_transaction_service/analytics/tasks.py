@@ -24,6 +24,25 @@ from redis.exceptions import LockError
 # Side-effect import; intentional. Keep ordering after `LOCK_TIMEOUT` so
 # everything `tasks_shards` depends on is in scope.
 from safe_transaction_service.analytics import tasks_shards  # noqa: F401
+from safe_transaction_service.analytics.catchup.day import (
+    CORE_INPUTS,
+    POPULATORS,
+    DayResult,
+    DayStatus,
+    compute_day,
+)
+from safe_transaction_service.analytics.catchup.gate import (
+    DayNotReady,
+    get_indexer_status,
+)
+from safe_transaction_service.analytics.catchup.snapshots import (
+    mark_snapshot_dispatched,
+)
+from safe_transaction_service.analytics.catchup.state import (
+    get_day_state,
+    reset_core_ok,
+)
+from safe_transaction_service.analytics.catchup.sweeper import run_catchup
 from safe_transaction_service.analytics.models import (
     AnalyticsSnapshot,
     AnalyticsWatermark,
@@ -331,6 +350,10 @@ def compute_summary_task(self):
     """
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
+            # In-flight mark for the snapshot sweeper (`catchup/snapshots.py`)
+            # -- set here, at the very start, regardless of whether beat or
+            # the sweeper triggered this run.
+            mark_snapshot_dispatched("summary")
             started = time.time()
             logger.info("compute_summary_task: starting")
             try:
@@ -745,6 +768,9 @@ def compute_safe_segments_task(self):
     """
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
+            # In-flight mark for the snapshot sweeper -- see
+            # `compute_summary_task`.
+            mark_snapshot_dispatched("safe_segments")
             started = time.time()
             logger.info("compute_safe_segments_task: starting")
             now = timezone.now()
@@ -813,6 +839,12 @@ def compute_tvl_task(self):
                 dispatch_tvl_finalize,
             )
 
+            # In-flight mark for the snapshot sweeper -- see
+            # `compute_summary_task`. Set here rather than relying on this
+            # task's own `only_one_running_task` lock: that lock is released
+            # as soon as this function returns below, well before the
+            # dispatched chord/finalize actually finishes.
+            mark_snapshot_dispatched("tvl")
             started = time.time()
             logger.info("compute_tvl_task: starting")
 
@@ -1853,17 +1885,21 @@ def _compute_daily_metric_core(day_start, day_end) -> DailyMetric:
     """
     start_block, end_block = _resolve_block_window(day_start, day_end)
     if start_block is None:
-        # Day not yet indexed — write an all-zeros row so consumers can
-        # still distinguish "no data yet" via `computed_at`. The cron
-        # will re-fire on a later day and idempotently overwrite.
+        # No blocks in the window. This function only ever runs once the
+        # catch-up gate has passed for the day (`compute_day` /
+        # `ensure_day_settled` -- see "Analytics catch-up" in
+        # `analytics/implementation-notes.md`), so this is an honest zero,
+        # not "not yet indexed": a quiet network genuinely had no activity.
+        # It is also final -- a later reindex will not cause this day to be
+        # recomputed, only an explicit `backfill_daily_metrics --start D
+        # --end D` does. `multisig_txs_via_api` / `multisig_txs_indexed_only`
+        # get a real 0 here too, not NULL, so a quiet day reads as "API
+        # attribution complete" rather than "not computed".
         new_safes = 0
         multisig_txs_executed = 0
         native_value_wei = 0
-        # Nullable columns stay NULL here — "day not split" rather than a
-        # real zero, so a not-yet-indexed day can't be read as "nothing
-        # came through the proposal API".
-        multisig_txs_via_api = None
-        multisig_txs_indexed_only = None
+        multisig_txs_via_api = 0
+        multisig_txs_indexed_only = 0
     else:
         with connection.cursor() as cursor:
             cursor.execute(_METRIC_CORE_NEW_SAFES_SQL, [start_block, end_block])
@@ -2367,9 +2403,22 @@ def _safes_active_between_set(start, end) -> set[str]:
     return active
 
 
-def _upsert_daily_metric(day_start, day_end) -> DailyMetric:
-    """Run the 6-step single-day populate path: 5 narrow rollup tables
-    plus the `DailyMetric` core upsert.
+def _upsert_daily_metric(
+    day_start, day_end, *, only: tuple[str, ...] | None = None
+) -> DayResult:
+    """Run the single-day populate path -- some or all of the 6 narrow
+    rollup populators, plus the `DailyMetric` core upsert -- and report
+    what happened as a `DayResult`. Doesn't know about the catch-up gate:
+    callers that need "is this day settled yet" go through `compute_day`
+    (see "Analytics catch-up" in `analytics/implementation-notes.md`).
+
+    `only`, when given, retries a subset of `POPULATORS` instead of a full
+    run: the day must already have a `DailyMetric` row (`ValueError`
+    otherwise, along with an empty or unknown-name `only`). The core reruns
+    only when `only` overlaps `CORE_INPUTS` (`active_safes` / `active_owners`
+    -- the core reads their rollups, so retrying either without the core
+    would leave its counts stale); `only=None` is a full run and always
+    reruns the core.
 
     Population order matters: the membership populators (`active_safes`,
     `active_owners`) run FIRST so their rollups are populated before
@@ -2379,27 +2428,63 @@ def _upsert_daily_metric(day_start, day_end) -> DailyMetric:
     once for the rollup rows) — on BASE that doubles wall time.
 
     Per-populator failures are isolated so one slow / failing populator
-    does not strand the others.
+    does not strand the others; a core failure is caught here too (rather
+    than raised) so a bad day doesn't strand the whole batch caller.
+
+    A run that touches the core clears both `DailyMetric` completion marks
+    first, as an immediate, separately committed write (not inside any
+    transaction the rest of this function opens) — so a run that dies
+    partway through leaves the day looking "not computed" rather than
+    stale-but-marked-complete. The day's `AnalyticsCatchupState.core_ok` (if
+    the sweeper has a row for it) is reset the same way, for the same
+    reason: an `only=` retry that skips the core later trusts that field to
+    know whether the core is still good.
     """
-    # Time each populator so operators can localise slow chains via logs
-    # without having to ssh + py-spy. Cheap (one logger call per day per
-    # populator).
-    populator_order = (
-        ("active_safes", _compute_daily_active_safes),
-        ("active_owners", _compute_daily_active_owners),
-        ("token_volume", _compute_daily_token_volume),
-        ("tx_volume", _compute_daily_tx_volume),
-        ("safe_app_txs", _compute_daily_safe_app_txs),
-        ("safe_creations", _compute_daily_safe_creations),
-    )
-    day_label = day_start.date()
+    # Name -> populator function, keyed the same as `POPULATORS`. Built here
+    # (not module-level) so a test's `unittest.mock.patch` on the module
+    # attribute is picked up -- a module-level dict would freeze in the
+    # original function objects at import time instead.
+    populator_funcs = {
+        "active_safes": _compute_daily_active_safes,
+        "active_owners": _compute_daily_active_owners,
+        "token_volume": _compute_daily_token_volume,
+        "tx_volume": _compute_daily_tx_volume,
+        "safe_app_txs": _compute_daily_safe_app_txs,
+        "safe_creations": _compute_daily_safe_creations,
+    }
+    day = day_start.date()
+
+    if only is not None:
+        if not only:
+            raise ValueError("only must not be empty")
+        unknown = set(only) - set(POPULATORS)
+        if unknown:
+            raise ValueError(
+                f"only contains unknown populator name(s): {sorted(unknown)}"
+            )
+        if not DailyMetric.objects.filter(date=day).exists():
+            raise ValueError(f"only requires an existing DailyMetric row for {day}")
+        run_populators = tuple(name for name in POPULATORS if name in only)
+        run_core = bool(set(only) & CORE_INPUTS)
+    else:
+        run_populators = POPULATORS
+        run_core = True
+
+    if run_core:
+        DailyMetric.objects.filter(date=day).update(
+            core_completed_at=None, completed_at=None
+        )
+        reset_core_ok(day)
+
     overall_started = time.time()
     logger.info(
         "_upsert_daily_metric: starting day=%s populators=%d",
-        day_label,
-        len(populator_order),
+        day,
+        len(run_populators),
     )
-    for name, fn in populator_order:
+    failed: list[str] = []
+    for name in run_populators:
+        fn = populator_funcs[name]
         step_started = time.time()
         try:
             rows = fn(day_start, day_end)
@@ -2407,39 +2492,95 @@ def _upsert_daily_metric(day_start, day_end) -> DailyMetric:
                 "_upsert_daily_metric: rollup %s took %.2fs day=%s rows=%s",
                 name,
                 time.time() - step_started,
-                day_label,
+                day,
                 rows,
             )
         except Exception:
+            failed.append(name)
             logger.exception(
                 "_upsert_daily_metric: rollup %s failed in %.2fs day=%s",
                 name,
                 time.time() - step_started,
-                day_label,
+                day,
             )
 
-    # Core last so it can SELECT COUNT(*) from analytics_dailyactivesafe
-    # instead of re-running _safes_active_between.
-    core_started = time.time()
-    obj = _compute_daily_metric_core(day_start, day_end)
-    logger.info(
-        "_upsert_daily_metric: metric_core took %.2fs day=%s "
-        "active_safes=%d active_owners=%d multisig_txs_executed=%d "
-        "via_api=%s indexed_only=%s",
-        time.time() - core_started,
-        day_label,
-        obj.active_safes,
-        obj.active_owners,
-        obj.multisig_txs_executed,
-        obj.multisig_txs_via_api,
-        obj.multisig_txs_indexed_only,
+    if run_core:
+        # Core last so it can SELECT COUNT(*) from analytics_dailyactivesafe
+        # instead of re-running _safes_active_between.
+        core_started = time.time()
+        try:
+            obj = _compute_daily_metric_core(day_start, day_end)
+            core_ok = True
+            logger.info(
+                "_upsert_daily_metric: metric_core took %.2fs day=%s "
+                "active_safes=%d active_owners=%d multisig_txs_executed=%d "
+                "via_api=%s indexed_only=%s",
+                time.time() - core_started,
+                day,
+                obj.active_safes,
+                obj.active_owners,
+                obj.multisig_txs_executed,
+                obj.multisig_txs_via_api,
+                obj.multisig_txs_indexed_only,
+            )
+        except Exception:
+            core_ok = False
+            logger.exception(
+                "_upsert_daily_metric: metric_core failed in %.2fs day=%s",
+                time.time() - core_started,
+                day,
+            )
+    else:
+        core_ok = None  # not run this call; resolved below from prior state
+
+    if only is None:
+        # Full run: this call's own result is the whole story, nothing to
+        # carry forward.
+        effective_core_ok = core_ok
+        effective_failed = set(failed)
+    else:
+        # Partial (`only=`) retry: populators/core outside `only` weren't
+        # touched, so their standing carries forward from the last run
+        # that did touch them -- which only the day's AnalyticsCatchupState
+        # row (if any) knows. No row -> treat the core as not (yet) known
+        # good, so a retry can't silently reveal a day whose core was
+        # never actually verified.
+        prior = get_day_state(day)
+        prior_core_ok = (
+            bool(prior.core_ok) if prior and prior.core_ok is not None else False
+        )
+        effective_core_ok = core_ok if run_core else prior_core_ok
+        prior_failed = set(prior.failed_steps) if prior else set()
+        effective_failed = (prior_failed - set(only)) | set(failed)
+
+    tx_volume_ok = "tx_volume" not in effective_failed
+    all_populators_ok = not effective_failed
+
+    now = timezone.now()
+    updates = {}
+    if effective_core_ok and tx_volume_ok:
+        updates["core_completed_at"] = now
+    if effective_core_ok and all_populators_ok:
+        updates["completed_at"] = now
+    if updates:
+        DailyMetric.objects.filter(date=day).update(**updates)
+
+    status = (
+        DayStatus.DONE
+        if (effective_core_ok and all_populators_ok)
+        else DayStatus.INCOMPLETE
     )
     logger.info(
-        "_upsert_daily_metric: completed in %.2fs day=%s",
+        "_upsert_daily_metric: completed in %.2fs day=%s status=%s",
         time.time() - overall_started,
-        day_label,
+        day,
+        status.value,
     )
-    return obj
+    return DayResult(
+        status=status,
+        core_ok=effective_core_ok,
+        failed=tuple(sorted(effective_failed)),
+    )
 
 
 def _refresh_active_window_caches(now) -> None:
@@ -2504,37 +2645,73 @@ def _refresh_active_window_caches(now) -> None:
 @app.shared_task(bind=True)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT * 4)
 def compute_daily_metrics_task(self, days_back: int = 1) -> bool:
-    """Upsert `DailyMetric` rows for the last `days_back` complete UTC days
-    and refresh the rolling-window distinct active_* Redis keys.
+    """Compute (or retry) `DailyMetric` rows for the last `days_back`
+    complete UTC days through `compute_day` -- the same catch-up gate,
+    completion marks and honest-zero handling a backfill shard or the
+    sweeper get -- then refresh the rolling-window distinct active_* Redis
+    keys. See "Analytics catch-up" in `analytics/implementation-notes.md`.
 
-    Default `days_back=1` runs the previous-day metric daily. The same task
-    is invoked by the `backfill_daily_metrics` management command with a
-    larger range for one-shot history loads. Per-day try/except so a single
-    bad day doesn't strand the rest of the run.
+    Default `days_back=1` runs the previous-day metric daily. The same
+    task is invoked by the `backfill_daily_metrics` management command
+    with a larger range for one-shot history loads. Per-day try/except so
+    a single bad day doesn't strand the rest of the run. The indexer
+    status is fetched once for the whole run (`None` if unavailable) and
+    reused for every day, exactly like a backfill shard or the sweeper.
 
-    Guarded by ``only_one_running_task(self)`` so the 01:00 cron and a
-    manual ``.delay()`` (or a backfill shard for the same date range)
-    cannot race the same ``update_or_create`` and trip ``IntegrityError``
-    on the ``analytics_dailymetric`` PK.
+    Exits immediately with INFO `analytics.daily.skipped_disabled`,
+    without reading any analytics setting or touching the database, when
+    `ENABLE_ANALYTICS` is False -- every instance runs this beat task
+    regardless of that flag.
+
+    A day that already has `completed_at` is skipped outright: no gate
+    check, no populators, not counted as failed. This task doubles as the
+    cold-read path behind `/active-safes/` and `/active-owners/`, which
+    can compute "yesterday" ahead of the 01:00 cron when `SETTLE_MINUTES`
+    is small; without this skip a routine run would clear and recompute
+    an already-finished day, hiding it from `/tx-volume/` for as long as
+    that takes.
+
+    Guarded by ``only_one_running_task(self, lock_timeout=LOCK_TIMEOUT * 4
+    + 300)`` -- the same lock name and timeout the sweeper uses -- so the
+    01:00 cron, the hourly sweeper and a manual ``.delay()`` cannot race
+    the same ``DailyMetric`` row. A skip due to the lock is not silent:
+    INFO ``analytics.daily.skipped_locked``.
     """
-    with contextlib.suppress(LockError):
-        with only_one_running_task(self):
+    if not settings.ENABLE_ANALYTICS:
+        logger.info("analytics.daily.skipped_disabled")
+        return False
+
+    try:
+        with only_one_running_task(self, lock_timeout=LOCK_TIMEOUT * 4 + 300):
             started = time.time()
             now = timezone.now()
             today_utc_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
             logger.info("compute_daily_metrics_task: starting days_back=%d", days_back)
+
+            try:
+                status = get_indexer_status()
+            except DayNotReady:
+                status = None
+
             written = 0
+            days_skipped_done = 0
             with relaxed_statement_timeout():
                 for offset in range(1, days_back + 1):
                     day_start = today_utc_midnight - timezone.timedelta(days=offset)
-                    day_end = day_start + timezone.timedelta(days=1)
+                    day = day_start.date()
+                    if DailyMetric.objects.filter(
+                        date=day, completed_at__isnull=False
+                    ).exists():
+                        days_skipped_done += 1
+                        continue
                     try:
-                        _upsert_daily_metric(day_start, day_end)
-                        written += 1
+                        result = compute_day(day, status)
+                        if result.status != DayStatus.DEFERRED:
+                            written += 1
                     except Exception:
                         logger.exception(
                             "compute_daily_metrics_task: day %s failed",
-                            day_start.date(),
+                            day,
                         )
                         continue
                 refresh_started = time.time()
@@ -2551,9 +2728,57 @@ def compute_daily_metrics_task(self, days_back: int = 1) -> bool:
                         time.time() - refresh_started,
                     )
             logger.info(
-                "compute_daily_metrics_task: completed in %.2fs days_written=%d/%d",
+                "compute_daily_metrics_task: completed in %.2fs "
+                "days_written=%d/%d days_skipped_done=%d",
                 time.time() - started,
                 written,
                 days_back,
+                days_skipped_done,
             )
             return written > 0
+    except LockError:
+        logger.info("analytics.daily.skipped_locked")
+        return False
+
+
+@app.shared_task(
+    bind=True,
+    name="safe_transaction_service.analytics.tasks.analytics_catchup_task",
+)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT * 4)
+def analytics_catchup_task(self) -> None:
+    """Hourly sweeper: retries unsettled/failed `DailyMetric` days inside
+    the catch-up window, gives up loudly after `MAX_ATTEMPTS`, and flags
+    days that fall out of the window or a stuck processing queue. See
+    "Analytics catch-up" in `analytics/implementation-notes.md`.
+
+    A thin wrapper around `catchup.run_catchup()`, declared here (not in
+    the `catchup` package) with an explicit `name=` -- Celery's
+    `autodiscover_tasks()` only scans `<app>.tasks`, and the
+    `analytics.tasks.*` -> `contracts` queue route matches on this name, not
+    on where the function is defined (see the module docstring in
+    `catchup/__init__.py`).
+
+    Exits immediately with INFO `analytics.catchup: skipped_reason=analytics_disabled`,
+    without reading any analytics setting or touching the database, when
+    `ENABLE_ANALYTICS` is False -- every instance runs this beat task
+    regardless of that flag, same as `compute_daily_metrics_task`.
+
+    Guarded by the *same* lock `compute_daily_metrics_task` takes --
+    `only_one_running_task(compute_daily_metrics_task, lock_timeout=LOCK_TIMEOUT
+    * 4 + 300)` derives the lock name from that task's registered name, so
+    the 01:00 cron and this hourly sweeper can never write the same
+    `DailyMetric` row at once. A skip due to the lock does no work and logs
+    the same minimal line, `skipped_reason=locked`.
+    """
+    if not settings.ENABLE_ANALYTICS:
+        logger.info("analytics.catchup: skipped_reason=analytics_disabled")
+        return
+
+    try:
+        with only_one_running_task(
+            compute_daily_metrics_task, lock_timeout=LOCK_TIMEOUT * 4 + 300
+        ):
+            run_catchup()
+    except LockError:
+        logger.info("analytics.catchup: skipped_reason=locked")

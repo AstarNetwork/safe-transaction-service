@@ -42,6 +42,8 @@ from safe_transaction_service.history.tests.factories import (
 )
 from safe_transaction_service.utils.redis import get_redis
 
+from .catchup_gate_fixture import SettledGateMixin
+
 
 class TestCalculateNativeBalancesFromDb(TestCase):
     def test_empty_safe_contracts(self):
@@ -618,9 +620,11 @@ class TestUpsertDailyMetric(TestCase):
             row.multisig_txs_executed,
         )
 
-    def test_api_attribution_split_is_null_when_day_not_indexed(self):
-        """No blocks in the window -> the split stays NULL instead of
-        claiming a real zero (see `_compute_daily_metric_core`)."""
+    def test_api_attribution_split_is_honest_zero_when_no_blocks_in_window(self):
+        """No blocks in the window -> a real 0, not NULL: `_upsert_daily_metric`
+        only ever runs a window the catch-up gate has already accepted as
+        settled, so "no blocks" means the day was genuinely quiet, not
+        "not yet indexed" (see `_compute_daily_metric_core`)."""
         from django.utils import timezone
 
         day_start = timezone.now() + timezone.timedelta(days=365)
@@ -629,8 +633,8 @@ class TestUpsertDailyMetric(TestCase):
 
         row = DailyMetric.objects.get(date=day_start.date())
         self.assertEqual(row.multisig_txs_executed, 0)
-        self.assertIsNone(row.multisig_txs_via_api)
-        self.assertIsNone(row.multisig_txs_indexed_only)
+        self.assertEqual(row.multisig_txs_via_api, 0)
+        self.assertEqual(row.multisig_txs_indexed_only, 0)
 
     def test_idempotent_upsert(self):
         from django.utils import timezone
@@ -651,7 +655,7 @@ class TestUpsertDailyMetric(TestCase):
         self.assertGreaterEqual(refreshed.computed_at, first_computed_at)
 
 
-class TestComputeDailyMetricsTask(TestCase):
+class TestComputeDailyMetricsTask(SettledGateMixin, TestCase):
     """End-to-end task: the rolling-window cache refresh must populate the
     same Redis keys the read path consumes, and a per-day failure must not
     strand the rolling-window refresh that runs after the day loop."""
@@ -693,7 +697,7 @@ class TestComputeDailyMetricsTask(TestCase):
         )
 
 
-class TestBackfillDailyMetricsCommand(TestCase):
+class TestBackfillDailyMetricsCommand(SettledGateMixin, TestCase):
     """`manage.py backfill_daily_metrics` should upsert one DailyMetric row
     per day in the inclusive range, reusing the same task helper."""
 

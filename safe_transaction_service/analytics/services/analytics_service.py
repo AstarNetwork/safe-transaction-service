@@ -1160,7 +1160,13 @@ class AnalyticsService:
 
         today = timezone.now().date()
         date_from = today - timezone.timedelta(days=days)
-        rows = DailyMetric.objects.filter(date__gte=date_from, date__lt=today)
+        # `core_completed_at` gates every column this method exposes: a day
+        # whose core or `tx_volume` populator failed stays excluded rather
+        # than summed in as an undisclosed zero. See "Analytics catch-up" in
+        # `analytics/implementation-notes.md`.
+        rows = DailyMetric.objects.filter(
+            date__gte=date_from, date__lt=today, core_completed_at__isnull=False
+        )
 
         agg = rows.aggregate(
             proposed=Coalesce(Sum("multisig_txs_proposed"), Value(0)),

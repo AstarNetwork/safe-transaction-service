@@ -49,6 +49,21 @@ class DailyMetric(models.Model):
     multisig_txs_via_api = models.PositiveIntegerField(null=True)
     multisig_txs_indexed_only = models.PositiveIntegerField(null=True)
     computed_at = models.DateTimeField()
+    # Catch-up state — see "Analytics catch-up" in
+    # `analytics/implementation-notes.md`. Both NULL until the day is
+    # fully settled; neither is touched by populators directly — only
+    # `compute_day` (via `_upsert_daily_metric`) sets them, and it clears
+    # both to NULL as the *first*, separately committed step of any run
+    # that recomputes the core, so a run that dies partway never leaves a
+    # stale/rewritten row still marked complete.
+    #
+    # `core_completed_at`: core + `tx_volume` succeeded — i.e. every
+    # column this table itself exposes via `/tx-volume/` is trustworthy.
+    # This is what readers (`get_tx_volume`, `breakdown=day`) gate on.
+    # `completed_at`: core + all populators succeeded. This is what the
+    # sweeper reads to decide "done, never retry again".
+    core_completed_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-date"]
@@ -283,3 +298,78 @@ class AnalyticsWatermark(models.Model):
 
     def __str__(self) -> str:
         return f"AnalyticsWatermark({self.name}={self.block_number})"
+
+
+class AnalyticsCatchupState(models.Model):
+    """Sweeper bookkeeping for the analytics catch-up mechanism.
+
+    See "Analytics catch-up" in `analytics/implementation-notes.md` for the
+    full design. One table replaces the seven kinds of Redis keys the
+    design first considered: attempt counters and "already logged" markers
+    now survive a Redis flush, so `gave_up` / `expired` don't re-fire after
+    one.
+
+    ``kind`` + ``key`` (unique together) identify what is being tracked:
+    ``("day", "2026-09-22")`` for a `DailyMetric` day, ``("snapshot",
+    "tvl")`` for a PR-2 snapshot, ``("processing", "oldest")`` for the
+    single row the gate uses to detect a stuck `InternalTxDecoded` queue.
+
+    Every write here is committed immediately, outside any transaction
+    wrapping the actual compute — an attempt is counted *before* the work
+    it pays for runs, so it survives a SIGKILL or a gevent `Timeout`
+    mid-compute. Success (a day/snapshot fully catching up) deletes the
+    row; the sweeper itself prunes `kind="day"` rows older than two
+    windows.
+
+    ``core_ok`` and ``failed_steps`` are written **only** by `compute_day`
+    (whichever caller invoked it — nightly task, backfill shard,
+    `--inline` backfill, or the sweeper itself); the sweeper only reads
+    them to decide whether a retry should pass `only=failed_steps`.
+    Keeping the sweeper out of writing these two fields is what stops a
+    manual backfill's `failed_steps` from silently diverging from the
+    sweeper's.
+
+    ``observed_value`` / ``observed_since`` / ``observed_count`` are only
+    meaningful for ``kind="processing"``: the id of the oldest unprocessed
+    `InternalTxDecoded` row the sweeper last saw, since when that id last
+    changed, and how many unprocessed rows there were at that observation
+    — the "same id, same-or-growing count" combination is what lets the
+    sweeper tell a stuck queue apart from `fix_out_of_order` reshuffling
+    within an otherwise-draining one.
+    """
+
+    kind = models.CharField(max_length=32)
+    key = models.CharField(max_length=64)
+    attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(null=True, blank=True)
+    failed_steps = models.JSONField(default=list, blank=True)
+    # Nullable: None = core has never been attempted (or its outcome is
+    # not yet known) for this state row; only `compute_day` sets it.
+    core_ok = models.BooleanField(null=True, blank=True)
+    last_state = models.CharField(max_length=32, null=True, blank=True)
+    last_code = models.CharField(max_length=64, null=True, blank=True)
+    gave_up_logged_at = models.DateTimeField(null=True, blank=True)
+    expired_logged_at = models.DateTimeField(null=True, blank=True)
+    stuck_logged_at = models.DateTimeField(null=True, blank=True)
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    # `kind="processing"` only — see docstring.
+    observed_value = models.BigIntegerField(null=True, blank=True)
+    observed_since = models.DateTimeField(null=True, blank=True)
+    observed_count = models.BigIntegerField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["kind", "key"],
+                name="analytics_catchup_state_kind_key_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["kind", "next_attempt_at"], name="analytics_acs_kind_next_idx"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"AnalyticsCatchupState({self.kind}:{self.key})"

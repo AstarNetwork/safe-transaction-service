@@ -174,6 +174,14 @@ TASKS = [
         cron=CronDefinition(minute=0, hour=1),  # Daily at 01:00 - 0 1 * * *
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.analytics_catchup_task",
+        description=(
+            "Retry unsettled/failed DailyMetric days inside the catch-up "
+            "window (hourly at minute 20, after the 01:00 nightly task)"
+        ),
+        cron=CronDefinition(minute=20),  # Every hour at minute 20 - 20 * * * *
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.analytics.tasks.compute_active_safes_task",
         description="Precompute active Safes for 7d/30d/90d (daily at 02:30)",
         cron=CronDefinition(minute=30, hour=2),  # Daily at 02:30 - 30 2 * * *

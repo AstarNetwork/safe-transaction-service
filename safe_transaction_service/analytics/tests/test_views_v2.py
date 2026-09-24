@@ -34,6 +34,8 @@ from safe_transaction_service.history.tests.factories import (
 from safe_transaction_service.tokens.tests.factories import TokenFactory
 from safe_transaction_service.utils.redis import get_redis
 
+from .catchup_gate_fixture import SettledGateMixin
+
 
 class AnalyticsTestMixin:
     """Common setup for analytics test classes."""
@@ -350,6 +352,7 @@ class TestTxVolumeView(AnalyticsTestMixin, APITestCase):
             confirmations_count=4,
             confirmed_tx_count=2,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
 
         response = self.client.get(
@@ -400,13 +403,16 @@ class TestTxVolumeView(AnalyticsTestMixin, APITestCase):
             multisig_txs_via_api=3,
             multisig_txs_indexed_only=1,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
-        # Pre-backfill day: executed split NULL.
+        # Pre-backfill day: core completed (visible to `get_tx_volume`) but
+        # the executed split predates that column, so it's NULL, not 0.
         DailyMetric.objects.create(
             date=today - timedelta(days=2),
             multisig_txs_proposed=7,
             multisig_txs_executed=6,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
         # Fully computed day with every executed tx attributed to the API.
         DailyMetric.objects.create(
@@ -416,6 +422,7 @@ class TestTxVolumeView(AnalyticsTestMixin, APITestCase):
             multisig_txs_via_api=2,
             multisig_txs_indexed_only=0,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
 
         response = self.client.get(
@@ -865,7 +872,7 @@ class TestSummaryCache(AnalyticsTestMixin, APITestCase):
         self.assertIsNotNone(second.data["computed_at"])
 
 
-class TestActiveSafesViewDailyTask(AnalyticsTestMixin, APITestCase):
+class TestActiveSafesViewDailyTask(SettledGateMixin, AnalyticsTestMixin, APITestCase):
     """C7 read-path contract: the active_safes view must serve the
     window-distinct count written by `compute_daily_metrics_task`, not a
     sum of per-day DAU rows. A Safe touching activity in the 7d window
@@ -1186,6 +1193,7 @@ class TestTxVolumeDailyMetricSource(AnalyticsTestMixin, APITestCase):
                 confirmations_count=6,
                 confirmed_tx_count=3,
                 computed_at=timezone.now(),
+                core_completed_at=timezone.now(),
             )
 
         response = self.client.get(
@@ -1283,15 +1291,18 @@ class TestTxVolumeDayBreakdown(AnalyticsTestMixin, APITestCase):
             confirmations_count=8,
             confirmed_tx_count=4,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
         # today-2 is deliberately absent from the rollup.
-        # Pre-backfill day: the executed split is NULL, not 0.
+        # Pre-backfill day: core completed but the executed split predates
+        # that column, so it's NULL, not 0.
         DailyMetric.objects.create(
             date=self.today - timedelta(days=3),
             multisig_txs_proposed=1,
             multisig_txs_executed=1,
             erc20_transfers=2,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
         # Today is not a completed UTC day (`date__lt=today`), and
         # today-40 sits outside the 30d window. Neither may appear.
@@ -1299,11 +1310,13 @@ class TestTxVolumeDayBreakdown(AnalyticsTestMixin, APITestCase):
             date=self.today,
             multisig_txs_executed=99,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
         DailyMetric.objects.create(
             date=self.today - timedelta(days=40),
             multisig_txs_executed=77,
             computed_at=timezone.now(),
+            core_completed_at=timezone.now(),
         )
 
     def _get(self, params):

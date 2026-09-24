@@ -5,9 +5,14 @@ from datetime import date, datetime, timedelta
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from safe_transaction_service.analytics.models import DailyMetric
+from safe_transaction_service.analytics.catchup import (
+    DayNotReady,
+    DayStatus,
+    compute_day,
+    get_indexer_status,
+    select_failed_days,
+)
 from safe_transaction_service.analytics.services.db import relaxed_statement_timeout
-from safe_transaction_service.analytics.tasks import _upsert_daily_metric
 from safe_transaction_service.analytics.tasks_shards import (
     BACKFILL_CURSOR_KEY,
     latest_backfill_run_id,
@@ -47,36 +52,28 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{secs}s"
 
 
-def select_failed_days(dates: list[date]) -> list[date]:
-    """Days in ``dates`` whose ``DailyMetric`` row is missing or was written
-    before the API-attribution split landed (``multisig_txs_via_api IS
-    NULL``). Used by ``--failed-only`` so a re-run touches only what the
-    previous run did not finish.
-    """
-    if not dates:
-        return []
-    existing = dict(
-        DailyMetric.objects.filter(date__range=(dates[0], dates[-1])).values_list(
-            "date", "multisig_txs_via_api"
-        )
-    )
-    return [d for d in dates if d not in existing or existing[d] is None]
-
-
 class Command(BaseCommand):
     help = (
         "Backfill DailyMetric rows and rollup tables for a closed date range. "
-        "Default mode splits the range into --chunk-days chunks and runs them "
-        "STRICTLY ONE AT A TIME on the `contracts` queue: each chunk is a "
-        "Celery chord (one task per day) whose callback dispatches the next "
-        "chunk, so at most --chunk-days days are ever in flight regardless of "
-        "the worker pool size and regardless of whether this process is still "
-        "alive. --wait N polls Redis and reports each chunk (N is an upper "
-        "bound per chunk); --wait 0 returns right after starting the run. "
-        "--status [RUN_ID] prints the progress of a run without touching the "
-        "database. --failed-only re-runs only days missing a DailyMetric row or "
-        "with multisig_txs_via_api IS NULL. Use --inline for the sequential "
-        "in-process loop (debugging, no worker needed)."
+        "Every day goes through the same indexer-status gate as the nightly "
+        "task and the sweeper -- a day that isn't settled yet is deferred, "
+        "not computed on partial data. Default mode splits the range into "
+        "--chunk-days chunks and runs them STRICTLY ONE AT A TIME on the "
+        "`contracts` queue: each chunk is a Celery chord (one task per day) "
+        "whose callback dispatches the next chunk, so at most --chunk-days "
+        "days are ever in flight regardless of the worker pool size and "
+        "regardless of whether this process is still alive -- but this "
+        "process's --inline run is invisible to the sweeper, which only "
+        "sees the most recent Celery run's manifest; avoid a long --inline "
+        "run on a large network once the sweeper is active. --wait N polls "
+        "Redis and reports each chunk (N is an upper bound per chunk); "
+        "--wait 0 returns right after starting the run. --status [RUN_ID] "
+        "prints the progress of a run without touching the database. "
+        "--failed-only re-runs only days without completed_at. Use --inline "
+        "for the sequential in-process loop (debugging, no worker needed). "
+        "--skip-settle-check bypasses the indexer-status gate for this range "
+        "-- only for a range you already know is fully indexed; every "
+        "skipped day is logged."
     )
 
     def add_arguments(self, parser):
@@ -142,9 +139,23 @@ class Command(BaseCommand):
             "--failed-only",
             action="store_true",
             help=(
-                "Only (re)run days in the range whose DailyMetric row is "
-                "missing or has multisig_txs_via_api IS NULL. Works with both "
-                "Celery and --inline modes."
+                "Only (re)run days in the range without completed_at -- "
+                "missing a DailyMetric row entirely, deferred by the gate, "
+                "or still short a populator. Works with both Celery and "
+                "--inline modes."
+            ),
+        )
+        parser.add_argument(
+            "--skip-settle-check",
+            action="store_true",
+            help=(
+                "Bypass the indexer-status gate for this range and compute "
+                "every day regardless of whether it looks settled yet. Only "
+                "for a one-shot backfill of history you already know is "
+                "fully indexed -- a day computed this way gets completed_at "
+                "on possibly-partial data and the sweeper will never retry "
+                "it. Logs WARNING analytics.daily.settle_check_skipped for "
+                "every day. Works with both Celery and --inline modes."
             ),
         )
         parser.add_argument(
@@ -192,22 +203,35 @@ class Command(BaseCommand):
                 return
             dates = selected
 
+        skip_settle_check = options["skip_settle_check"]
+        if skip_settle_check:
+            self.stdout.write(
+                self.style.WARNING(
+                    "--skip-settle-check: bypassing the indexer-status gate "
+                    "for this range. Only for a range you already know is "
+                    "fully indexed -- see --help."
+                )
+            )
+
         if options["inline"]:
-            return self._run_inline(dates, options["batch_days"], options["chunk_days"])
+            return self._run_inline(
+                dates, options["batch_days"], options["chunk_days"], skip_settle_check
+            )
         return self._run_celery(
             dates,
             wait_seconds=options["wait"],
             chunk_days=options["chunk_days"],
             poll_interval=options["poll_interval"],
             run_id=options.get("run_id"),
+            skip_settle_check=skip_settle_check,
         )
 
     # ────────────────────────────── inline ─────────────────────────────
 
-    def _run_inline(self, dates, batch_days, chunk_days):
-        tz = timezone.get_current_timezone()
+    def _run_inline(self, dates, batch_days, chunk_days, skip_settle_check):
         total_days = len(dates)
         written = 0
+        deferred = 0
         failed = 0
 
         self.stdout.write(
@@ -216,6 +240,15 @@ class Command(BaseCommand):
         )
 
         import time as _time
+
+        # One indexer-status snapshot for the whole run, reused for every
+        # day -- same as a Celery shard or the nightly task. `None` means
+        # the snapshot itself couldn't be fetched this run; every day then
+        # defers unless `skip_settle_check` says to compute anyway.
+        try:
+            status = get_indexer_status()
+        except DayNotReady:
+            status = None
 
         # Slice the run into chunks. chunk_days=0 → single chunk (legacy).
         chunk_size = chunk_days if chunk_days and chunk_days > 0 else total_days
@@ -227,6 +260,7 @@ class Command(BaseCommand):
             for chunk_idx, chunk in enumerate(chunks):
                 chunk_started = _time.time()
                 chunk_written = 0
+                chunk_deferred = 0
                 chunk_failed = 0
                 self.stdout.write(
                     f"== Chunk {chunk_idx + 1}/{total_chunks}: "
@@ -236,20 +270,14 @@ class Command(BaseCommand):
                 self.stdout.flush()
                 for chunk_offset, day in enumerate(chunk):
                     offset = chunk_idx * chunk_size + chunk_offset
-                    day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
-                    day_end = day_start + timedelta(days=1)
                     self.stdout.write(
                         f"  [{offset + 1}/{total_days}] Starting {day.isoformat()} …"
                     )
                     self.stdout.flush()
                     started = _time.time()
                     try:
-                        _upsert_daily_metric(day_start, day_end)
-                        written += 1
-                        chunk_written += 1
-                        self.stdout.write(
-                            f"  [{offset + 1}/{total_days}] {day.isoformat()} "
-                            f"done in {_time.time() - started:.1f}s"
+                        result = compute_day(
+                            day, status, skip_settle_check=skip_settle_check
                         )
                     except Exception as e:  # noqa: BLE001 — per-day isolation
                         failed += 1
@@ -261,19 +289,40 @@ class Command(BaseCommand):
                                 f"{_time.time() - started:.1f}s: {e}"
                             )
                         )
+                        self.stdout.flush()
+                        continue
+                    if result.status == DayStatus.DEFERRED:
+                        deferred += 1
+                        chunk_deferred += 1
+                        self.stdout.write(
+                            f"  [{offset + 1}/{total_days}] {day.isoformat()} "
+                            f"deferred ({result.code}) in "
+                            f"{_time.time() - started:.1f}s"
+                        )
+                    else:
+                        written += 1
+                        chunk_written += 1
+                        self.stdout.write(
+                            f"  [{offset + 1}/{total_days}] {day.isoformat()} "
+                            f"done in {_time.time() - started:.1f}s "
+                            f"status={result.status.value}"
+                        )
                     self.stdout.flush()
                     if batch_days and (offset + 1) % batch_days == 0:
                         self.stdout.write(
                             f"  …{offset + 1}/{total_days} processed "
-                            f"(written={written}, failed={failed})"
+                            f"(written={written}, deferred={deferred}, "
+                            f"failed={failed})"
                         )
 
                 self.stdout.write(
                     self.style.SUCCESS(
                         f"== Chunk {chunk_idx + 1}/{total_chunks} done in "
                         f"{_time.time() - chunk_started:.1f}s "
-                        f"(chunk: written={chunk_written}, failed={chunk_failed}; "
-                        f"cumulative: written={written}, failed={failed})"
+                        f"(chunk: written={chunk_written}, "
+                        f"deferred={chunk_deferred}, failed={chunk_failed}; "
+                        f"cumulative: written={written}, deferred={deferred}, "
+                        f"failed={failed})"
                     )
                 )
                 self.stdout.flush()
@@ -281,8 +330,8 @@ class Command(BaseCommand):
         self.stdout.write(
             self.style.SUCCESS(
                 f"Backfill done in {_time.time() - run_started:.1f}s: "
-                f"written={written}, failed={failed}, total={total_days}, "
-                f"chunks={total_chunks}"
+                f"written={written}, deferred={deferred}, failed={failed}, "
+                f"total={total_days}, chunks={total_chunks}"
             )
         )
 
@@ -295,6 +344,7 @@ class Command(BaseCommand):
         chunk_days: int,
         poll_interval: int,
         run_id: str | None,
+        skip_settle_check: bool = False,
     ):
         """Start a sequential chunked run on the worker and optionally watch it.
 
@@ -303,8 +353,14 @@ class Command(BaseCommand):
         only *observes*: completion of a chunk is detected by the appearance
         of its summary key in Redis — never via the chord's ``AsyncResult``,
         whose value is not stored under ``CELERY_IGNORE_RESULT=True``.
+
+        ``skip_settle_check`` rides on the run manifest, not just this call
+        -- every chunk after the first is dispatched by a shard's chord
+        callback, not by this process (see ``build_backfill_run``).
         """
-        run = start_backfill_run(dates, chunk_days, run_id=run_id)
+        run = start_backfill_run(
+            dates, chunk_days, run_id=run_id, skip_settle_check=skip_settle_check
+        )
         run_id = run["run_id"]
         total_chunks = run["chunk_count"]
 

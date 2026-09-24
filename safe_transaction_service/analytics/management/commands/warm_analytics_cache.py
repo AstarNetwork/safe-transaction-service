@@ -1,9 +1,21 @@
+"""``--skip-if-fresh`` for `summary` / `safe_segments` / `tvl` decides
+freshness from Postgres (`AnalyticsSnapshot.computed_at` / `native_source`),
+via the same `is_snapshot_stale` the snapshot sweeper uses, instead of a
+Redis probe -- the Redis keys those payloads used to be cached under have
+since been dropped, so the old probe never actually skipped anything for
+these three. The other tasks in `TASKS` are unaffected.
+
+See "Analytics catch-up" in `analytics/implementation-notes.md`.
+"""
+
 import json
 from datetime import datetime, timedelta
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
+from safe_transaction_service.analytics.catchup import SNAPSHOT_NAMES, is_snapshot_stale
+from safe_transaction_service.analytics.conf import get_catchup_settings
 from safe_transaction_service.analytics.services.analytics_service import (
     AnalyticsService,
 )
@@ -30,14 +42,13 @@ class Command(BaseCommand):
     # (label, task_callable, freshness_probe_key, timestamp_field)
     # `timestamp_field` is None for payloads without a timestamp (existence-only
     # check); `freshness_probe_key` is None for work that has no Redis payload to
-    # probe at all, which `--skip-if-fresh` therefore never skips.
+    # probe at all, which `--skip-if-fresh` therefore never skips based on a
+    # probe -- this also covers `summary` / `safe_segments` / `tvl`, whose
+    # labels are their `SNAPSHOT_NAMES` entry and are freshness-checked
+    # against Postgres instead, ahead of the probe_key/ts_field pair (see
+    # `_is_fresh`).
     TASKS = [
-        (
-            "summary",
-            compute_summary_task,
-            AnalyticsService.REDIS_SUMMARY,
-            "computed_at",
-        ),
+        ("summary", compute_summary_task, None, None),
         (
             "transactions_per_safe_app",
             get_transactions_per_safe_app_task,
@@ -56,12 +67,7 @@ class Command(BaseCommand):
             AnalyticsService.REDIS_ACTIVE_OWNERS_PREFIX + "30d",
             "computed_at",
         ),
-        (
-            "safe_segments",
-            compute_safe_segments_task,
-            AnalyticsService.REDIS_SAFE_SEGMENTS,
-            "computed_at",
-        ),
+        ("safe_segments", compute_safe_segments_task, None, None),
         # Before `tvl`, which reads the rollup this advances. Both are
         # fire-and-forget dispatches so the ordering is a hint, not a
         # guarantee — and it does not need to be one: a TVL run that
@@ -73,7 +79,7 @@ class Command(BaseCommand):
             None,
             None,
         ),
-        ("tvl", compute_tvl_task, AnalyticsService.REDIS_TVL, "computed_at"),
+        ("tvl", compute_tvl_task, None, None),
         (
             "safe_creations",
             compute_safe_creations_task,
@@ -102,10 +108,16 @@ class Command(BaseCommand):
         skip_if_fresh = options["skip_if_fresh"]
         threshold = timedelta(hours=options["fresh_window_hours"])
         now = timezone.now()
+        # Only read when actually needed -- this can raise `ImproperlyConfigured`
+        # on a bad env var, and a plain (non-`--skip-if-fresh`) dispatch run
+        # should not be able to fail because of that.
+        cfg = get_catchup_settings() if skip_if_fresh else None
 
         self.stdout.write("Enqueuing analytics warm-up tasks...")
         for label, task, probe_key, ts_field in self.TASKS:
-            if skip_if_fresh and self._is_fresh(probe_key, ts_field, now, threshold):
+            if skip_if_fresh and self._is_fresh(
+                label, probe_key, ts_field, now, threshold, cfg
+            ):
                 self.stdout.write(f"  {label}: skipped (fresh)")
                 continue
             try:
@@ -119,8 +131,18 @@ class Command(BaseCommand):
 
     @staticmethod
     def _is_fresh(
-        probe_key: str | None, ts_field: str | None, now, threshold: timedelta
+        label: str,
+        probe_key: str | None,
+        ts_field: str | None,
+        now,
+        threshold: timedelta,
+        cfg,
     ) -> bool:
+        if label in SNAPSHOT_NAMES:
+            # Same rule the snapshot sweeper uses: a Postgres row, not a
+            # Redis probe -- `cfg` is guaranteed set here since this branch
+            # only runs when `skip_if_fresh` is True.
+            return not is_snapshot_stale(label, cfg.SNAPSHOT_STALE_HOURS, now)
         if probe_key is None:
             # Nothing to probe — the rollup's freshness lives in a Postgres
             # watermark, not a Redis payload. Never skip it; the task is
