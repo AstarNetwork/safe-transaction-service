@@ -22,6 +22,7 @@ from safe_transaction_service.analytics.services.analytics_service import (
 from safe_transaction_service.analytics.tasks import (
     compute_active_owners_task,
     compute_active_safes_task,
+    compute_erc20_balance_rollup_task,
     compute_native_balance_rollup_task,
     compute_safe_creations_task,
     compute_safe_segments_task,
@@ -80,6 +81,12 @@ class Command(BaseCommand):
             None,
         ),
         ("tvl", compute_tvl_task, None, None),
+        (
+            "erc20_balance_rollup",
+            compute_erc20_balance_rollup_task,
+            None,
+            None,
+        ),
         (
             "safe_creations",
             compute_safe_creations_task,

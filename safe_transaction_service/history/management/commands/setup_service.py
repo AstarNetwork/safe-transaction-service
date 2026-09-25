@@ -210,6 +210,14 @@ TASKS = [
         cron=CronDefinition(minute=15, hour=3),  # Daily at 03:15 - 15 3 * * *
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.compute_erc20_balance_rollup_task",
+        description=(
+            "Advance the incremental ERC-20 balance rollup (daily at 03:45, "
+            "after compute_tvl_task)"
+        ),
+        cron=CronDefinition(minute=45, hour=3),  # Daily at 03:45 - 45 3 * * *
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.analytics.tasks.compute_safe_creations_task",
         description="Compute Safe creations day-grain time series (daily at 04:30)",
         cron=CronDefinition(minute=30, hour=4),  # 30 4 * * *
@@ -221,6 +229,23 @@ TASKS = [
             "recompute and report disagreement (every Sunday at 05:00)"
         ),
         cron=CronDefinition(minute=0, hour=5, day_of_week=0),  # 0 5 * * 0
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.check_erc20_balance_drift_task",
+        description=(
+            "Sample the ERC-20 balance rollup against a from-scratch "
+            "recompute and report disagreement (every Sunday at 05:15)"
+        ),
+        cron=CronDefinition(minute=15, hour=5, day_of_week=0),  # 15 5 * * 0
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.erc20_balance_backfill_watchdog_task",
+        description=(
+            "Redispatch a stalled `backfill_erc20_balances --celery` chain "
+            "(progress rows exist, heartbeat >15min stale, rollup lock "
+            "free; every 5 minutes)"
+        ),
+        cron=CronDefinition(minute="*/5"),  # Every 5 minutes - */5 * * * *
     ),
 ]
 

@@ -50,4 +50,9 @@ urlpatterns = [
         views_v2.AnalyticsTokenVolumeView.as_view(),
         name="analytics-token-volume",
     ),
+    path(
+        "token-holdings/",
+        views_v2.AnalyticsTokenHoldingsView.as_view(),
+        name="analytics-token-holdings",
+    ),
 ]

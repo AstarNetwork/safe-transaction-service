@@ -2376,4 +2376,518 @@ skipped these three. It now calls `is_snapshot_stale` with
 the sweeper never disagree about whether one of the three needs a refresh.
 The other tasks the command dispatches (`active_safes`, `active_owners`,
 `transactions_per_safe_app`, `native_balance_rollup`, `safe_creations`) are
-unchanged — still probed against their own cached Redis payload.
+unchanged — still probed against their own cached Redis payload. **Token
+holdings (P2) added a sixth**, `erc20_balance_rollup`
+(`compute_erc20_balance_rollup_task`), dispatched right after `tvl` — same
+`(None, None)` probe/timestamp pair as `native_balance_rollup`: no Redis
+payload to probe, so `--skip-if-fresh` never skips it either. See "Token
+holdings" below.
+
+---
+
+# Token holdings — incremental ERC-20 balance rollup (P1–P5)
+
+Token-holdings spec: `docs/specs/token-holdings.md` (workspace root), §4 (producer) and §5
+(contract). Files: `analytics/models.py` (`SafeTokenBalance`, `TokenHolding`,
+`Erc20BalanceWhale`), `analytics/migrations/0010_token_holdings.py`, the ERC-20 balance
+block in `analytics/tasks.py` (search "Incremental ERC-20 balance rollup"),
+`analytics/management/commands/backfill_erc20_balances.py`, `analytics/views_v2.py`
+(`AnalyticsTokenHoldingsView`), `analytics/services/analytics_service.py`
+(`get_token_holdings` / `get_token_holdings_by_tokens` / `get_token_metadata`). Same
+three-phase shape (seed / delta / mark) as Part 8's native-balance rollup, with departures
+that all trace back to one design choice: `SafeTokenBalance` deletes zero-balance rows,
+unlike `SafeNativeBalance`.
+
+## A separate table, and why "no row" isn't "new Safe" here
+
+Not merged into `SafeNativeBalance` (spec §4.1 decision): source, indexer cursor, error
+profile and drift check all differ, and the two unify only at read time. Native keeps one
+row per `SafeContract`, always present, so "row absent from the rollup" is an unambiguous
+"not seeded yet" signal the seed step can anti-join against. `SafeTokenBalance` deletes a
+pair the moment it nets to zero — a Safe that fully exits a token loses its row — so the
+same absence now means either "never held" or "held once, exited," and the seed step
+cannot tell them apart by reading the table. It doesn't try to: new Safes are found
+through an explicit marker instead of a "no row" anti-join (next section).
+
+## The seed marker: `AnalyticsWatermark(name='erc20_balance_safes').address`
+
+Migration `0010_token_holdings.py` adds one column, `AnalyticsWatermark.address`
+(nullable `EthereumAddressBinaryField`), rather than shipping a separate `0011`. The
+migration's own comment: neither P1 (models) nor P2 (the task that needs the column) had
+shipped yet, and the whole feature lands as one cherry-picked commit, so folding it into
+0010 is simpler than two migrations — worth noting because P1's spec section (§4.1) does
+not mention this field; it belongs to P2's watermark design.
+
+The `erc20_balance_safes` watermark row repurposes `AnalyticsWatermark` for a payload the
+model wasn't originally built for: `block_number` is unused (set equal to the sibling
+`erc20_balance` watermark's block, for readability only), and the real cursor is the
+`(computed_at, address)` pair — the last `(created, address)` tuple the seed step reached.
+Every other watermark row leaves `address` `NULL`; a plain block cursor has no address
+component.
+
+## Boundary B = `now() - ERC20_BALANCE_SAFE_SETTLE` (1h) — the late-commit race
+
+§4.2 says B is "an ordered `(created, address)` pair taken at the start" of the run and
+gives no margin. The code (`erc20_balance_run_boundary`, `tasks.py`) backs it off by
+`ERC20_BALANCE_SAFE_SETTLE = timedelta(hours=1)`. Decided in P2 review:
+`history_safecontract.created` is `auto_now_add`, stamped in Python before the row's
+INSERT commits — a plain `now()` boundary is unsafe, because an indexer transaction still
+open when the run starts can already have `created < now()` stamped on a Safe that is
+still invisible to the candidate query (its INSERT hasn't committed). B would sail past
+that Safe, the marker would move beyond it, and neither step would ever revisit it — its
+pre-watermark balance is lost permanently, not delayed. The margin has to exceed the
+longest an indexer transaction can plausibly stay open; a Safe created inside the margin
+simply waits for the next run, costing one run's delay, never correctness.
+`_MAX_ADDRESS = b"\xff" * 20` is the paired high-end sentinel, so a `created` tie down to
+the microsecond still resolves every existing address as `<= B`.
+
+## Exclusive marker, inclusive boundary — not the spec prose's `<` / `≤`
+
+§4.2 reads "Which Safes: `marker ≤ (created, address) < B`." The SQL
+(`_ERC20_BALANCE_SAFE_CANDIDATES_SQL`) does the opposite on both ends: `marker <
+(created, address) <= boundary`. Both flips are load-bearing:
+
+- **Marker exclusive.** The marker a run receives is the *exact* tuple of the last Safe
+  the previous run seeded. An inclusive `>=` would re-select that Safe and sum its
+  pre-watermark history a second time. `address` is a real primary key, so "equal to the
+  marker" can only mean "is the marker's own row" — nothing legitimate is lost by
+  excluding it.
+- **Boundary inclusive.** Required for the capped case (§4.2: "B is lowered to the
+  `(created, address)` of the last seeded Safe") to be internally consistent — when the
+  cap bites, the lowered B is exactly that last-seeded Safe's own tuple, and the delta's
+  UPSERT is bounded by that same B. A strict `<` there would exclude the very Safe step 1
+  just seeded, leaving it seeded but never delta-applied. `<=` on both sides means one
+  lowered B selects the same Safe set in both steps — the actual "so both steps still
+  agree" requirement. The marker's own strict `>` on the *next* run is what stops that
+  Safe being reprocessed, so nothing is lost by the boundary not also being strict.
+
+## The UPSERT and the zero DELETE are two statements, not one CTE
+
+§4.2: "UPSERT `balance = balance + delta`, then delete the touched pairs that reached 0" —
+read literally, the obvious shape is one writable CTE (`INSERT ... RETURNING` feeding a
+`DELETE ... USING`). An earlier draft tried exactly that and it silently does nothing: it
+upserts correctly but never deletes, every time, with nothing concurrent. Postgres
+documents that the writable arms of one `WITH` cannot see one another's effects on a
+shared target table — every arm runs against the statement's starting snapshot. Confirmed
+against this project's own Postgres (2026-09-24), not assumed from the docs alone.
+`_ERC20_BALANCE_UPSERT_SQL` and `_ERC20_BALANCE_DELETE_ZERO_SQL` are therefore two
+separate `cursor.execute()` calls, both inside the same `transaction.atomic()` block the
+caller already opens, so the second one does see the first one's write.
+
+## `max_digits=1000`, not `numeric(80,0)` and not `Uint256Field`
+
+Both `SafeTokenBalance.balance` and `TokenHolding.total_balance` are
+`DecimalField(max_digits=1000, decimal_places=0)` — Postgres's own numeric precision
+ceiling, emitting bare `numeric`. Two rejected alternatives, per the model docstrings:
+`numeric(80,0)` (`SafeNativeBalance.balance_wei`'s type) is sized for real chain supply,
+which bounds native value but not an ERC-20 `Transfer` amount — any contract can emit up
+to 2**256-1, and ~900 such transfers overflow 80 digits, aborting the transaction
+mid-upsert and freezing the watermark for every token, not just the spam one.
+`Uint256Field` is out because it's unsigned and its `pre_save` rejects negative values
+outright, and `SafeTokenBalance.balance` is the true *signed* net flow, kept unclamped so
+negative pairs can be counted (`negative_pairs` on `TokenHolding`) rather than hidden by a
+clamp the way native's read-time clamp hides them.
+
+## Whale list: a table, `pg_stats` refreshed only on a fresh backfill run, one resumable
+## walk
+
+`Erc20BalanceWhale(safe_address)` — spec §0.5's "small analytics table, not a setting."
+Added in migration 0010, filled and read only by the backfill command and the drift check.
+
+`refresh_whale_list` seeds it from `pg_stats` most-common `to`/`_from` values
+(`DEFAULT_WHALE_MIN_FREQUENCY = 0.001`, 0.1% — comfortably below the ~35% the dominant
+Optimism whale sits at, per `optimism-balance-accuracy.paste.sql` §1w) — but **only on a
+fresh run**: no progress watermark rows yet, or right after `--restart`, never on a
+resume. Reason, from the command's own module docstring: a `pg_stats` whale discovered
+mid-resume could already have been seeded as an ordinary Safe by an earlier,
+already-committed chunk of *this same run*; summing it again in the whale walk would
+double-count that history. Run-time detection (`detect_runtime_whales`, a bounded-count
+trick over `DEFAULT_WHALE_ROW_THRESHOLD = 50_000` rows per chunk) stays safe across
+resumes because it only ever looks at chunks not yet seeded.
+
+Whales are summed **once**, in a single resumable block-range walk (`_run_whale_walk`) run
+after the whole chunk loop finishes, in `DEFAULT_WHALE_BLOCK_RANGE = 500_000`-block steps
+(~11-12 days at Optimism's block time) over the union of every whale found by then — never
+inside the per-chunk loop. A chunk containing a whale still advances the progress cursor
+past it; the whale itself is left for the walk. Summing a whale per-chunk would cost N
+full history scans across the N chunks it happens to land in; walking once after the loop
+costs exactly one scan per whale, independent of chunk count. The walk's own progress is a
+dedicated `AnalyticsWatermark` row (`erc20_balance_backfill_whales`, `block_number` = last
+`range_to` applied), separate from the two seed-progress watermarks, so a crash mid-walk
+resumes at the right block range instead of re-summing from zero.
+
+## Drift check: recompute per Safe, not per pair — report-only
+
+§4.4 says "sample 2000 pairs and recompute them." The code (`check_erc20_balance_drift`,
+mirroring `check_native_balance_drift`) samples 2000 *Safes* and recomputes each one's
+**entire** current token set with `erc20_balances_upto_block`, not just the sampled
+`(Safe, token)` pairs. Deliberate, per the task's own comment: a pair the rollup *should*
+have a row for but doesn't has no row to land in a pair-level sample in the first place,
+so sampling stored pairs alone could never surface a missing one. Comparing a sampled
+Safe's full recomputed set against every row the check can see for that Safe catches both
+directions — a missing pair, and a stored pair the recompute no longer sees (an
+un-deleted zero). Whale Safes are excluded from the sample (`Erc20BalanceWhale`) — unlike
+the native check, which has no whale concept — because recomputing one alone (tens of
+millions of transfer rows) would blow the statement timeout on its own. Report-only, same
+as native: no self-repair; `--restart` is the only fix (§4.4, Q5).
+
+## The cursor: 409 on a stale `as_of_block`
+
+`AnalyticsTokenHoldingsView` decodes the opaque cursor strictly (any decode/JSON/shape
+error → 400, per §5). `get_token_holdings` then compares the cursor's `as_of_block`
+against the *current* `TokenHolding` snapshot's — a mismatch raises
+`TokenHoldingsCursorStaleError`, which the view turns into 409. This is new in this app;
+no other analytics endpoint pages, so there was no existing cursor precedent to follow.
+The hub restarts from page one on a 409 and records NULL + logs WARNING on a second one in
+the same cycle (spec §0.4) — the producer has no part in that retry policy, it only ever
+reports "stale."
+
+## Metadata: joined from `tokens_token` at read time, not stored
+
+`TokenHolding` carries no `symbol`/`decimals` columns (moved out of P2 into P5 during
+review — see the spec's P5 task notes). `_join_token_holdings_metadata` calls
+`get_token_metadata` (the `/token-holdings/` counterpart to Part 4's `get_token_symbols`)
+on every read, over the page's addresses only. Unknown is `null`, never defaulted to 18 or
+to the address — same contract Part 4 already established for `tokens_token` lookups
+elsewhere in this app.
+
+## The known tiny race: a single-page read can straddle the nightly rewrite
+
+`get_token_holdings` reads `AnalyticsSnapshot(name='token_holdings')` for the chain-level
+`as_of_block` first, then queries `TokenHolding` for the page's rows as a second,
+independent statement — not inside one transaction spanning both reads, and not against a
+shared `REPEATABLE READ` snapshot. `run_erc20_balance_rollup` rewrites `TokenHolding`
+wholesale and the chain-level snapshot in the same transaction as each incremental delta,
+nightly at 03:45. A request whose two reads straddle that commit can therefore pair an
+`as_of_block` from one rewrite with rows from the other. The cursor's stale-check only
+protects *later* pages of a paged walk against a rewrite that happens between them — the
+*first* page of a request that starts mid-rewrite has nothing to compare against yet, so
+that one page can carry a mismatched pair. Not fixed here: the spec accepts a plain read
+plus one query for this endpoint, and the hub's next collection cycle reads a fresh,
+consistent snapshot — self-correcting one cycle later, the same tolerance the workspace
+contract already extends to every other snapshot-backed endpoint.
+
+## Whale threshold starting values
+
+Three constants, all in `backfill_erc20_balances.py`, all explicitly starting values (spec
+§4.3, in the same spirit as the hub-side pricing floors in §11 Q7): `DEFAULT_WHALE_MIN_FREQUENCY
+= 0.001` (0.1% of `pg_stats`' sampled rows), `DEFAULT_WHALE_ROW_THRESHOLD = 50_000` (rows
+in one chunk before run-time detection flags it), `DEFAULT_WHALE_BLOCK_RANGE = 500_000`
+(blocks per whale-walk step). `DEFAULT_CHUNK_SIZE` is not a fourth new value — it reuses
+`NATIVE_BALANCE_SEED_BATCH_SIZE`, the existing native-rollup constant, per spec §4.3
+("reusing the native guard").
+
+## The pre-existing `id` `AlterField` drift — still not fixed here
+
+Part 8 already records that `makemigrations analytics --check` wants four `AutoField` →
+`BigAutoField` `AlterField` operations on the `Daily*` rollup PKs, predating that branch
+and out of scope for it. `0010_token_holdings.py` doesn't touch any of those four tables
+and doesn't resolve the drift — `makemigrations --check` on this branch still reports the
+same four operations it did before P1. Rewriting them remains someone else's task, not
+this one's.
+
+## Rollout
+
+Per priority chain (spec §9): `ENABLE_ANALYTICS=True`, `migrate`, then
+`backfill_erc20_balances` off-peak, one-time. The nightly `compute_erc20_balance_rollup_task`
+(03:45 UTC, after `compute_tvl_task`) then takes over — cold start (no `erc20_balance`
+watermark) is a no-op with a log line pointing at the backfill command, same convention as
+the native rollup. `check_erc20_balance_drift_task` runs Sundays 05:15, fifteen minutes
+after the native drift check.
+
+## Not done here (P6 scope)
+
+No code changes; this section and the workspace `CLAUDE.md` contract table / refresh
+cadence / ownership rows are what P6 delivers (spec §12). H1–H5 (hub storage, fetcher,
+pricing, persistence, dashboard) are a separate repo and a separate PR.
+
+---
+
+# Token holdings — P7: Celery mode for `backfill_erc20_balances`
+
+Added 2026-09-25 after the Berachain staging run (250k Safes, 42.9M transfers): the
+operator can't hold an SSH session open all night, and Optimism (15.4M Safes, ~3,000
+chunks at the default `--chunk-size`) means hours, not the ~17 minutes Berachain took.
+Mirrors `backfill_native_balances.py`'s `--celery` / `--wait` / `--status` / `--run-id`
+shape (native is the closer analogue per the task brief) with `backfill_daily_metrics.py`'s
+`--inline` naming convention borrowed only for the flag that keeps the old default
+behaviour explicit in `--help`. `--inline` is *not* a new flag here, unlike
+`backfill_daily_metrics` — no flag at all still means inline, exactly as before P7, so an
+existing cron/runbook line keeps working unchanged.
+
+## Where the logic lives, and why it moved
+
+`_run` / `_run_whale_walk` / `_finish` (three `Command` methods) became `run_chunk_slice` /
+`run_whale_slice` / `finish_run` (three plain, module-level functions in
+`backfill_erc20_balances.py`), plus `resolve_run`, `read_boundary`, `read_head` and
+`count_upto_boundary`. `--inline` calls each bounded function unbounded
+(`max_chunks=None` / `max_ranges=None`) — one call runs the whole phase to completion under
+the single lock `handle()` still acquires once for the entire run, byte-for-byte the same
+behaviour as before this task. The three new Celery tasks
+(`backfill_erc20_balance_chunk_task` / `_whale_task` / `_finish_task`, `tasks.py`) call the
+*same* functions bounded by `--task-chunks` (default `DEFAULT_TASK_CHUNKS = 20`), each task
+acquiring the shared rollup lock for its own slice only and releasing it before dispatching
+the next task — see `tasks.py`'s block comment above `ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX`
+for the full shape and the two deliberate departures from `backfill_native_balance_chunk`
+(native's chain never takes a lock at all; this one must, because a chunk-phase or
+whale-walk slice must never overlap the nightly task's delta step into the same
+`SafeTokenBalance` rows — spec edge case #10b).
+
+## Resumability lives in the DB watermarks, not a Redis cursor — the one place this
+## deliberately does NOT mirror native
+
+`backfill_native_balance_chunk` carries its cursor in the Redis run manifest
+(`run["cursor"]`). This chain does not: `run_chunk_slice` / `run_whale_slice` always read
+`_PROGRESS_WATERMARK` / `_BOUNDARY_WATERMARK` / `_WHALE_PROGRESS_WATERMARK` — the *same*
+three rows `--inline` already used as its resume journal — fresh, at the start of every
+call. The Redis manifest (`build_erc20_balance_backfill_run` /
+`_save_erc20_balance_backfill_run`) exists purely for `--status` / `--wait` / refusing a
+second concurrent `--celery`; it is never read to decide what work is left. Consequence,
+load-bearing for the crash-safety design below: a task's *only* argument is `run_id`, so a
+redelivered, lost, or even accidentally-duplicate-in-flight task can never rewind and
+double-apply an already-committed range — it just re-enters wherever the watermarks
+currently are and continues forward. This is also why `--inline` and `--celery` can
+interleave freely: an inline run interrupted by Ctrl-C resumes under `--celery` and vice
+versa, with no special-casing needed anywhere.
+
+## Crash safety: two layers, neither sufficient alone
+
+The architect's staging addendum asked specifically for checkpointing so a worker or
+broker restart doesn't strand an hours-long Optimism run.
+
+1. **`acks_late=True, reject_on_worker_lost=True`** on all three chain tasks. No existing
+   precedent in this codebase (`grep -r acks_late` found nothing before this change) — but
+   provably safe to add here specifically *because* of the "only argument is `run_id`"
+   property above: nothing about redelivery can cause double-counting, and any concurrent
+   redelivery still serializes on the shared rollup lock before touching the DB. What this
+   does **not** cover: `config/settings/base.py`'s `CELERY_ROUTES` sets `delivery_mode:
+   "transient"` for the `contracts` queue (pre-existing, broker-wide, not touched here) —
+   a *broker* restart, as opposed to a *worker* restart, still loses an in-flight message
+   outright. Layer 2 is what recovers from that.
+2. **Heartbeat + watchdog.** `_save_erc20_balance_backfill_run` refreshes `run["heartbeat_at"]`
+   on every write (every slice's start, success and failure) — one line, not a `_touch()`
+   call threaded through three task bodies, so it can't be forgotten at a new call site
+   later. `erc20_balance_backfill_watchdog_task` (new beat entry, every 5 minutes,
+   `setup_service.py`) re-dispatches the chain when `erc20_balance_backfill_looks_stalled()`
+   says a run is mid-flight (progress rows exist, `erc20_balance` doesn't), its manifest is
+   still `"running"`, and the heartbeat is older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS`
+   (15 min) — then, separately, checks the shared lock is free *right now* before acting
+   (a held lock means genuine work, not a stall; try again next beat). Considered extending
+   `analytics_catchup_task` ("self-healing daily analytics") instead of a new beat task, per
+   the architect's "prefer it if it fits" — it doesn't: that task is entirely `DailyMetric`
+   catch-up domain logic guarded by `compute_daily_metrics_task`'s own lock, with no natural
+   place to hang an unrelated chain's stall check. A small dedicated task was the option the
+   architect explicitly left open for exactly this case.
+
+`--status` now also prints each `--celery` run's heartbeat age and a `STALLED:` line when
+`erc20_balance_backfill_looks_stalled()` would act, so an operator watching the run sees the
+same signal the watchdog does.
+
+## Per-chunk fixed cost: query rewrite, and the three EXPLAINs to run on Berachain staging
+
+Berachain measured 50 chunks (250k Safes / `--chunk-size` 5000) at a flat **~8.3s each,
+including chunks that inserted zero pairs** — a cost that does not look like it scales with
+chunk contents, which is the profile of a query whose cost scales with table position or
+size instead. Three candidates, per the architect's brief; **not guessed at, not
+independently confirmed here** — no Optimism/Berachain-scale `history_safecontract` /
+`history_erc20transfer` exists in this local/CI environment to measure against. Run these
+on Berachain staging (swap in a real `created`/address marker from a `--status` or `psql`
+probe partway through a run, and a real recent block for `head`):
+
+```sql
+-- 1) Seed candidates (marker/boundary-driven page of Safes) --
+--    Use a REAL marker from a run in progress: e.g.
+--    `SELECT block_number, computed_at, address FROM analytics_analyticswatermark
+--     WHERE name = 'erc20_balance_backfill';`
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT address, created
+FROM history_safecontract
+WHERE (
+        '2026-06-01 00:00:00+00'::timestamptz IS NULL
+        OR created > '2026-06-01 00:00:00+00'::timestamptz
+        OR (
+            created = '2026-06-01 00:00:00+00'::timestamptz
+            AND address > '\x0000000000000000000000000000000000000000'::bytea
+        )
+      )
+  AND (
+        created < now() - interval '1 hour'
+        OR (
+            created = now() - interval '1 hour'
+            AND address <= '\xffffffffffffffffffffffffffffffffffffffff'::bytea
+        )
+      )
+ORDER BY created, address
+LIMIT 5000;
+
+-- 2) Run-time whale detection's bounded count, over a REAL chunk's worth of
+--    non-whale addresses (swap in 5000 real `history_safecontract.address`
+--    values from the same window as (1); threshold+1 = 50001 at the default
+--    --whale-row-threshold) --
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT
+    (SELECT COUNT(*) FROM (
+        SELECT 1 FROM history_erc20transfer
+        WHERE "to" = ANY(ARRAY[]::bytea[])  -- paste 5000 real addresses
+        LIMIT 50001
+    ) x) AS to_count,
+    (SELECT COUNT(*) FROM (
+        SELECT 1 FROM history_erc20transfer
+        WHERE "_from" = ANY(ARRAY[]::bytea[])  -- same 5000 addresses
+        LIMIT 50001
+    ) y) AS from_count;
+
+-- 3) The seed SUM over the same chunk's addresses, up to the run's head --
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT addr, token, SUM(signed_value) AS balance
+FROM (
+    SELECT t."to" AS addr, t.address AS token, t.value AS signed_value
+    FROM history_erc20transfer t
+    WHERE t."to" = ANY(ARRAY[]::bytea[])  -- same 5000 addresses
+      AND t.block_number <= 999999999     -- the run's real head
+    UNION ALL
+    SELECT t."_from" AS addr, t.address AS token, -t.value AS signed_value
+    FROM history_erc20transfer t
+    WHERE t."_from" = ANY(ARRAY[]::bytea[])
+      AND t.block_number <= 999999999
+) transfers
+GROUP BY addr, token
+HAVING SUM(signed_value) != 0;
+```
+
+**Rewrote query 1 on the strength of the reasoning alone** (see
+`_ERC20_BALANCE_SAFE_CANDIDATES_SQL`'s comment in `tasks.py`), independent of which of the
+three turns out to be the actual culprit: `history_safecontract` carries a single-column
+btree on `created` only, no composite `(created, address)` index. The original row-
+constructor form, `(created, address) > (x, y)`, is not guaranteed to be planned as a
+sargable range scan against a single-column index the way a plain `created > x` always is —
+whether Postgres derives a loose index condition from a row comparison is planner- and
+statistics-dependent. Decomposed into `created > x OR (created = x AND address > y)` (and
+the symmetric form for the boundary's `<=`), every `created` comparison is now a plain,
+always-sargable single-column predicate; `address` stays a cheap residual filter on however
+many rows share one `created` value, which is rare (`auto_now_add` has microsecond
+resolution — genuine ties come only from same-transaction bulk inserts). **Provably
+equivalent** for a NULL-free total order (`created` is `auto_now_add`, `address` is the
+primary key — neither is ever NULL); proven in `test_backfill_erc20_balances.py`'s
+`TestSeedCandidatesKeysetSemantics` (marker-exclusive / boundary-inclusive with an explicit
+`created` tie, plus a full paginated walk compared against the DB's own `ORDER BY`). An
+actual composite `(created, address)` index on `history_safecontract` would very likely
+help more — noted as an option, **not applied**: that table is upstream Safe code, out of
+scope for this task and this app's migrations.
+
+If EXPLAIN (2) or (3) turns out to be the actual bottleneck instead (or as well), that is a
+separate finding to raise once measured, not something guessed at or fixed here.
+
+## Flags added, `backfill_erc20_balances --help`
+
+`--celery`, `--wait N` (0 = return immediately, matching native), `--poll-interval`,
+`--run-id`, `--status` (now also reports heartbeat age / stalled), `--task-chunks` (default
+20 — see its own comment in the command module for the LOCK_TIMEOUT-vs-throughput
+reasoning). `--chunk-size`, `--restart` and the three `--whale-*` / `--statement-timeout-ms`
+flags are unchanged and apply to both modes.
+
+## Tests
+
+`test_backfill_erc20_balances.py`: Celery mode produces the same result as inline
+(including a whale walk split across several Celery tasks); a chain interrupted mid-slice
+(an exception inside `seed_missing_erc20_balances`) is caught *inside* the task — the
+manifest records `state="failed"` rather than raising out of the management command, unlike
+`--inline` — and a second `--celery` resumes it without double-counting; a second `--celery`
+is refused while a fabricated manifest says `"running"`, but `--restart` still gets through;
+`--status` output and its "writes nothing" guarantee; the nightly rollup stays a no-op
+while a chain is mid-run; the watchdog redispatches a fabricated stalled chain to
+completion, and leaves a fresh heartbeat, a held lock, or an empty/finished state alone; the
+candidates-query rewrite's exclusivity/ordering semantics. One test-writing pitfall worth
+recording: an early version of the whale-walk-across-tasks test set `--whale-block-range=1`
+against a real (large, `BASE_BLOCK`-offset) head — that is thousands of ranges/tasks, which
+recursed the eager-mode Celery chain into a C-stack overflow (`exit=139`, not a
+`RecursionError`) rather than merely running slowly. Not a production bug — a real worker
+consumes one task message at a time, no Python call-stack nesting — but a real trap for any
+other eager-mode Celery-chain test in this codebase that picks a "small" parameter against
+an absolute block number.
+
+---
+
+# Token holdings — P8: whale detection only on demand
+
+Added 2026-09-25, from the follow-up Berachain staging run of the three EXPLAINs P7 left as
+"not guessed at, not independently confirmed here." Query (2), the run-time whale-detection
+bounded count (`_WHALE_BOUNDED_COUNT_SQL`: two `LIMIT 50001` counts over `"to" = ANY(chunk)`
+/ `"_from" = ANY(chunk)`), is the culprit, not query (1) or (3):
+
+| Query | Berachain staging (5,000 Safes/chunk) |
+|---|---|
+| (2) run-time detection (index-only scans) | **4.3s**, ~8.3k cold buffer reads |
+| (3) seed SUM, same chunk, run right after | **0.17s** — warm cache |
+
+Both queries read overlapping index entries for the same address set; running detection
+first meant the seed's own SUM almost always hit a warm cache and looked cheap, while
+detection paid the real cold-read cost. Every chunk paid it — 45 of the 50 Berachain chunks
+found no whale at all, so unconditional detection was doubling the I/O of chunks that never
+needed it for a signal the seed itself only needs a fraction of the time.
+
+## The fix: seed first, detect only after a timeout
+
+`run_chunk_slice` (`backfill_erc20_balances.py`) no longer calls `detect_runtime_whales`
+ahead of the seed. It seeds the chunk's non-whale addresses directly inside
+`transaction.atomic()`, under the existing per-chunk `SET LOCAL statement_timeout`
+(`--statement-timeout-ms`, default 300s). Two outcomes:
+
+- **Seed succeeds:** commit as before. Zero detection queries — proven in
+  `TestNoDetectionOnNormalChunks`, which patches both `detect_runtime_whales` and
+  `_bounded_transfer_row_count` and asserts neither is called for an ordinary chunk.
+- **Seed times out:** Postgres cancels the statement (SQLSTATE 57014); Django re-raises it
+  as `OperationalError`, and the atomic block rolls back — the progress watermark keeps
+  pointing at the previous chunk, exactly as if the chunk had never been attempted. The
+  cancellation is distinguished from any other `OperationalError` (a dropped connection, a
+  dead server — faults that must not be silently retried) with `_is_statement_timeout`
+  (`analytics/services/analytics_service.py`), the same helper the `/active-safes/` and
+  `/active-owners/` ranged reads already use for the identical Postgres-cancel signature:
+  psycopg's `QueryCanceled` class checked first (including on `exc.__cause__`, where Django
+  re-raising puts the original driver exception), the `"canceling statement due to
+  statement timeout"` message as a fallback. Only then does `run_chunk_slice` call
+  `detect_runtime_whales` on the chunk's non-whale addresses — the same bounded-count trick
+  as before, unchanged — record any offender in `Erc20BalanceWhale` (already done inside
+  that function), and retry the chunk once, excluding the addresses detection just flagged.
+
+**Never loops more than once.** A second timeout on the retry raises `CommandError`
+("lower --chunk-size or raise --statement-timeout-ms") instead of trying detection again —
+a chunk that still can't finish after shedding its detected whale(s) needs a smaller chunk
+or a longer budget, not another round of the same diagnostic. The progress watermark is
+untouched by either failed attempt, so the chunk is retried in full on the next invocation.
+`TestSeedTimeoutRetryAlsoTimesOut` proves both halves: the `CommandError`, and that
+`_PROGRESS_WATERMARK.address` is still `None` (the fresh-run value `resolve_run` writes
+before any chunk commits) afterwards.
+
+Detected offenders are summed correctly regardless: they land in `Erc20BalanceWhale` inside
+`detect_runtime_whales` (unchanged), so the post-loop whale walk (`whale_addresses_upto_boundary`
++ `run_whale_slice`) picks them up like any other whale. `TestSeedTimeoutInlineAndCeleryMatch`
+simulates one timeout on a chunk holding a heavy address, and checks the final balance
+(post-retry seed for the light address, post-walk sum for the whale) against
+`erc20_balances_upto_block` under both `--inline` and `--celery` — both call the same
+`run_chunk_slice`, so this is an end-to-end check rather than an inspection of shared code.
+
+## Unchanged by this task
+
+- `refresh_whale_list`'s `pg_stats` seeding at the start of a fresh run (no progress rows
+  yet, or right after `--restart`) — still the first line of defence, still skipped on
+  resume for the reason P7's notes already give (a `pg_stats` whale found mid-resume could
+  already have been seeded as an ordinary Safe by an earlier, already-committed chunk of
+  this same run).
+- The resume rule: detection (now timeout-triggered) only ever touches the *current*
+  unseeded chunk — the progress watermark already guarantees a resumed run never
+  re-examines an already-committed chunk, timeout-triggered detection or not.
+- `detect_runtime_whales` / `_bounded_transfer_row_count` themselves, and
+  `DEFAULT_WHALE_ROW_THRESHOLD` (50,000) — the trigger condition changed, the detection
+  mechanism and its threshold did not.
+
+## Progress output and logging
+
+The per-chunk stdout line only mentions detection when it actually ran: `"chunk k: seed
+timed out, run-time whale detection flagged N address(es)."` (`Command._chunk_progress_cb`,
+gated on a new `seed_timed_out` key in the `"chunk"` progress event — a normal chunk's
+`newly_detected` count is always 0 and now carries no message at all, instead of the old
+unconditional per-chunk line). `run_chunk_slice` also logs the same event at WARNING via the
+module logger (`erc20_balance.backfill: chunk at (...): seed timed out, run-time whale
+detection flagged N address(es); retrying without them`) so it shows up in worker logs under
+`--celery`, which never wires a `progress_cb`.

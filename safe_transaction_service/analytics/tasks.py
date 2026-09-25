@@ -2,7 +2,7 @@ import contextlib
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.conf import settings
@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from celery import app
 from dateutil.relativedelta import relativedelta
+from hexbytes import HexBytes
 from redis.exceptions import LockError
 
 # Force-import `tasks_shards` so its `@app.shared_task` decorators register
@@ -61,6 +62,8 @@ from safe_transaction_service.analytics.services.db import (
 from safe_transaction_service.history.models import (
     ERC20Transfer,
     ERC721Transfer,
+    EthereumBlock,
+    IndexingStatus,
     ModuleTransaction,
     MultisigConfirmation,
     MultisigTransaction,
@@ -69,7 +72,11 @@ from safe_transaction_service.history.models import (
 )
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
-from safe_transaction_service.utils.tasks import LOCK_TIMEOUT, only_one_running_task
+from safe_transaction_service.utils.tasks import (
+    LOCK_TIMEOUT,
+    get_task_lock_name,
+    only_one_running_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1676,6 +1683,1544 @@ def check_native_balance_drift_task(self):
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             return check_native_balance_drift()
+
+
+# ───────────────── Incremental ERC-20 balance rollup ──────────────────
+#
+# Token-holdings spec: `docs/specs/token-holdings.md` §4.2 (workspace root).
+# Same three-phase shape as the native rollup above (seed / delta / mark,
+# one transaction for the last two), with two deliberate departures --
+# both are consequences of `SafeTokenBalance` deleting zero-balance rows
+# instead of keeping one row per Safe (see its docstring in `models.py`):
+#
+#   1. "No row" cannot mean "new Safe" here, because a Safe that fully
+#      exits a token loses its row too. So the seed step is driven by an
+#      explicit marker (`AnalyticsWatermark(name='erc20_balance_safes')`,
+#      an ordered `(created, address)` pair) instead of an anti-join
+#      against the rollup's own rows.
+#   2. The delta step is an UPSERT, not the native delta's plain UPDATE:
+#      an existing Safe picking up a token it never held before is a
+#      completely ordinary event, not a race only the seed step may win.
+#
+# Both steps are bounded by one boundary B -- a `(created, address)` pair
+# taken at the start of the run, at or before every Safe already committed
+# and visible -- so a Safe the indexer inserts *while* the run is
+# executing has `created >= B` and is picked up by neither step this time,
+# and by both, exactly once, next time (spec edge case #10e).
+
+ERC20_BALANCE_WATERMARK = "erc20_balance"
+ERC20_BALANCE_SAFES_WATERMARK = "erc20_balance_safes"
+
+# Sentinel high end of the 20-byte address space, paired with `now() -
+# ERC20_BALANCE_SAFE_SETTLE` to build B (see `erc20_balance_run_boundary`)
+# -- so a tie on `created` down to the microsecond (two rows genuinely
+# created in the same instant) still resolves every *existing* address as
+# `<= B`, since every real address sorts at or below `\xff * 20`.
+_MAX_ADDRESS = b"\xff" * 20
+
+# `history_safecontract.created` is `auto_now_add`, stamped by the
+# indexer's Python code when it builds the row -- but the row is only
+# *visible* to another connection once that indexer transaction commits.
+# A plain `now()` boundary is therefore unsafe: an indexer transaction
+# open when this run starts can have already stamped `created < now()` on
+# a Safe that is still invisible to the candidate query, because its
+# INSERT hasn't committed yet. B would then sail past it, the marker
+# would move beyond it, and neither step would ever see it again -- the
+# Safe is seeded never, and every later delta only adds flow *after* the
+# watermark, so its pre-watermark balance is lost permanently, not just
+# delayed.
+#
+# Backing B off by a safety margin fixes this the same way
+# `native_balance_head_block`'s reorg-depth term does: it must exceed the
+# longest indexer transaction can plausibly stay open, so that by the time
+# a run reads `created <= B`, every transaction that could have stamped a
+# `created` at or before B has committed. A Safe created inside the
+# margin is simply excluded from this run and picked up by the next one --
+# both steps already handle "not yet reached" Safes correctly, so this
+# costs at most one run's delay, never correctness.
+ERC20_BALANCE_SAFE_SETTLE = timedelta(hours=1)
+
+# Cap and batch size are intentionally the *same* constants the native
+# rollup uses (`NATIVE_BALANCE_MAX_SEED_PER_RUN`,
+# `NATIVE_BALANCE_SEED_BATCH_SIZE`), not separate ERC-20 copies with the
+# same value -- "reusing the native guard" per spec §4.2, and one knob to
+# retune instead of two that can drift apart.
+
+# Candidates for step 1: Safes strictly after the marker, at or below B.
+#
+# Marker is exclusive (`>`), not `marker <= ...` as the spec's prose reads
+# -- the marker this run receives is the *exact* `(created, address)` of
+# the last Safe the previous run seeded (the capped case lowers it to
+# exactly that tuple; §4.2). An inclusive `>=` would make that same Safe a
+# candidate again on the very next run and sum its pre-watermark history
+# a second time -- since `address` is a real primary key, "equal to the
+# marker" can only ever mean "is the marker's own row", never a
+# coincidental tie, so there is nothing an inclusive bound would
+# legitimately catch that a strict one misses.
+#
+# Boundary is inclusive (`<=`), not the spec's `< B` read literally -- and
+# it has to be, for the capped case to be internally consistent: when the
+# cap bites, B is lowered to exactly the last *seeded* Safe's own tuple
+# (§4.2), and `apply_erc20_balance_delta` is given that same B to decide
+# which Safes its UPSERT may touch. A strict `<` there would then exclude
+# the very Safe step 1 just seeded (its own tuple is not "less than"
+# itself), leaving it seeded but never delta-applied. `<=` here and `<=`
+# there make one lowered B mean the same set of Safes in both steps, which
+# is the actual requirement ("so both steps still agree") -- the marker's
+# own strict `>` on the next run is what keeps that Safe from being
+# reprocessed, so nothing is lost by not also making this bound strict.
+#
+# `history_safecontract.created` carries its own `db_index=True`, so the
+# `>`/`<=` range and the `ORDER BY` both use it.
+#
+# **P7 staging finding (Berachain, 2026-09-25):** the "there is no
+# composite `(created, address)` index, and there does not need to be
+# one, since a whole run only ever pages a few hundred-to-thousand rows"
+# claim this comment used to make was wrong at Optimism's scale
+# (~3,000 chunks over 15.4M Safes, hours not minutes) — and possibly
+# already wrong on Berachain (250k Safes, 50 chunks measured at a flat
+# ~8.3s each regardless of how many pairs a chunk inserted, which is
+# consistent with, but not proven to be, a per-chunk cost that scales
+# with table size rather than chunk size; see the EXPLAIN statements in
+# the P7 backfill-celery-mode report). The row-constructor form below,
+# `(created, address) > (x, y)`, is NOT guaranteed to be planned as an
+# index range scan against a single-column `created` btree the way a
+# plain `created > x` is: Postgres *can* derive a loose `created >= x`
+# index condition from a row comparison, but whether it does, and
+# whether it also uses the index for the symmetric upper bound, is
+# planner- and statistics-dependent, unlike a plain single-column
+# inequality, which is always sargable. Decomposed into the equivalent
+# OR form below (`a > x OR (a = x AND b > y)` for a NULL-free total
+# order — true here because `created` is `auto_now_add` and `address` is
+# the primary key, so neither column is ever NULL), the `created`
+# comparisons are always plain, unambiguously sargable predicates against
+# the existing single-column index, with the address tie-break staying a
+# cheap residual filter on however many rows share one `created` value
+# (`auto_now_add` has microsecond resolution, so genuine ties are rare —
+# only from bulk inserts in the same transaction). Provably equivalent to
+# the row-constructor form for both bounds — see
+# `test_backfill_erc20_balances.py`'s ordering/exclusivity test. An
+# actual composite `(created, address)` index would help more but
+# touches an upstream table (`history_safecontract`) and is out of scope
+# here — noted as an option for whoever owns that migration, not applied.
+_ERC20_BALANCE_SAFE_CANDIDATES_SQL = """
+SELECT address, created
+FROM history_safecontract
+WHERE (
+        %(marker_created)s::timestamptz IS NULL
+        OR created > %(marker_created)s::timestamptz
+        OR (
+            created = %(marker_created)s::timestamptz
+            AND address > %(marker_address)s::bytea
+        )
+      )
+  AND (
+        created < %(boundary_created)s::timestamptz
+        OR (
+            created = %(boundary_created)s::timestamptz
+            AND address <= %(boundary_address)s::bytea
+        )
+      )
+ORDER BY created, address
+LIMIT %(limit)s
+"""
+
+# Per-(Safe, token) net flow for an explicit address list, through
+# `upto_block` inclusive. Same shape and the same reason as
+# `_NATIVE_BALANCE_SEED_SQL`: driven by the address (`= ANY(...)`), so the
+# block bound is a residual filter, not the access path. `HAVING != 0`
+# mirrors `SafeTokenBalance`'s "balance = 0 is deleted" rule (§4.1) at the
+# source, rather than inserting zero rows and immediately deleting them.
+_ERC20_BALANCES_UPTO_BLOCK_SQL = """
+    SELECT addr, token, SUM(signed_value) AS balance
+    FROM (
+        SELECT t."to" AS addr, t.address AS token, t.value AS signed_value
+        FROM history_erc20transfer t
+        WHERE t."to" = ANY(%s) AND t.block_number <= %s
+        UNION ALL
+        SELECT t."_from" AS addr, t.address AS token, -t.value AS signed_value
+        FROM history_erc20transfer t
+        WHERE t."_from" = ANY(%s) AND t.block_number <= %s
+    ) transfers
+    GROUP BY addr, token
+    HAVING SUM(signed_value) != 0
+"""
+
+# Bulk insert of seeded pairs. `ON CONFLICT DO NOTHING` guards a retried
+# run after a crash before the marker was moved forward -- see
+# `seed_missing_erc20_balances`.
+_ERC20_BALANCE_SEED_INSERT_SQL = """
+INSERT INTO analytics_safetokenbalance (safe_address, token_address, balance)
+SELECT * FROM unnest(%s::bytea[], %s::bytea[], %s::numeric[])
+ON CONFLICT (safe_address, token_address) DO NOTHING
+"""
+
+# The UPSERT half of the incremental step.
+#
+# Driven from `history_ethereumtx.block_id` via `CROSS JOIN LATERAL`, not
+# a plain `JOIN … ON t.ethereum_tx_id = etx.tx_hash`, for the same reason
+# `_NATIVE_BALANCE_DELTA_SQL` is (see its comment for the measured
+# Ethereum EXPLAIN): `history_erc20transfer` carries no index on
+# `block_number` either, and a plain join lets the planner pick a hash
+# join with a sequential scan of the whole table as the probe side. Not
+# independently re-measured on this table -- if the delta turns out slow
+# here, that is the finding to raise, not a detail to fix quietly.
+#
+# The `JOIN history_safecontract sc` (not an anti-join, not a filter on
+# the pair table) is what makes the UPSERT safe despite creating rows: it
+# restricts every touched address to a Safe the boundary already covers,
+# so a counterparty this run's seed step has not reached yet is simply
+# excluded, left for its own seed pass on a later run -- never given a
+# partial row here.
+#
+# Deliberately **not** a single statement with a `DELETE` CTE chained onto
+# this `INSERT ... RETURNING` (an earlier draft tried exactly that, "upsert
+# then clean up what the upsert just wrote" in one round trip). It looked
+# right and it is wrong: Postgres documents that the writable arms of a
+# `WITH` "cannot see one another's effects on the target tables" -- they
+# all run against the snapshot from the start of the statement. Confirmed
+# against this project's own Postgres (2026-09-24): a `DELETE ... USING
+# upserted u WHERE ... AND u.balance = 0` chained onto the `INSERT`
+# consistently upserts the row but deletes nothing, every time, even with
+# nothing else concurrent -- not a race, a documented property of
+# multi-CTE writes on one table. Two statements, both inside the same
+# `transaction.atomic()` block as the caller, is what makes the second one
+# actually see the first one's write.
+_ERC20_BALANCE_UPSERT_SQL = """
+WITH delta AS (
+    SELECT flows.addr AS addr, flows.token AS token, SUM(flows.signed_value) AS delta
+    FROM history_ethereumtx etx
+    CROSS JOIN LATERAL (
+        SELECT t."to" AS addr, t.address AS token, t.value AS signed_value
+        FROM history_erc20transfer t
+        WHERE t.ethereum_tx_id = etx.tx_hash
+        UNION ALL
+        SELECT t."_from" AS addr, t.address AS token, -t.value AS signed_value
+        FROM history_erc20transfer t
+        WHERE t.ethereum_tx_id = etx.tx_hash
+    ) flows
+    JOIN history_safecontract sc ON sc.address = flows.addr
+    WHERE etx.block_id > %(watermark)s AND etx.block_id <= %(head)s
+      -- Inclusive (`<=`), matching `_ERC20_BALANCE_SAFE_CANDIDATES_SQL` --
+      -- see that constant's comment. A capped run lowers B to exactly the
+      -- last *seeded* Safe's own tuple, and this UPSERT must still be
+      -- able to touch that Safe.
+      AND (sc.created, sc.address) <= (%(boundary_created)s::timestamptz, %(boundary_address)s::bytea)
+    GROUP BY flows.addr, flows.token
+)
+INSERT INTO analytics_safetokenbalance (safe_address, token_address, balance)
+SELECT addr, token, delta FROM delta
+ON CONFLICT (safe_address, token_address)
+DO UPDATE SET balance = analytics_safetokenbalance.balance + EXCLUDED.balance
+RETURNING safe_address, token_address, balance
+"""
+
+# The cleanup half: only the pairs the UPSERT above just touched, and only
+# if they netted to zero -- never a full-table `WHERE balance = 0` scan.
+# `unnest` of two parallel arrays is the same idiom `_NATIVE_BALANCE_SEED_INSERT_SQL`
+# uses for the reverse (insert) direction.
+_ERC20_BALANCE_DELETE_ZERO_SQL = """
+DELETE FROM analytics_safetokenbalance b
+USING unnest(%s::bytea[], %s::bytea[]) AS touched(safe_address, token_address)
+WHERE b.safe_address = touched.safe_address
+  AND b.token_address = touched.token_address
+  AND b.balance = 0
+"""
+
+# Pair rows whose Safe no longer exists -- same cause (a reorg cascade
+# through `SafeContract`) and the same "count, don't delete" handling as
+# `_NATIVE_BALANCE_ORPHANS_SQL`.
+_ERC20_BALANCE_ORPHANS_SQL = """
+SELECT COUNT(*)
+FROM analytics_safetokenbalance b
+WHERE NOT EXISTS (
+    SELECT 1 FROM history_safecontract sc WHERE sc.address = b.safe_address
+)
+"""
+
+# `TokenHolding` is rewritten wholesale (see its docstring), not upserted:
+# a token whose last holder just dropped to zero must disappear, not sit
+# stale. The `EXISTS` join excludes orphan pairs from both `holders` and
+# `total_balance`, same as `safes_with_any_erc20` below excludes them from
+# the chain-level count.
+_TOKEN_HOLDING_REBUILD_SQL = """
+INSERT INTO analytics_tokenholding
+    (token_address, holders, negative_pairs, total_balance,
+     as_of_block, as_of_timestamp, computed_at)
+SELECT
+    b.token_address,
+    COUNT(*) FILTER (WHERE b.balance > 0),
+    COUNT(*) FILTER (WHERE b.balance < 0),
+    COALESCE(SUM(b.balance) FILTER (WHERE b.balance > 0), 0),
+    %(as_of_block)s,
+    %(as_of_timestamp)s,
+    %(computed_at)s
+FROM analytics_safetokenbalance b
+WHERE EXISTS (SELECT 1 FROM history_safecontract sc WHERE sc.address = b.safe_address)
+GROUP BY b.token_address
+"""
+
+_SAFES_WITH_ANY_ERC20_SQL = """
+SELECT COUNT(DISTINCT b.safe_address)
+FROM analytics_safetokenbalance b
+WHERE b.balance > 0
+  AND EXISTS (SELECT 1 FROM history_safecontract sc WHERE sc.address = b.safe_address)
+"""
+
+
+def erc20_balance_head_block() -> int | None:
+    """Highest block the ERC-20 balance rollup may consume.
+
+    Same reorg-safety formula as ``native_balance_head_block``
+    (``min(confirmed head, tip - ETH_REORG_BLOCKS)``), reusing its SQL —
+    but the third term bounds on the ERC20/721 events indexer's own
+    progress (``IndexingStatus(indexing_type=ERC20_721_EVENTS)``) instead
+    of the master-copies indexer that writes ``InternalTx``: this rollup
+    consumes ``history_erc20transfer``, which the ERC20/721 events indexer
+    populates, not the trace indexer native depends on. See
+    ``native_balance_head_block``'s docstring for why a third term is
+    needed at all — block presence in ``EthereumBlock`` can outrun
+    whichever indexer actually wrote the rows a rollup consumes.
+
+    Returns ``None`` when nothing is safe to consume yet.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(_NATIVE_BALANCE_HEAD_SQL)
+        confirmed_head, tip = cursor.fetchone()
+    if confirmed_head is None or tip is None:
+        return None
+    depth_head = int(tip) - settings.ETH_REORG_BLOCKS
+    head = min(int(confirmed_head), depth_head)
+    try:
+        indexed_head = (
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number
+        )
+    except IndexingStatus.DoesNotExist:
+        indexed_head = None
+    if indexed_head is not None and int(indexed_head) < head:
+        logger.info(
+            "erc20_balance.head: ERC20/721 events indexer is at %d, below the "
+            "reorg-safe head %d — consuming only what it has written",
+            indexed_head,
+            head,
+        )
+        head = int(indexed_head)
+    if head < 0:
+        return None
+    return head
+
+
+def erc20_balance_run_boundary() -> tuple[datetime, bytes]:
+    """Boundary B for one incremental run — ``(now - ERC20_BALANCE_SAFE_SETTLE,
+    _MAX_ADDRESS)`` — taken once at the start (token-holdings spec §4.2).
+
+    Backed off by ``ERC20_BALANCE_SAFE_SETTLE``, not a plain ``now()`` —
+    see that constant's comment for why an uncommitted indexer transaction
+    makes a plain ``now()`` boundary lose a Safe's pre-watermark balance
+    permanently. Every Safe committed and visible at least
+    ``ERC20_BALANCE_SAFE_SETTLE`` ago satisfies ``(created, address) <= B``
+    regardless of its own address (the max-address second component
+    absorbs a tie on ``created`` down to the microsecond). A Safe created
+    more recently than that is excluded from both steps this run and
+    picked up cleanly, once, by a later run's own boundary.
+
+    A plain function (not a query) on purpose: unlike native, there is no
+    "does at least one Safe exist" question to answer here — an empty
+    ``history_safecontract`` just makes both steps below find nothing, the
+    same as any other day with no new Safes.
+    """
+    return timezone.now() - ERC20_BALANCE_SAFE_SETTLE, _MAX_ADDRESS
+
+
+def erc20_balance_seed_candidates(
+    marker: tuple[datetime, bytes] | None,
+    boundary: tuple[datetime, bytes],
+    limit: int,
+) -> list[tuple[bytes, datetime]]:
+    """Up to ``limit`` Safes with ``marker < (created, address) <= boundary``,
+    in ``(created, address)`` order — the Safes step 1 of one incremental
+    run seeds. ``marker`` is exclusive, ``boundary`` is inclusive; see
+    ``_ERC20_BALANCE_SAFE_CANDIDATES_SQL``.
+
+    ``marker`` is ``None`` on the very first run (nothing seeded yet, so
+    every Safe below ``boundary`` is a candidate). Returns ``(address,
+    created)`` pairs so a caller that hits the cap can read the last one
+    off the end, for lowering B, without a second query.
+    """
+    marker_created, marker_address = marker if marker is not None else (None, None)
+    boundary_created, boundary_address = boundary
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _ERC20_BALANCE_SAFE_CANDIDATES_SQL,
+            {
+                "marker_created": marker_created,
+                "marker_address": marker_address,
+                "boundary_created": boundary_created,
+                "boundary_address": boundary_address,
+                "limit": limit,
+            },
+        )
+        return [(bytes(row[0]), row[1]) for row in cursor.fetchall()]
+
+
+def erc20_balances_upto_block(
+    address_bytes: list[bytes], upto_block: int
+) -> dict[tuple[bytes, bytes], Decimal]:
+    """Every non-zero ``(Safe, token)`` balance for ``address_bytes``,
+    summed over ``history_erc20transfer`` through ``upto_block`` inclusive.
+
+    The full-history recompute both the nightly seed step and the backfill
+    command need — exposed as a plain, reusable function rather than
+    folded into a write path. Driven in batches of
+    ``NATIVE_BALANCE_SEED_BATCH_SIZE`` addresses, the same batch size
+    ``_NATIVE_BALANCE_SEED_SQL`` uses, because that is the ``= ANY(...)``
+    plan it was measured on.
+    """
+    balances: dict[tuple[bytes, bytes], Decimal] = {}
+    if not address_bytes:
+        return balances
+    for offset in range(0, len(address_bytes), NATIVE_BALANCE_SEED_BATCH_SIZE):
+        batch = address_bytes[offset : offset + NATIVE_BALANCE_SEED_BATCH_SIZE]
+        with connection.cursor() as cursor:
+            cursor.execute(
+                _ERC20_BALANCES_UPTO_BLOCK_SQL, [batch, upto_block, batch, upto_block]
+            )
+            for addr, token, balance in cursor.fetchall():
+                balances[(bytes(addr), bytes(token))] = Decimal(balance)
+    return balances
+
+
+def seed_missing_erc20_balances(
+    address_bytes: list[bytes], upto_block: int
+) -> tuple[int, int]:
+    """Seed non-zero ``(Safe, token)`` pairs for ``address_bytes`` at
+    ``upto_block``. Returns ``(safes_processed, pairs_inserted)``.
+
+    Unlike ``seed_missing_native_balances`` there is no "already present"
+    check: a Safe reaches this function once, because the caller selects
+    candidates from the ``erc20_balance_safes`` marker rather than from
+    "no row exists" (§4.1 — a token pair's absence means "never held or
+    fully exited", not "new Safe"). ``ON CONFLICT DO NOTHING`` still
+    guards a run retried after a crash before the marker was moved.
+    """
+    if not address_bytes:
+        return 0, 0
+    balances = erc20_balances_upto_block(address_bytes, upto_block)
+    if not balances:
+        return len(address_bytes), 0
+    safes, tokens, amounts = [], [], []
+    for (safe, token), balance in balances.items():
+        safes.append(safe)
+        tokens.append(token)
+        amounts.append(balance)
+    with connection.cursor() as cursor:
+        cursor.execute(_ERC20_BALANCE_SEED_INSERT_SQL, [safes, tokens, amounts])
+    return len(address_bytes), len(balances)
+
+
+def apply_erc20_balance_delta(
+    watermark: int, head: int, boundary: tuple[datetime, bytes]
+) -> tuple[int, int]:
+    """Apply the net ERC-20 flow of ``(watermark, head]`` to the pair
+    table, restricted to Safes ``(created, address) <= boundary``. Returns
+    ``(pairs_upserted, pairs_deleted)``.
+
+    An UPSERT, not the plain UPDATE ``_apply_native_balance_delta`` uses —
+    see ``_ERC20_BALANCE_UPSERT_SQL``'s comment for why that is safe here.
+
+    Two statements, not one — see ``_ERC20_BALANCE_UPSERT_SQL``'s comment
+    for why a single multi-CTE statement silently deletes nothing here.
+    Both still run inside the caller's ``transaction.atomic()``, so the
+    pair is as atomic as the old single-statement version would have
+    been; only the "one round trip" property is gone.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _ERC20_BALANCE_UPSERT_SQL,
+            {
+                "watermark": watermark,
+                "head": head,
+                "boundary_created": boundary[0],
+                "boundary_address": boundary[1],
+            },
+        )
+        upserted_rows = cursor.fetchall()
+        zeroed_safes = [row[0] for row in upserted_rows if row[2] == 0]
+        zeroed_tokens = [row[1] for row in upserted_rows if row[2] == 0]
+        deleted = 0
+        if zeroed_safes:
+            cursor.execute(
+                _ERC20_BALANCE_DELETE_ZERO_SQL, [zeroed_safes, zeroed_tokens]
+            )
+            deleted = cursor.rowcount
+    return len(upserted_rows), deleted
+
+
+def count_erc20_balance_orphans() -> int:
+    """Pair rows whose Safe no longer exists in ``history_safecontract``.
+    See ``_ERC20_BALANCE_ORPHANS_SQL``.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(_ERC20_BALANCE_ORPHANS_SQL)
+        return int(cursor.fetchone()[0] or 0)
+
+
+def rebuild_token_holdings(as_of_block: int, as_of_timestamp, computed_at) -> dict:
+    """Rewrite ``TokenHolding`` wholesale from ``SafeTokenBalance`` and
+    return the chain-level counts for ``AnalyticsSnapshot(name=
+    'token_holdings')``: ``{tokens_with_holders, safes_with_any_erc20,
+    negative_pairs_total, orphan_pairs}``.
+
+    A full delete + insert, not an upsert — see ``_TOKEN_HOLDING_REBUILD_SQL``.
+    Must run inside the same transaction as ``apply_erc20_balance_delta``
+    and the watermark writes (§4.1: "written in the same transaction as
+    TokenHolding").
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM analytics_tokenholding")
+        cursor.execute(
+            _TOKEN_HOLDING_REBUILD_SQL,
+            {
+                "as_of_block": as_of_block,
+                "as_of_timestamp": as_of_timestamp,
+                "computed_at": computed_at,
+            },
+        )
+        cursor.execute("SELECT COUNT(*) FROM analytics_tokenholding WHERE holders > 0")
+        tokens_with_holders = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COALESCE(SUM(negative_pairs), 0) FROM analytics_tokenholding"
+        )
+        negative_pairs_total = cursor.fetchone()[0]
+        cursor.execute(_SAFES_WITH_ANY_ERC20_SQL)
+        safes_with_any_erc20 = cursor.fetchone()[0]
+    return {
+        "tokens_with_holders": int(tokens_with_holders or 0),
+        "safes_with_any_erc20": int(safes_with_any_erc20 or 0),
+        "negative_pairs_total": int(negative_pairs_total or 0),
+        "orphan_pairs": count_erc20_balance_orphans(),
+    }
+
+
+def run_erc20_balance_rollup() -> dict | None:
+    """One incremental pass over the ERC-20 balance rollup — seed new
+    Safes, apply the delta, rebuild the read model. See the token-holdings
+    spec §4.2.
+
+    Unlike ``run_native_balance_rollup`` this never cold-starts itself:
+    the (Safe, token) pair space has no bound small enough to trust
+    seeding inline the way a handful of native rows is. A missing
+    ``erc20_balance`` watermark always means "run ``manage.py
+    backfill_erc20_balances`` once" — see the log line below.
+
+    Returns a summary dict, or ``None`` when the run declined to do
+    anything. Every declining path logs; the ones that mean something is
+    wrong log at ERROR, mirroring ``run_native_balance_rollup``.
+    """
+    started = time.time()
+    head = erc20_balance_head_block()
+    if head is None:
+        logger.info(
+            "erc20_balance.rollup: no confirmed block within the reorg depth "
+            "yet; nothing to consume"
+        )
+        return None
+
+    watermark_row = AnalyticsWatermark.objects.filter(
+        name=ERC20_BALANCE_WATERMARK
+    ).first()
+    if watermark_row is None:
+        logger.info(
+            "erc20_balance.rollup: no '%s' watermark yet. Run `manage.py "
+            "backfill_erc20_balances` once to initialise the rollup — unlike "
+            "native, this task never seeds a fleet from cold: the (Safe, "
+            "token) pair space has no bound small enough to trust inline.",
+            ERC20_BALANCE_WATERMARK,
+        )
+        return None
+
+    watermark = watermark_row.block_number
+    if watermark > head:
+        logger.error(
+            "erc20_balance.rollup: watermark=%d is ahead of the safe head=%d. "
+            "Blocks this rollup already applied have been removed — a reorg "
+            "deeper than the confirmation zone, or a database restore — and "
+            "the rows needed to undo them went with them. Refusing to run; "
+            "rebuild with `manage.py backfill_erc20_balances --restart`.",
+            watermark,
+            head,
+        )
+        return None
+
+    boundary = erc20_balance_run_boundary()
+
+    marker_row = AnalyticsWatermark.objects.filter(
+        name=ERC20_BALANCE_SAFES_WATERMARK
+    ).first()
+    # `AnalyticsWatermark.address` is an `EthereumAddressBinaryField`: the
+    # ORM hands back a checksummed hex *string* (`from_db_value`), not raw
+    # bytes — `HexBytes(...)`, not `bytes(...)`, is what turns that back
+    # into the 20-byte value the raw-SQL helpers below compare against
+    # `bytea` columns.
+    marker = (
+        (marker_row.computed_at, HexBytes(marker_row.address))
+        if marker_row is not None and marker_row.address is not None
+        else None
+    )
+
+    with relaxed_statement_timeout():
+        candidates = erc20_balance_seed_candidates(
+            marker, boundary, NATIVE_BALANCE_MAX_SEED_PER_RUN + 1
+        )
+        capped = len(candidates) > NATIVE_BALANCE_MAX_SEED_PER_RUN
+        if capped:
+            candidates = candidates[:NATIVE_BALANCE_MAX_SEED_PER_RUN]
+            last_address, last_created = candidates[-1]
+            new_boundary = (last_created, last_address)
+            logger.info(
+                "erc20_balance.rollup: more new Safes than the %d-per-run "
+                "seed cap; lowering this run's boundary to (%s, 0x%s) so the "
+                "delta step agrees with what was actually seeded",
+                NATIVE_BALANCE_MAX_SEED_PER_RUN,
+                last_created,
+                last_address.hex(),
+            )
+        else:
+            new_boundary = boundary
+
+        seed_addresses = [addr for addr, _created in candidates]
+        # Seeded at the OLD watermark, deliberately, and outside the
+        # transaction below — seeding is idempotent (`DO NOTHING`), so a
+        # failure after it leaves rows the next run simply finds already
+        # present, same reasoning as the native seed step.
+        seeded_safes, seeded_pairs = seed_missing_erc20_balances(
+            seed_addresses, watermark
+        )
+
+        with transaction.atomic():
+            touched, deleted = apply_erc20_balance_delta(watermark, head, new_boundary)
+            now = timezone.now()
+            AnalyticsWatermark.objects.update_or_create(
+                name=ERC20_BALANCE_WATERMARK,
+                defaults={"block_number": head, "computed_at": now},
+            )
+            AnalyticsWatermark.objects.update_or_create(
+                name=ERC20_BALANCE_SAFES_WATERMARK,
+                defaults={
+                    "block_number": head,
+                    "computed_at": new_boundary[0],
+                    "address": new_boundary[1],
+                },
+            )
+            as_of_timestamp = (
+                EthereumBlock.objects.filter(number=head)
+                .values_list("timestamp", flat=True)
+                .first()
+                or now
+            )
+            chain_level = rebuild_token_holdings(head, as_of_timestamp, now)
+            _write_snapshot(
+                "token_holdings",
+                {
+                    "as_of_block": head,
+                    "as_of_timestamp": as_of_timestamp.isoformat(),
+                    **chain_level,
+                },
+            )
+
+    summary = {
+        "watermark_from": watermark,
+        "watermark_to": head,
+        "blocks": head - watermark,
+        "seeded_safes": seeded_safes,
+        "seeded_pairs": seeded_pairs,
+        "touched_pairs": touched,
+        "deleted_pairs": deleted,
+        **chain_level,
+    }
+    logger.info(
+        "erc20_balance.rollup: completed in %.2fs blocks=(%d, %d] "
+        "seeded_safes=%d seeded_pairs=%d touched=%d deleted=%d "
+        "tokens_with_holders=%d safes_with_any_erc20=%d orphan_pairs=%d",
+        time.time() - started,
+        watermark,
+        head,
+        seeded_safes,
+        seeded_pairs,
+        touched,
+        deleted,
+        chain_level["tokens_with_holders"],
+        chain_level["safes_with_any_erc20"],
+        chain_level["orphan_pairs"],
+    )
+    return summary
+
+
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def compute_erc20_balance_rollup_task(self):
+    """Advance the incremental ERC-20 balance rollup (daily at 03:45 UTC,
+    after ``compute_tvl_task``).
+
+    Lives in ``tasks.py`` for the same Celery-routing reason as
+    ``compute_native_balance_rollup_task`` — see its docstring.
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            return run_erc20_balance_rollup()
+
+
+# ───────────── ERC-20 balance backfill, chunked on Celery (P7) ─────────
+#
+# `manage.py backfill_erc20_balances --celery` for when the run should
+# outlive the shell that started it (token-holdings spec §4.3, §12 P7) —
+# the same operator problem `backfill_native_balance_chunk`
+# (`tasks_shards.py`) and `backfill_daily_metrics`'s chunked mode solve,
+# with two departures forced by this rollup's own design:
+#
+#   1. **Resumability lives in the `erc20_balance_backfill*` watermark
+#      rows, not a Redis cursor.** Those three rows
+#      (`erc20_balance_backfill`, `erc20_balance_backfill_boundary`,
+#      `erc20_balance_backfill_whales` — see
+#      `analytics/management/commands/backfill_erc20_balances.py`'s module
+#      docstring) are already the resume journal `--inline` mode writes.
+#      Reusing them as the *only* source of truth means inline and Celery
+#      modes can interleave freely: an inline run interrupted by Ctrl-C
+#      resumes fine under `--celery`, and a Celery run a worker lost
+#      resumes fine under `--inline`. The Redis manifest below exists
+#      purely for `--status` / `--wait` / refusing a second concurrent
+#      `--celery` — it is never read to decide what work is left, only to
+#      report it.
+#   2. **Every slice holds the shared rollup lock itself, for the
+#      duration of that slice only**, released before the next task is
+#      dispatched — not held for the whole run the way `--inline` holds
+#      it once, nor never taken at all the way
+#      `backfill_native_balance_chunk` runs lock-free. `SafeTokenBalance`
+#      deletes zero-balance rows and the nightly rollup UPSERTs into the
+#      same table (spec edge case #10b), so a chunk-phase or whale-walk
+#      slice must never overlap the nightly task's delta step. Between
+#      slices the nightly task may take the lock; that is safe, because
+#      `run_erc20_balance_rollup` is a no-op until the `erc20_balance`
+#      watermark exists, and that is only written by the finish step.
+#      A slice that cannot get the lock (the nightly task or another
+#      writer has it) retries itself after a short countdown rather than
+#      failing the run — there is no existing lock-contention precedent
+#      in either reference backfill to mirror (native's chain does not
+#      lock at all; see the command module's own note on this deviation).
+#
+# Shape: `backfill_erc20_balance_chunk_task` runs up to `task_chunks` Safe
+# chunks (`run_chunk_slice`, plain-function, shared with `--inline`) and
+# dispatches its own successor, exactly like `backfill_native_balance_chunk`
+# — until seeding is done, when it hands off to
+# `backfill_erc20_balance_whale_task` (up to `task_chunks` whale
+# block-ranges per task, `run_whale_slice`), which itself hands off to
+# `backfill_erc20_balance_finish_task` (one-shot: writes the real
+# `erc20_balance` / `erc20_balance_safes` watermarks and rebuilds
+# `TokenHolding`, `finish_run`). Each task is wrapped in
+# `@task_timeout(timeout_seconds=LOCK_TIMEOUT)`, the same bound
+# `backfill_native_balance_chunk` uses — `task_chunks`'s default is picked
+# so a slice's total work comfortably clears it even on a slow chunk (see
+# `DEFAULT_TASK_CHUNKS`'s comment in the command module).
+#
+# **Crash safety (P7 staging addendum, 2026-09-25).** Optimism's ~3,000
+# chunks mean this chain runs for hours — long enough to outlast at least
+# one ordinary worker restart. Two layers, neither sufficient alone:
+#
+#   1. `acks_late=True, reject_on_worker_lost=True` on all three tasks
+#      (no precedent elsewhere in this codebase — `grep` for
+#      `acks_late` before this change found none — but safe to add here
+#      specifically because a task's *only* argument is `run_id`; all
+#      progress state is read fresh from the DB / manifest at call time,
+#      never baked into the task signature the way a keyset cursor would
+#      be. A redelivered (possibly duplicate, possibly concurrent) call
+#      just re-enters `run_chunk_slice` / `run_whale_slice`, which reads
+#      wherever the watermarks currently are and continues forward from
+#      there — it cannot rewind and double-apply an already-committed
+#      range. Concurrent redeliveries still serialize on the shared
+#      rollup lock, so two copies never do DB work at the same instant
+#      either. What this does NOT cover: `CELERY_ROUTES` sets
+#      `delivery_mode: "transient"` for the `contracts` queue (not
+#      changed here — that is a broker-wide, pre-existing choice, not
+#      specific to this chain), so a *broker* restart, as opposed to a
+#      *worker* restart, still loses an in-flight message outright. Layer
+#      2 below is what recovers from that.
+#   2. A heartbeat on the run manifest (`heartbeat_at`, refreshed by
+#      every `_save_erc20_balance_backfill_run` call — i.e. on every
+#      slice's start, success and failure) plus
+#      `erc20_balance_backfill_watchdog_task`, a beat task (every 5
+#      minutes, `setup_service.py`) that re-dispatches the chain when the
+#      progress watermarks say a run is mid-flight, its manifest is still
+#      `"running"`, the heartbeat has gone stale
+#      (`ERC20_BALANCE_BACKFILL_STALE_SECONDS`), and the shared lock is
+#      free right now (proof nothing legitimate is in flight this
+#      instant). See `erc20_balance_backfill_looks_stalled` and
+#      `erc20_balance_backfill_watchdog_task` below.
+
+ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX = "analytics_erc20_balance_backfill_run:"
+ERC20_BALANCE_BACKFILL_CURSOR_KEY = "analytics_erc20_balance_backfill_cursor"
+
+# How long a slice that lost the lock race waits before trying again. Not
+# mirrored from either reference backfill (see the block comment above) —
+# short enough that a run does not visibly stall behind one nightly-task
+# cycle, long enough not to hammer Redis if the lock is held for a while.
+ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN = 15
+
+# How stale `heartbeat_at` must be before the watchdog treats a
+# "running" manifest as stalled rather than merely between slices. The
+# architect's own figure (P7 addendum, 2026-09-25): long enough that an
+# ordinary slice (normally well under a minute; see `DEFAULT_TASK_CHUNKS`)
+# never trips it, short enough that a genuine stall does not sit silent
+# for hours on an Optimism-sized run.
+ERC20_BALANCE_BACKFILL_STALE_SECONDS = 15 * 60
+
+
+def erc20_balance_backfill_run_key(run_id: str) -> str:
+    return f"{ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX}{run_id}"
+
+
+def _erc20_backfill_redis_set_json(key: str, value: dict) -> None:
+    get_redis().set(key, json.dumps(value), ex=tasks_shards.BACKFILL_KEY_TTL_SECONDS)
+
+
+def _erc20_backfill_redis_get_json(key: str) -> dict | None:
+    blob = get_redis().get(key)
+    if not blob:
+        return None
+    try:
+        return json.loads(blob)
+    except (TypeError, ValueError):
+        logger.warning("erc20_balance.backfill: unreadable JSON at redis key %s", key)
+        return None
+
+
+def load_erc20_balance_backfill_run(run_id: str) -> dict | None:
+    """Return the run manifest for ``run_id``, or ``None`` if unknown/expired."""
+    return _erc20_backfill_redis_get_json(erc20_balance_backfill_run_key(run_id))
+
+
+def latest_erc20_balance_backfill_run_id() -> str | None:
+    pointer = _erc20_backfill_redis_get_json(ERC20_BALANCE_BACKFILL_CURSOR_KEY)
+    if pointer and isinstance(pointer.get("run_id"), str):
+        return pointer["run_id"]
+    return None
+
+
+def _save_erc20_balance_backfill_run(run: dict) -> None:
+    """Persist the manifest and refresh its heartbeat in the same write.
+    Every meaningful state change (slice start, success, failure, finish)
+    already calls this, so touching `heartbeat_at` here — rather than at
+    each of those call sites individually — is what makes the watchdog's
+    staleness check (`erc20_balance_backfill_looks_stalled`) correct by
+    construction instead of by remembering to call a separate `_touch()`
+    everywhere.
+    """
+    run["heartbeat_at"] = timezone.now().isoformat()
+    _erc20_backfill_redis_set_json(run["run_key"], run)
+
+
+def _erc20_backfill_options_from_run(run: dict) -> dict:
+    """Reconstruct the ``options`` dict ``run_chunk_slice`` / ``run_whale_slice``
+    expect, from the fields the manifest was built with."""
+    return {
+        "chunk_size": run["chunk_size"],
+        "whale_min_frequency": run["whale_min_frequency"],
+        "whale_row_threshold": run["whale_row_threshold"],
+        "whale_block_range": run["whale_block_range"],
+        "statement_timeout_ms": run["statement_timeout_ms"],
+    }
+
+
+def build_erc20_balance_backfill_run(
+    *,
+    chunk_size: int,
+    whale_min_frequency: float,
+    whale_row_threshold: int,
+    whale_block_range: int,
+    statement_timeout_ms: int,
+    task_chunks: int,
+    run_id: str | None = None,
+) -> dict:
+    """Pure helper: a fresh manifest. Nothing is written or dispatched —
+    see ``dispatch_erc20_balance_backfill_run``."""
+    run_id = run_id or tasks_shards.new_backfill_run_id()
+    return {
+        "run_id": run_id,
+        "run_key": erc20_balance_backfill_run_key(run_id),
+        "phase": "chunks",
+        "state": "running",
+        "started_at": timezone.now().isoformat(),
+        "finished_at": None,
+        "error": None,
+        "chunk_size": chunk_size,
+        "whale_min_frequency": whale_min_frequency,
+        "whale_row_threshold": whale_row_threshold,
+        "whale_block_range": whale_block_range,
+        "statement_timeout_ms": statement_timeout_ms,
+        "task_chunks": task_chunks,
+        "slices_done": 0,
+        "chunks_done": 0,
+        "safes_seen": 0,
+        "safes_seeded": 0,
+        "pairs_touched": 0,
+        "whale_skipped": 0,
+        "whale_ranges_done": 0,
+        "whale_safes_summed": 0,
+        "head": None,
+    }
+
+
+def dispatch_erc20_balance_backfill_run(run: dict) -> dict:
+    """Persist a fresh manifest, point the cursor key at it and dispatch
+    the first chunk-phase task. Later slices dispatch themselves on the
+    worker, so the caller (the management command) may exit immediately.
+    """
+    _save_erc20_balance_backfill_run(run)
+    _erc20_backfill_redis_set_json(
+        ERC20_BALANCE_BACKFILL_CURSOR_KEY,
+        {
+            "run_id": run["run_id"],
+            "run_key": run["run_key"],
+            "started_at": run["started_at"],
+        },
+    )
+    backfill_erc20_balance_chunk_task.apply_async((run["run_id"],), queue="contracts")
+    return load_erc20_balance_backfill_run(run["run_id"]) or run
+
+
+@app.shared_task(acks_late=True, reject_on_worker_lost=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def backfill_erc20_balance_chunk_task(run_id: str) -> dict:
+    """One bounded slice (up to ``task_chunks`` Safe chunks) of the
+    backfill's seed phase, then dispatch the next slice — or the
+    whale-walk phase once seeding is done. See the block comment above
+    ``ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX`` for the two departures from
+    ``backfill_native_balance_chunk``'s shape.
+    """
+    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        run_chunk_slice,
+    )
+
+    run = load_erc20_balance_backfill_run(run_id)
+    if run is None:
+        logger.warning(
+            "erc20_balance.backfill: run=%s manifest is gone (expired or "
+            "flushed); stopping the chain",
+            run_id,
+        )
+        return {"run_id": run_id, "state": "unknown"}
+    if run.get("state") != "running":
+        logger.info(
+            "erc20_balance.backfill: run=%s is %s, not dispatching further chunks",
+            run_id,
+            run.get("state"),
+        )
+        return run
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_erc20_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        logger.info(
+            "erc20_balance.backfill: run=%s chunk slice could not get the "
+            "rollup lock (nightly task or another writer has it); "
+            "retrying in %ds",
+            run_id,
+            ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        backfill_erc20_balance_chunk_task.apply_async(
+            (run_id,),
+            queue="contracts",
+            countdown=ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        return run
+
+    started = time.time()
+    try:
+        try:
+            result = run_chunk_slice(
+                _erc20_backfill_options_from_run(run),
+                lock,
+                max_chunks=run["task_chunks"],
+            )
+        finally:
+            lock.release()
+    except Exception as exc:
+        logger.exception("erc20_balance.backfill: run=%s chunk slice failed", run_id)
+        run["state"] = "failed"
+        run["error"] = str(exc)[:500]
+        run["finished_at"] = timezone.now().isoformat()
+        _save_erc20_balance_backfill_run(run)
+        return run
+
+    run["slices_done"] += 1
+    run["chunks_done"] += result["chunks_done"]
+    run["safes_seen"] += result["seen"]
+    run["safes_seeded"] += result["seeded_safes"]
+    run["pairs_touched"] += result["pairs_inserted"]
+    run["whale_skipped"] += result["whale_skipped"]
+    run["head"] = result["head"]
+    # Persisted BEFORE the dispatch below and never after it — same reason
+    # as `backfill_native_balance_chunk`'s own comment: under eager mode
+    # the rest of the chain runs inside `apply_async`, so a write
+    # afterwards would clobber newer state with this stale copy.
+    _save_erc20_balance_backfill_run(run)
+
+    logger.info(
+        "erc20_balance.backfill: run=%s chunk slice done in %.2fs "
+        "chunks=%d seen=%d seeded=%d whale_skipped=%d finished_seeding=%s",
+        run_id,
+        time.time() - started,
+        result["chunks_done"],
+        result["seen"],
+        result["seeded_safes"],
+        result["whale_skipped"],
+        result["finished_seeding"],
+    )
+
+    if result["finished_seeding"]:
+        run["phase"] = "whales"
+        _save_erc20_balance_backfill_run(run)
+        backfill_erc20_balance_whale_task.apply_async((run_id,), queue="contracts")
+    else:
+        backfill_erc20_balance_chunk_task.apply_async((run_id,), queue="contracts")
+    return run
+
+
+@app.shared_task(acks_late=True, reject_on_worker_lost=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def backfill_erc20_balance_whale_task(run_id: str) -> dict:
+    """One bounded slice (up to ``task_chunks`` whale block-ranges) of the
+    backfill's whale-walk phase, then dispatch the next slice — or the
+    finish step once the walk covers ``(0, head]``. The whale address set
+    is recomputed at the start of every slice from ``Erc20BalanceWhale``
+    and the boundary (``whale_addresses_upto_boundary``) — safe to do on
+    every invocation by construction; see that function's docstring.
+    """
+    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        read_boundary,
+        read_head,
+        run_whale_slice,
+        whale_addresses_upto_boundary,
+    )
+
+    run = load_erc20_balance_backfill_run(run_id)
+    if run is None:
+        logger.warning(
+            "erc20_balance.backfill: run=%s manifest is gone; stopping "
+            "before the whale walk",
+            run_id,
+        )
+        return {"run_id": run_id, "state": "unknown"}
+    if run.get("state") != "running":
+        logger.info(
+            "erc20_balance.backfill: run=%s is %s, not continuing the whale walk",
+            run_id,
+            run.get("state"),
+        )
+        return run
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_erc20_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        logger.info(
+            "erc20_balance.backfill: run=%s whale slice could not get the "
+            "rollup lock; retrying in %ds",
+            run_id,
+            ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        backfill_erc20_balance_whale_task.apply_async(
+            (run_id,),
+            queue="contracts",
+            countdown=ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        return run
+
+    started = time.time()
+    whale_addresses: list = []
+    try:
+        try:
+            boundary = read_boundary()
+            head = read_head()
+            whale_addresses = whale_addresses_upto_boundary(boundary)
+            result = run_whale_slice(
+                whale_addresses,
+                head,
+                _erc20_backfill_options_from_run(run),
+                lock,
+                max_ranges=run["task_chunks"],
+            )
+        finally:
+            lock.release()
+    except Exception as exc:
+        logger.exception("erc20_balance.backfill: run=%s whale slice failed", run_id)
+        run["state"] = "failed"
+        run["error"] = str(exc)[:500]
+        run["finished_at"] = timezone.now().isoformat()
+        _save_erc20_balance_backfill_run(run)
+        return run
+
+    run["whale_ranges_done"] += result["ranges_done"]
+    run["pairs_touched"] += result["rows_touched"]
+    if result["finished"]:
+        run["whale_safes_summed"] = len(whale_addresses)
+    _save_erc20_balance_backfill_run(run)
+
+    logger.info(
+        "erc20_balance.backfill: run=%s whale slice done in %.2fs "
+        "ranges=%d rows_touched=%d finished=%s",
+        run_id,
+        time.time() - started,
+        result["ranges_done"],
+        result["rows_touched"],
+        result["finished"],
+    )
+
+    if result["finished"]:
+        run["phase"] = "finish"
+        _save_erc20_balance_backfill_run(run)
+        backfill_erc20_balance_finish_task.apply_async((run_id,), queue="contracts")
+    else:
+        backfill_erc20_balance_whale_task.apply_async((run_id,), queue="contracts")
+    return run
+
+
+@app.shared_task(acks_late=True, reject_on_worker_lost=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def backfill_erc20_balance_finish_task(run_id: str) -> dict:
+    """One-shot: write the real ``erc20_balance`` / ``erc20_balance_safes``
+    watermarks and rebuild ``TokenHolding`` (``finish_run``), then mark the
+    manifest finished. Runs once the chunk and whale-walk phases are both
+    done — see ``backfill_erc20_balance_whale_task``.
+    """
+    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        finish_run,
+        read_boundary,
+        read_head,
+    )
+
+    run = load_erc20_balance_backfill_run(run_id)
+    if run is None:
+        logger.warning(
+            "erc20_balance.backfill: run=%s manifest is gone; the run may "
+            "have finished without recording it — check the watermarks by "
+            "hand",
+            run_id,
+        )
+        return {"run_id": run_id, "state": "unknown"}
+    if run.get("state") != "running":
+        logger.info(
+            "erc20_balance.backfill: run=%s is %s, not finishing again",
+            run_id,
+            run.get("state"),
+        )
+        return run
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_erc20_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        logger.info(
+            "erc20_balance.backfill: run=%s finish step could not get the "
+            "rollup lock; retrying in %ds",
+            run_id,
+            ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        backfill_erc20_balance_finish_task.apply_async(
+            (run_id,),
+            queue="contracts",
+            countdown=ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        return run
+
+    try:
+        try:
+            # Read BEFORE `finish_run`, which deletes both progress rows
+            # (`_PROGRESS_WATERMARK`, `_BOUNDARY_WATERMARK`) as part of its
+            # own transaction — reading them after would find nothing.
+            head = read_head()
+            boundary = read_boundary()
+            chain_level = finish_run(head, boundary)
+        finally:
+            lock.release()
+    except Exception as exc:
+        logger.exception("erc20_balance.backfill: run=%s finish step failed", run_id)
+        run["state"] = "failed"
+        run["error"] = str(exc)[:500]
+        run["finished_at"] = timezone.now().isoformat()
+        _save_erc20_balance_backfill_run(run)
+        return run
+
+    run["state"] = "finished"
+    run["phase"] = "done"
+    run["finished_at"] = timezone.now().isoformat()
+    run["head"] = head
+    run["tokens_with_holders"] = chain_level["tokens_with_holders"]
+    run["safes_with_any_erc20"] = chain_level["safes_with_any_erc20"]
+    _save_erc20_balance_backfill_run(run)
+
+    logger.info(
+        "erc20_balance.backfill: run=%s FINISHED head=%d "
+        "tokens_with_holders=%d safes_with_any_erc20=%d",
+        run_id,
+        head,
+        chain_level["tokens_with_holders"],
+        chain_level["safes_with_any_erc20"],
+    )
+    return run
+
+
+def _erc20_backfill_dispatch_phase(run: dict) -> None:
+    """Re-enter the chain at whatever phase the manifest currently says,
+    without creating a new run. Used by the watchdog's resume — the same
+    "read `phase`, dispatch that task" step a legitimate hand-off between
+    phases already does inline (see the three tasks above), just driven
+    from outside the chain instead of from the end of a slice.
+    """
+    phase = run.get("phase")
+    if phase == "whales":
+        backfill_erc20_balance_whale_task.apply_async(
+            (run["run_id"],), queue="contracts"
+        )
+    elif phase == "finish":
+        backfill_erc20_balance_finish_task.apply_async(
+            (run["run_id"],), queue="contracts"
+        )
+    else:
+        backfill_erc20_balance_chunk_task.apply_async(
+            (run["run_id"],), queue="contracts"
+        )
+
+
+def erc20_balance_backfill_looks_stalled() -> dict | None:
+    """Pure check, no side effects (does not touch the lock): ``None``
+    when nothing needs re-dispatching, else the run manifest the watchdog
+    should resume. Split out from the task so `--status`
+    (`backfill_erc20_balances.py`'s `_print_status`) can show the same
+    verdict the watchdog would act on.
+
+    All three conditions below are required, so a healthy run, an
+    inline-mode run (which has no self-dispatch to resume — the
+    operator's own shell holds that lock, not a stalled chain), or an
+    already-finished/failed one is never flagged:
+
+    1. A backfill is genuinely mid-run: `_PROGRESS_WATERMARK` exists and
+       `ERC20_BALANCE_WATERMARK` (written only by `finish_run`) does not.
+    2. Its Celery run manifest exists, is `state == "running"`, and
+       carries a `heartbeat_at`.
+    3. That heartbeat is older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS`.
+
+    Deliberately does NOT check the shared lock here — that check has a
+    side effect (acquire-then-release) that belongs in the task, once,
+    right before it decides to act, not in a read-only helper `--status`
+    also calls on every invocation.
+    """
+    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        _PROGRESS_WATERMARK,
+    )
+
+    if AnalyticsWatermark.objects.filter(name=ERC20_BALANCE_WATERMARK).exists():
+        return None
+    if not AnalyticsWatermark.objects.filter(name=_PROGRESS_WATERMARK).exists():
+        return None
+
+    run_id = latest_erc20_balance_backfill_run_id()
+    if run_id is None:
+        return None
+    run = load_erc20_balance_backfill_run(run_id)
+    if run is None or run.get("state") != "running":
+        return None
+
+    heartbeat_at = run.get("heartbeat_at")
+    if not heartbeat_at:
+        return None
+    try:
+        age = (timezone.now() - datetime.fromisoformat(heartbeat_at)).total_seconds()
+    except ValueError:
+        return None
+    if age < ERC20_BALANCE_BACKFILL_STALE_SECONDS:
+        return None
+    return run
+
+
+@app.shared_task(
+    bind=True,
+    name="safe_transaction_service.analytics.tasks.erc20_balance_backfill_watchdog_task",
+)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def erc20_balance_backfill_watchdog_task(self) -> None:
+    """Beat task (every 5 minutes, `setup_service.py`): re-dispatch a
+    `backfill_erc20_balances --celery` chain that has stopped advancing —
+    e.g. because the worker holding its last slice was restarted (or, per
+    the module comment above `ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX`, the
+    broker itself was, which `acks_late` alone does not cover) before the
+    self-dispatch of the next slice ran. P7 staging note (Berachain,
+    2026-09-25): Optimism's ~3,000 chunks mean the chain runs for hours,
+    long enough to outlast at least one ordinary deploy.
+
+    `erc20_balance_backfill_looks_stalled` decides WHETHER to act; this
+    task adds the one check that belongs at the point of action rather
+    than in a read-only helper: the shared rollup lock must be free RIGHT
+    NOW. Held means genuine work (a slice, the nightly task, or a
+    concurrent `--inline` run) is in flight, not a stall — try again next
+    beat rather than race it. Never starts a second concurrent chain: it
+    dispatches by `run_id` from the existing manifest's own `phase`
+    (`_erc20_backfill_dispatch_phase`), the same re-entry point a normal
+    slice-to-slice hand-off uses, and that task will itself take the lock
+    before touching anything.
+    """
+    if not settings.ENABLE_ANALYTICS:
+        return
+
+    run = erc20_balance_backfill_looks_stalled()
+    if run is None:
+        return
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_erc20_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        logger.info(
+            "erc20_balance.backfill.watchdog: run=%s heartbeat looks "
+            "stale but the rollup lock is held (genuine work in flight); "
+            "leaving it alone this cycle",
+            run["run_id"],
+        )
+        return
+    # Immediately release: this task only decides whether to redispatch
+    # and does no work of its own. Holding it any longer would just delay
+    # the slice task's own acquire for no benefit.
+    lock.release()
+
+    logger.warning(
+        "erc20_balance.backfill.watchdog: run=%s heartbeat older than "
+        "%ds (last seen %s), rollup lock free -- redispatching phase=%s",
+        run["run_id"],
+        ERC20_BALANCE_BACKFILL_STALE_SECONDS,
+        run.get("heartbeat_at"),
+        run.get("phase"),
+    )
+    _erc20_backfill_dispatch_phase(run)
+
+
+# ─────────────── ERC-20 balance rollup drift check ────────────────
+#
+# Same rationale as the native drift check above: an incrementally
+# maintained running total has no self-healing property, so a batch
+# applied twice (or a seed step that silently missed a pair) stays wrong
+# forever and looks exactly like a real number. Token-holdings spec §4.4.
+#
+# Two departures from the native version, both consequences of
+# `SafeTokenBalance` deleting zero-balance rows instead of keeping one
+# row per pair (see that model's docstring):
+#
+#   1. The recompute is per-*Safe*, not per sampled pair.
+#      `erc20_balances_upto_block` already returns every non-zero
+#      (Safe, token) balance for the addresses it is given, so calling it
+#      with the *sampled Safes'* addresses -- not the sampled
+#      (Safe, token) pairs -- recomputes each Safe's whole token set for
+#      free. That is deliberate, not incidental: a pair the rollup should
+#      have created but never did has no row to land in the sample in the
+#      first place, so sampling stored *pairs* alone could never surface
+#      it. Comparing the recomputed set against every row this check can
+#      see for the same Safes (not only the sampled row) is what catches
+#      a missing pair, the same way a stored pair the recompute no longer
+#      sees (an un-deleted zero) is caught by the opposite direction of
+#      the same comparison.
+#   2. Whale Safes (`Erc20BalanceWhale`) are excluded from the sample --
+#      recomputing one of them (tens of millions of transfer rows) would
+#      blow the statement timeout on its own (§4.3, §4.4).
+
+ERC20_BALANCE_DRIFT_SAMPLE_SIZE = 2000
+
+# Same `ORDER BY random()` trade-off as `_NATIVE_BALANCE_SAMPLE_SQL` --
+# see its comment. Whale Safes are filtered out of the sampling pool
+# itself, not out of the Python-side result, so `LIMIT` is still filled
+# entirely from non-whale rows.
+_ERC20_BALANCE_SAMPLE_SQL = """
+SELECT b.safe_address, b.token_address, b.balance
+FROM analytics_safetokenbalance b
+WHERE NOT EXISTS (
+    SELECT 1 FROM analytics_erc20balancewhale w
+    WHERE w.safe_address = b.safe_address
+)
+ORDER BY random()
+LIMIT %s
+"""
+
+# Every currently-stored pair for a given set of (already sampled,
+# non-whale) Safes -- the counterpart `erc20_balances_upto_block` is
+# compared against. Not restricted to the sampled token: see departure 1
+# above.
+_ERC20_BALANCE_EXISTING_FOR_SAFES_SQL = """
+SELECT safe_address, token_address, balance
+FROM analytics_safetokenbalance
+WHERE safe_address = ANY(%s)
+"""
+
+_ERC20_BALANCE_NEGATIVE_PAIRS_SQL = """
+SELECT COUNT(*) FROM analytics_safetokenbalance WHERE balance < 0
+"""
+
+
+def check_erc20_balance_drift(
+    sample_size: int = ERC20_BALANCE_DRIFT_SAMPLE_SIZE,
+) -> dict | None:
+    """Compare a random sample of ``SafeTokenBalance`` rows -- and every
+    other pair the same Safes hold -- against a from-scratch recompute at
+    the watermark. Returns a summary, or ``None`` when there was nothing
+    to check.
+
+    Report-only, like ``check_native_balance_drift``: repair only ever
+    happens through ``manage.py backfill_erc20_balances --restart``
+    (§4.4) -- auto-repairing a signed running total from a sample is
+    unsafe.
+    """
+    started = time.time()
+    watermark_row = AnalyticsWatermark.objects.filter(
+        name=ERC20_BALANCE_WATERMARK
+    ).first()
+    if watermark_row is None:
+        logger.info("erc20_balance.drift: rollup not initialised, nothing to check")
+        return None
+    watermark = watermark_row.block_number
+
+    with relaxed_statement_timeout():
+        with connection.cursor() as cursor:
+            cursor.execute(_ERC20_BALANCE_SAMPLE_SQL, [sample_size])
+            sample_rows = [
+                (bytes(safe), bytes(token), Decimal(balance))
+                for safe, token, balance in cursor
+            ]
+        if not sample_rows:
+            logger.info("erc20_balance.drift: rollup is empty, nothing to check")
+            return None
+
+        sampled_safes = sorted({safe for safe, _token, _balance in sample_rows})
+        recomputed = erc20_balances_upto_block(sampled_safes, watermark)
+
+        with connection.cursor() as cursor:
+            cursor.execute(_ERC20_BALANCE_EXISTING_FOR_SAFES_SQL, [sampled_safes])
+            existing = {
+                (bytes(safe), bytes(token)): Decimal(balance)
+                for safe, token, balance in cursor
+            }
+
+    # If the nightly run landed between the sample and the recompute, the
+    # watermark it recomputed at is no longer the one the sample
+    # describes. That is a race, not drift -- same guard as the native
+    # check.
+    if (
+        AnalyticsWatermark.objects.filter(name=ERC20_BALANCE_WATERMARK)
+        .values_list("block_number", flat=True)
+        .first()
+        != watermark
+    ):
+        logger.info(
+            "erc20_balance.drift: the rollup advanced past block %d while the "
+            "check was running; skipping this round",
+            watermark,
+        )
+        return None
+
+    with connection.cursor() as cursor:
+        cursor.execute(_ERC20_BALANCE_ORPHANS_SQL)
+        orphans = int(cursor.fetchone()[0] or 0)
+        cursor.execute(_ERC20_BALANCE_NEGATIVE_PAIRS_SQL)
+        negative_pairs = int(cursor.fetchone()[0] or 0)
+
+    mismatches = []
+    total_abs_diff = Decimal(0)
+    for key in set(existing) | set(recomputed):
+        stored = existing.get(key, Decimal(0))
+        expected = recomputed.get(key, Decimal(0))
+        diff = stored - expected
+        if diff:
+            mismatches.append((*key, stored, expected, diff))
+            total_abs_diff += abs(diff)
+
+    compared = len(set(existing) | set(recomputed))
+    summary = {
+        "watermark": watermark,
+        "sampled": len(sample_rows),
+        "compared": compared,
+        "mismatched": len(mismatches),
+        "total_abs_diff": int(total_abs_diff),
+        "max_abs_diff": (int(max(abs(d) for *_, d in mismatches)) if mismatches else 0),
+        "orphan_rows": orphans,
+        "negative_pairs": negative_pairs,
+        "elapsed": round(time.time() - started, 2),
+    }
+
+    if orphans:
+        logger.warning(
+            "erc20_balance.drift: %d rollup rows have no Safe in "
+            "history_safecontract. A reorg that removed a Safe creation "
+            "leaves the row behind, still contributing its balance to the "
+            "totals. Rebuild with `manage.py backfill_erc20_balances "
+            "--restart` to drop them.",
+            orphans,
+        )
+
+    if negative_pairs:
+        logger.info(
+            "erc20_balance.drift: %d pairs in the rollup are currently "
+            "negative (incomplete upstream indexing, not necessarily a "
+            "rollup bug on its own) -- see TokenHolding.negative_pairs per "
+            "token for the breakdown",
+            negative_pairs,
+        )
+
+    if mismatches:
+        worst = sorted(mismatches, key=lambda row: abs(row[4]), reverse=True)[:5]
+        logger.warning(
+            "erc20_balance.drift: %d of %d compared pairs (sample of %d "
+            "Safes) disagree with a from-scratch recompute at block %d "
+            "(total |diff| = %d, worst = %d). Worst offenders: %s. The "
+            "rollup cannot self-heal -- rebuild with `manage.py "
+            "backfill_erc20_balances --restart` if this is not a one-off.",
+            summary["mismatched"],
+            summary["compared"],
+            summary["sampled"],
+            watermark,
+            summary["total_abs_diff"],
+            summary["max_abs_diff"],
+            ", ".join(
+                f"0x{safe.hex()}/0x{token.hex()} stored={stored} expected={expected}"
+                for safe, token, stored, expected, _ in worst
+            ),
+        )
+    else:
+        logger.info(
+            "erc20_balance.drift: %d compared pairs (sample of %d Safes) "
+            "all agree at block %d (%.2fs)",
+            summary["compared"],
+            summary["sampled"],
+            watermark,
+            summary["elapsed"],
+        )
+    return summary
+
+
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT * 2)
+def check_erc20_balance_drift_task(self):
+    """Weekly sanity check on the incremental ERC-20 balance rollup
+    (Sundays 05:15 UTC, after ``check_native_balance_drift_task``).
+
+    Reports only. See ``check_erc20_balance_drift``.
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            return check_erc20_balance_drift()
 
 
 @app.shared_task(bind=True)

@@ -271,12 +271,129 @@ class SafeNativeBalance(models.Model):
         return f"SafeNativeBalance({self.safe_address}@{self.updated_to_block})"
 
 
+class SafeTokenBalance(models.Model):
+    """Per-(Safe, ERC-20 token) balance, maintained incrementally from
+    indexed ``Transfer`` events — the token analogue of
+    ``SafeNativeBalance``, kept as a **separate** table rather than folded
+    into it (source, indexer cursor, error profile and drift check all
+    differ; see ``analytics/implementation-notes.md``).
+
+    ``balance`` is the **signed** net flow (inflow minus outflow), kept
+    unclamped so negative rows can be counted (``negative_pairs`` on
+    ``TokenHolding``) instead of being silently hidden by a clamp, unlike
+    native's read-time clamp which only ever needs the sign, not the
+    count.
+
+    Two deliberate departures from ``SafeNativeBalance``:
+
+    - **Rows with ``balance = 0`` are deleted**, not kept at zero. Unlike
+      native (one row per ``SafeContract``, always present), the space of
+      (Safe, token) pairs is unbounded — most Safes hold nothing — so
+      "no row" here means "never held or fully exited", *not* "new Safe".
+      New Safes are found through a separate marker
+      (``AnalyticsWatermark(name='erc20_balance_safes')``), because the
+      indexer can record a transfer to a not-yet-created Safe address
+      before that address becomes a ``SafeContract``.
+    - **``balance`` is an effectively unbounded signed numeric**
+      (``max_digits=1000``), not ``numeric(80, 0)`` like
+      ``balance_wei``. Native value is bounded by real chain supply;
+      an ERC-20 contract can emit a ``Transfer`` of up to 2**256 - 1,
+      and a spam token doing that a few hundred times overflows 80
+      digits. If it did, the transaction would abort mid-upsert and the
+      watermark would stop moving — freezing every token's rollup, not
+      just the spam one. ``max_digits=1000`` is Postgres's own numeric
+      precision ceiling, so there is no realistic value this can't
+      store. Not ``Uint256Field``: that type is unsigned and its
+      ``pre_save`` rejects negative values outright.
+    """
+
+    safe_address = EthereumAddressBinaryField()
+    token_address = EthereumAddressBinaryField()
+    balance = models.DecimalField(max_digits=1000, decimal_places=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["safe_address", "token_address"],
+                name="analytics_safe_token_balance_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["token_address"], name="analytics_stb_token_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"SafeTokenBalance({self.safe_address}/{self.token_address}={self.balance})"
+        )
+
+
+class TokenHolding(models.Model):
+    """Per-token read model over ``SafeTokenBalance`` — one row per token,
+    rewritten wholesale in the same transaction as each incremental
+    delta (see ``compute_erc20_balance_rollup_task``).
+
+    ``holders`` = ``COUNT(*) WHERE balance > 0`` and ``total_balance`` =
+    ``SUM(balance) WHERE balance > 0`` over ``SafeTokenBalance`` rows for
+    this token — both exclude negative rows so a token with only
+    negative-balance pairs (incomplete indexing, never a real holding)
+    doesn't count as held.
+
+    ``total_balance`` carries the same unbounded signed numeric type as
+    ``SafeTokenBalance.balance`` for the same overflow reason, even
+    though in practice it only ever sums positive rows.
+
+    ``negative_pairs`` is the count of ``SafeTokenBalance`` rows for this
+    token with ``balance < 0`` (incomplete indexing, not clamped away —
+    see ``SafeTokenBalance``), surfaced as a data-quality signal rather
+    than hidden.
+
+    ``as_of_block`` / ``as_of_timestamp`` declare the snapshot's right
+    edge explicitly, unlike the older endpoints in this app where the
+    window boundary is implicit (see the workspace contract notes on
+    this).
+    """
+
+    token_address = EthereumAddressBinaryField(primary_key=True)
+    holders = models.PositiveIntegerField(default=0)
+    negative_pairs = models.PositiveIntegerField(default=0)
+    total_balance = models.DecimalField(max_digits=1000, decimal_places=0, default=0)
+    as_of_block = models.PositiveIntegerField()
+    as_of_timestamp = models.DateTimeField()
+    computed_at = models.DateTimeField()
+
+    def __str__(self) -> str:
+        return f"TokenHolding({self.token_address}@{self.as_of_block})"
+
+
+class Erc20BalanceWhale(models.Model):
+    """Safes whose ERC-20 transfer history is too large to sum in one
+    backfill chunk (one Optimism Safe alone accounts for ~35% of all
+    ``history_erc20transfer`` rows — see §4.3 of the token-holdings spec).
+
+    A small, chain-specific allow-list, not a setting: it is filled by
+    the backfill command (seeded from ``pg_stats`` most-common values,
+    plus any Safe whose chunk exceeds a row threshold at run time) and
+    read by both the backfill (to split a whale's chunk by block range)
+    and the weekly drift check (to exclude whales from the recompute
+    sample, since resumming a whale's full history would blow the
+    statement timeout).
+    """
+
+    safe_address = EthereumAddressBinaryField(primary_key=True)
+
+    def __str__(self) -> str:
+        return f"Erc20BalanceWhale({self.safe_address})"
+
+
 class AnalyticsWatermark(models.Model):
     """How far an incremental analytics rollup has consumed the chain.
 
-    One row per rollup; currently only ``name='native_balance'``, written
-    by ``compute_native_balance_rollup_task`` and seeded by the
-    ``backfill_native_balances`` management command.
+    One row per rollup: ``name='native_balance'``, written by
+    ``compute_native_balance_rollup_task`` and seeded by the
+    ``backfill_native_balances`` management command; ``name='erc20_balance'``
+    and ``name='erc20_balance_safes'``, the ERC-20 analogues (see
+    ``run_erc20_balance_rollup`` in ``analytics/tasks.py``).
 
     Deliberately *not* a key inside ``AnalyticsSnapshot``: that table is
     the cache of payloads the views hand back, keyed by endpoint name and
@@ -286,12 +403,19 @@ class AnalyticsWatermark(models.Model):
     cursor inside a blob that any view refresh may replace.
 
     ``block_number`` is the **last block already applied** (inclusive), so
-    the next run consumes ``(block_number, head]``.
+    the next run consumes ``(block_number, head]``. For ``name=
+    'erc20_balance_safes'`` this column is unused (set equal to the sibling
+    ``erc20_balance`` watermark's block for readability) — that row's
+    payload is the ``(computed_at, address)`` pair instead: the
+    ``(created, address)`` boundary the new-Safe seed step last reached
+    (token-holdings spec §4.2). ``address`` is ``NULL`` for every other
+    watermark; a plain block cursor has no address component.
     """
 
     name = models.CharField(max_length=64, primary_key=True)
     block_number = models.PositiveIntegerField()
     computed_at = models.DateTimeField()
+    address = EthereumAddressBinaryField(null=True, blank=True, default=None)
 
     class Meta:
         ordering = ["name"]

@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import time
@@ -7,10 +8,12 @@ from functools import cache
 from importlib import import_module
 from itertools import groupby
 
-from django.db import OperationalError
-from django.db.models import Count, DecimalField, F, Sum, Value, Window
+from django.db import OperationalError, connection
+from django.db.models import Count, DecimalField, F, Q, Sum, Value, Window
 from django.db.models.functions import Coalesce, RowNumber
 from django.utils import timezone
+
+from hexbytes import HexBytes
 
 from safe_transaction_service import __version__
 from safe_transaction_service.history.models import (
@@ -358,6 +361,59 @@ def get_token_symbols(addresses: Iterable[str]) -> dict[str, str | None]:
     return symbols
 
 
+def get_token_metadata(
+    addresses: Iterable[str],
+) -> dict[str, tuple[str | None, int | None]]:
+    """Read-time join of token addresses against ``tokens_token`` for both
+    ``symbol`` and ``decimals`` — the ``/token-holdings/`` counterpart to
+    ``get_token_symbols`` (token-holdings spec §5, P5 Notes: "symbol/decimals
+    joined from ``tokens_token`` at read time, NULL when absent, never 18").
+
+    Same "no row → None" contract as ``get_token_symbols``: a missing
+    ``Token`` row, or a blank ``symbol``, maps to ``(None, None)``.
+    ``decimals`` is passed through as stored — ``Token.decimals`` is already
+    nullable and this never substitutes a default.
+    """
+    from safe_transaction_service.tokens.models import Token
+
+    unique_addresses = list(dict.fromkeys(addresses))
+    if not unique_addresses:
+        return {}
+
+    metadata: dict[str, tuple[str | None, int | None]] = dict.fromkeys(
+        unique_addresses, (None, None)
+    )
+    for address, symbol, decimals in Token.objects.filter(
+        address__in=unique_addresses
+    ).values_list("address", "symbol", "decimals"):
+        if address in metadata:
+            metadata[address] = (symbol or None, decimals)
+    return metadata
+
+
+class TokenHoldingsCursorStaleError(Exception):
+    """Raised when a ``/token-holdings/`` cursor's ``as_of_block`` no longer
+    matches the current ``TokenHolding`` snapshot — ``TokenHolding`` is
+    rewritten wholesale every nightly rollup, and a page issued against the
+    previous rewrite would silently mix two snapshots (spec §5, contract
+    invariant 10g). The view catches this and returns 409; the hub restarts
+    pagination from page one (spec §0.4)."""
+
+
+def _encode_token_holdings_cursor(
+    as_of_block: int, holders: int, token_address: str
+) -> str:
+    """Opaque URL-safe base64 of ``{"b": as_of_block, "h": holders, "a":
+    token_address}`` — keyset pagination position for ``/token-holdings/``
+    (spec §5 / §12 P5 design notes). Padding is stripped on encode and
+    restored on decode; the cursor is otherwise never inspected by the
+    caller."""
+    raw = json.dumps(
+        {"b": as_of_block, "h": holders, "a": token_address}, separators=(",", ":")
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
 _COMPUTE_LOCK_TTL_SECONDS = 1800  # max expected task duration (30 min)
 _COMPUTE_WAIT_SECONDS = 25  # how long a non-leader request will block
 _COMPUTE_POLL_INTERVAL_SECONDS = 0.5
@@ -407,6 +463,23 @@ EMPTY_TVL_PAYLOAD: dict = {
     "total_shards": 0,
     "native_source": None,
     "native_updated_to_block": None,
+    "computed_at": None,
+}
+# Warming shape for `/token-holdings/` (spec §5 "Warming" + §12 P5 Notes):
+# `AnalyticsSnapshot(name='token_holdings')` missing OR `TokenHolding` empty
+# both mean "the rollup hasn't run yet" and return this, HTTP 200. The
+# chain-level keys mirror exactly what `rebuild_token_holdings` / P2's
+# `run_erc20_balance_rollup` writes into the snapshot payload, so a warm
+# response is this dict's keys plus real values, never a different shape.
+EMPTY_TOKEN_HOLDINGS_PAYLOAD: dict = {
+    "as_of_block": None,
+    "as_of_timestamp": None,
+    "tokens_with_holders": None,
+    "safes_with_any_erc20": None,
+    "negative_pairs_total": None,
+    "orphan_pairs": None,
+    "tokens": [],
+    "next_cursor": None,
     "computed_at": None,
 }
 
@@ -1408,4 +1481,172 @@ class AnalyticsService:
                 for t in top
             ],
             "computed_at": timezone.now(),
+        }
+
+    # ── P5 Token Holdings (§5) ────────────────────────────────────────
+
+    _SAFES_HOLDING_REQUESTED_SQL = """
+        SELECT COUNT(DISTINCT b.safe_address)
+        FROM analytics_safetokenbalance b
+        WHERE b.token_address = ANY(%s)
+          AND b.balance > 0
+          AND EXISTS (
+              SELECT 1 FROM history_safecontract sc WHERE sc.address = b.safe_address
+          )
+    """
+
+    def _token_holdings_chain_level_or_none(self) -> dict | None:
+        """Read ``AnalyticsSnapshot(name='token_holdings')``.
+
+        Returns ``None`` when the snapshot is missing *or* ``TokenHolding``
+        has no rows — both mean "warming" per spec §5, and the caller
+        returns ``EMPTY_TOKEN_HOLDINGS_PAYLOAD`` immediately. Either miss
+        fire-and-forget dispatches ``compute_erc20_balance_rollup_task``,
+        wrapped exactly like every other snapshot read
+        (``_maybe_dispatch_refresh`` swallows broker errors) so a down
+        broker never fails the request.
+        """
+        from safe_transaction_service.analytics.models import (
+            AnalyticsSnapshot,
+            TokenHolding,
+        )
+        from safe_transaction_service.analytics.tasks import (
+            compute_erc20_balance_rollup_task,
+        )
+
+        try:
+            snap = AnalyticsSnapshot.objects.get(name="token_holdings")
+        except AnalyticsSnapshot.DoesNotExist:
+            logger.info("analytics.snapshot.cold_read name=token_holdings")
+            self._maybe_dispatch_refresh(
+                "token_holdings", compute_erc20_balance_rollup_task
+            )
+            return None
+        if not TokenHolding.objects.exists():
+            logger.info(
+                "analytics.snapshot.cold_read name=token_holdings (empty TokenHolding)"
+            )
+            self._maybe_dispatch_refresh(
+                "token_holdings", compute_erc20_balance_rollup_task
+            )
+            return None
+        return {**snap.payload, "computed_at": snap.computed_at.isoformat()}
+
+    def _join_token_holdings_metadata(self, rows: list[dict]) -> list[dict]:
+        """Attach ``symbol`` / ``decimals`` (via ``get_token_metadata``) and
+        serialise ``total_balance`` as a string of raw units — Uint256
+        doesn't fit a JSON number (spec §5)."""
+        metadata = get_token_metadata(r["token_address"] for r in rows)
+        result = []
+        for r in rows:
+            symbol, decimals = metadata.get(r["token_address"], (None, None))
+            result.append(
+                {
+                    "token_address": r["token_address"],
+                    "symbol": symbol,
+                    "decimals": decimals,
+                    "holders": r["holders"],
+                    "total_balance": str(int(r["total_balance"] or 0)),
+                    "negative_pairs": r["negative_pairs"],
+                }
+            )
+        return result
+
+    def _count_safes_holding_requested(self, tokens: list[str]) -> int:
+        """``COUNT(DISTINCT safe) WHERE token IN tokens AND balance > 0``
+        over ``SafeTokenBalance``, excluding orphan pairs (Safe no longer in
+        ``history_safecontract``) — the same ``EXISTS`` join
+        ``rebuild_token_holdings`` uses to exclude orphans from
+        ``TokenHolding`` (spec §5 "safes_holding_requested"). Addresses are
+        bound as raw ``bytea`` parameters, never string-built into the
+        query."""
+        addr_bytes = [bytes(HexBytes(token)) for token in tokens]
+        with connection.cursor() as cursor:
+            cursor.execute(self._SAFES_HOLDING_REQUESTED_SQL, [addr_bytes])
+            return int(cursor.fetchone()[0] or 0)
+
+    def get_token_holdings(
+        self,
+        min_holders: int,
+        limit: int,
+        cursor: tuple[int, int, str] | None,
+    ) -> dict:
+        """P5 — ``GET /token-holdings/`` without ``tokens=``: every token
+        with ``holders >= min_holders``, keyset-paginated ``(holders DESC,
+        token_address ASC)`` (spec §5).
+
+        ``cursor`` is ``(as_of_block, holders, token_address)`` as already
+        strictly decoded by the view; a mismatched ``as_of_block`` means
+        ``TokenHolding`` was rewritten since the cursor was issued and
+        raises ``TokenHoldingsCursorStaleError`` (409 — the hub restarts
+        from page one, spec §0.4). The view is responsible for the 400 on a
+        malformed cursor before this is ever called.
+        """
+        chain_level = self._token_holdings_chain_level_or_none()
+        if chain_level is None:
+            return dict(EMPTY_TOKEN_HOLDINGS_PAYLOAD)
+
+        as_of_block = chain_level["as_of_block"]
+        if cursor is not None:
+            cursor_block, cursor_holders, cursor_address = cursor
+            if cursor_block != as_of_block:
+                raise TokenHoldingsCursorStaleError(
+                    "cursor as_of_block no longer matches the current "
+                    "token_holdings snapshot; restart from page one"
+                )
+
+        from safe_transaction_service.analytics.models import TokenHolding
+
+        qs = TokenHolding.objects.filter(holders__gte=min_holders)
+        if cursor is not None:
+            _, cursor_holders, cursor_address = cursor
+            qs = qs.filter(
+                Q(holders__lt=cursor_holders)
+                | (Q(holders=cursor_holders) & Q(token_address__gt=cursor_address))
+            )
+        rows = list(
+            qs.order_by("-holders", "token_address").values(
+                "token_address", "holders", "negative_pairs", "total_balance"
+            )[: limit + 1]
+        )
+
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            last = rows[-1]
+            next_cursor = _encode_token_holdings_cursor(
+                as_of_block, last["holders"], last["token_address"]
+            )
+
+        return {
+            **chain_level,
+            "tokens": self._join_token_holdings_metadata(rows),
+            "next_cursor": next_cursor,
+        }
+
+    def get_token_holdings_by_tokens(self, tokens: list[str]) -> dict:
+        """P5 — ``GET /token-holdings/?tokens=...``: exactly the requested
+        tokens that are present in ``TokenHolding``, ignoring ``min_holders``
+        and pagination (``next_cursor`` is always ``null``), plus
+        ``safes_holding_requested`` (spec §5). ``tokens`` is the already
+        validated, deduped, ≤80-item list from the view (P9 — gunicorn's
+        request-line limit).
+        """
+        chain_level = self._token_holdings_chain_level_or_none()
+        if chain_level is None:
+            return {**EMPTY_TOKEN_HOLDINGS_PAYLOAD, "safes_holding_requested": None}
+
+        from safe_transaction_service.analytics.models import TokenHolding
+
+        rows = list(
+            TokenHolding.objects.filter(token_address__in=tokens)
+            .order_by("-holders", "token_address")
+            .values("token_address", "holders", "negative_pairs", "total_balance")
+        )
+
+        return {
+            **chain_level,
+            "tokens": self._join_token_holdings_metadata(rows),
+            "next_cursor": None,
+            "safes_holding_requested": self._count_safes_holding_requested(tokens),
         }

@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 from datetime import date
 
@@ -11,6 +13,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from safe_transaction_service.analytics.services.analytics_service import (
+    TokenHoldingsCursorStaleError,
     get_analytics_service,
 )
 
@@ -70,6 +73,68 @@ def _parse_iso_date_range(
     if date_from is not None and date_to is not None and date_from > date_to:
         return None, None, "from must not be after to"
     return date_from, date_to, None
+
+
+# 20-byte `0x` hex address, case-insensitive — shared by `/token-holdings/`'s
+# `tokens=` list and its cursor's embedded `token_address` (P5, spec §5).
+_HEX_ADDRESS_RE = re.compile(r"\A0x[0-9a-fA-F]{40}\Z")
+
+#: Cap on the deduplicated `tokens=` list (spec §12 P9 — Berachain staging:
+#: gunicorn's default `limit_request_line` is 4094 bytes, and each 42-char
+#: checksummed address plus its separating comma is 43 chars, so 100
+#: addresses alone produced a 4353-byte request line and gunicorn rejected
+#: it with its own 400 before Django ever saw the request. 80 addresses is
+#: 80 x 43 = 3440 chars, leaving headroom under 4094 for the path, the
+#: other query params and the HTTP method/version line).
+_TOKEN_HOLDINGS_TOKENS_CAP = 80
+
+
+def _parse_token_holdings_tokens(raw: str) -> list[str] | None:
+    """Parse `/token-holdings/`'s ``tokens=`` query param: comma-separated
+    20-byte ``0x`` hex addresses, deduplicated case-insensitively, capped at
+    80 after dedupe (P9 — gunicorn's request-line limit). Returns ``None``
+    on any malformed item, an empty list
+    (``tokens=`` alone splits to one empty item, which fails the regex) or a
+    list that is still too long after dedupe — the caller returns 400 for
+    all three (spec §5: "Anything else returns 400.")."""
+    deduped: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not _HEX_ADDRESS_RE.match(item):
+            return None
+        deduped.setdefault(item.lower(), item)
+    tokens = list(deduped.values())
+    if not tokens or len(tokens) > _TOKEN_HOLDINGS_TOKENS_CAP:
+        return None
+    return tokens
+
+
+def _decode_token_holdings_cursor(value: str) -> tuple[int, int, str] | None:
+    """Strictly decode `/token-holdings/`'s opaque cursor: URL-safe base64
+    of ``{"b": as_of_block, "h": holders, "a": token_address}`` (P5 design
+    notes). Returns ``(as_of_block, holders, token_address)``, or ``None``
+    on *any* decode, JSON, shape or type error — the caller returns 400
+    (spec §5: "The cursor is parsed strictly: anything malformed returns
+    400."). ``as_of_block`` staleness (409) is checked downstream, once the
+    current snapshot is known, not here."""
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or set(data.keys()) != {"b", "h", "a"}:
+        return None
+    as_of_block, holders, token_address = data["b"], data["h"], data["a"]
+    # `bool` is a subclass of `int` in Python — reject it explicitly so
+    # `{"b": true, ...}` doesn't silently decode as `{"b": 1, ...}`.
+    if not isinstance(as_of_block, int) or isinstance(as_of_block, bool):
+        return None
+    if not isinstance(holders, int) or isinstance(holders, bool):
+        return None
+    if not isinstance(token_address, str) or not _HEX_ADDRESS_RE.match(token_address):
+        return None
+    return as_of_block, holders, token_address
 
 
 class AnalyticsMultisigTxsByOriginListView(APIView):
@@ -295,3 +360,73 @@ class AnalyticsTokenVolumeView(APIView):
             return Response({"error": "breakdown must be: day"}, status=400)
         analytics_service = get_analytics_service()
         return Response(analytics_service.get_token_volume(window, breakdown=breakdown))
+
+
+class AnalyticsTokenHoldingsView(APIView):
+    """P5 — Top tokens held by Safes, current snapshot (token-holdings spec
+    §5). Reads exclusively from ``TokenHolding`` / ``AnalyticsSnapshot(name=
+    'token_holdings')`` — no RPC, no live aggregation over
+    ``SafeTokenBalance`` except ``safes_holding_requested`` under
+    ``tokens=``.
+
+    Query params, each validated 400-on-malformed, cheapest first:
+    ``min_holders`` (int >= 1, default 1), ``limit`` (int 1..1000, default
+    500), ``tokens`` (comma-separated 0x addresses, optional — switches to
+    the exact-lookup mode and makes ``min_holders``/``cursor`` inert), then
+    ``cursor`` (opaque, optional, only meaningful without ``tokens``). A
+    stale cursor's ``as_of_block`` — the snapshot was rewritten since the
+    cursor was issued — is a 409, not a 400; the hub restarts from page
+    one (spec §0.4).
+    """
+
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        raw_min_holders = request.query_params.get("min_holders", "1")
+        try:
+            min_holders = int(raw_min_holders)
+        except (TypeError, ValueError):
+            return Response({"error": "min_holders must be an integer"}, status=400)
+        if min_holders < 1:
+            return Response({"error": "min_holders must be >= 1"}, status=400)
+
+        raw_limit = request.query_params.get("limit", "500")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return Response({"error": "limit must be an integer"}, status=400)
+        if not (1 <= limit <= 1000):
+            return Response({"error": "limit must be between 1 and 1000"}, status=400)
+
+        analytics_service = get_analytics_service()
+
+        tokens_param = request.query_params.get("tokens")
+        if tokens_param is not None:
+            tokens = _parse_token_holdings_tokens(tokens_param)
+            if tokens is None:
+                return Response(
+                    {
+                        "error": "tokens must be a comma-separated list of up "
+                        "to 80 unique 0x hex addresses"
+                    },
+                    status=400,
+                )
+            return Response(analytics_service.get_token_holdings_by_tokens(tokens))
+
+        cursor_param = request.query_params.get("cursor")
+        cursor = None
+        if cursor_param is not None:
+            cursor = _decode_token_holdings_cursor(cursor_param)
+            if cursor is None:
+                return Response({"error": "cursor is malformed"}, status=400)
+
+        try:
+            return Response(
+                analytics_service.get_token_holdings(min_holders, limit, cursor)
+            )
+        except TokenHoldingsCursorStaleError as exc:
+            return Response({"error": str(exc)}, status=409)
