@@ -25,6 +25,9 @@ from redis.exceptions import LockError
 # Side-effect import; intentional. Keep ordering after `LOCK_TIMEOUT` so
 # everything `tasks_shards` depends on is in scope.
 from safe_transaction_service.analytics import tasks_shards  # noqa: F401
+from safe_transaction_service.analytics.bootstrap.tick import (
+    run_tick as analytics_bootstrap_run_tick,
+)
 from safe_transaction_service.analytics.catchup.day import (
     CORE_INPUTS,
     POPULATORS,
@@ -1258,15 +1261,25 @@ def write_native_balance_watermark(head: int) -> bool:
     incremental task, and moving it forward here would skip every block
     between it and ``head`` for the Safes this run did not touch. Returns
     whether it wrote.
+
+    ``get_or_create``, not a separate ``filter().exists()`` check followed
+    by ``create()``: the two-step version could race
+    ``_cold_start_native_balance_rollup``, which does the same
+    check-then-create -- both could see "absent" and then both try to
+    ``create()``, and ``AnalyticsWatermark.name`` is a primary key, so the
+    loser raised ``IntegrityError`` instead of a graceful decline.
+    ``get_or_create`` makes the check-and-write atomic (it runs inside its
+    own savepoint), so whichever caller's write actually lands, the other
+    is correctly told it did not write the watermark. ``backfill_native_balance_chunk``
+    (``tasks_shards.py``) also takes the same lock the nightly rollup task
+    holds while calling this, so the two are serialised in practice --
+    this is belt-and-braces on top of that.
     """
-    if AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists():
-        return False
-    AnalyticsWatermark.objects.create(
+    _, created = AnalyticsWatermark.objects.get_or_create(
         name=NATIVE_BALANCE_WATERMARK,
-        block_number=head,
-        computed_at=timezone.now(),
+        defaults={"block_number": head, "computed_at": timezone.now()},
     )
-    return True
+    return created
 
 
 def _unseeded_safe_addresses(limit: int) -> list[bytes] | None:
@@ -1350,6 +1363,51 @@ def read_native_balance_rollup() -> dict | None:
     }
 
 
+def _current_native_balance_run() -> dict | None:
+    """The latest native-balance backfill run manifest, or ``None`` if
+    there has never been one, it expired, or the cursor key is empty."""
+    run_id = tasks_shards.latest_native_balance_run_id()
+    return tasks_shards.load_native_balance_run(run_id) if run_id else None
+
+
+def _native_balance_backfill_in_progress() -> bool:
+    """Whether a ``backfill_native_balances`` run already has work under
+    way that the nightly cold start must not race. The rollup lock being
+    free is NOT sufficient evidence of the opposite: it is free during
+    the ordinary gap between one chunk finishing and the next being
+    picked up off the queue, and ``get_or_create`` on the watermark row
+    only hides the resulting data hole rather than preventing it -- if
+    the cold start seeds the remaining Safes and writes the watermark at
+    its OWN head ``H'`` while a real backfill is stamped at an earlier
+    ``H``, the backfill's own finish (kept at ``H`` by
+    ``write_native_balance_watermark``'s now-a-no-op ``get_or_create``)
+    leaves every Safe it touched missing the ``(H, H']`` delta forever --
+    silently, since nothing raises.
+
+    True when EITHER:
+
+    1. A Celery run manifest exists and is ``state == "running"`` --
+       covers a ``--celery`` run, whether its next chunk is mid-flight or
+       merely queued.
+    2. The rollup table already holds rows stamped at some block with no
+       final watermark yet (``_stamp_range()`` -- the same durable signal
+       ``native_balance_backfill_auto_start_target``'s "adopt" case
+       reads) -- covers an ``--inline`` run (which keeps no manifest at
+       all) and a ``--celery`` run whose manifest has expired from Redis
+       but whose progress is still sitting in the table, unfinished.
+    """
+    run = _current_native_balance_run()
+    if run is not None and run.get("state") == "running":
+        return True
+
+    from safe_transaction_service.analytics.management.commands.backfill_native_balances import (
+        _stamp_range,
+    )
+
+    low, _high = _stamp_range()
+    return low is not None
+
+
 def _cold_start_native_balance_rollup(head: int) -> AnalyticsWatermark | None:
     """Initialise an empty rollup from inside the nightly run, when — and
     only when — doing so is bounded work.
@@ -1367,8 +1425,23 @@ def _cold_start_native_balance_rollup(head: int) -> AnalyticsWatermark | None:
     stop doing inside a nightly task. That case still refuses, loudly, and
     still wants the command.
 
-    Returns the watermark row it created, or ``None`` if it declined.
+    Returns the watermark row it created, or ``None`` if it declined --
+    including declining outright, before touching anything, whenever a
+    native backfill already has work in progress
+    (``_native_balance_backfill_in_progress``) -- and, belt-and-braces,
+    the race where a bootstrap-started ``backfill_native_balances --celery``
+    chain wrote the watermark first regardless (``get_or_create`` below).
     """
+    if _native_balance_backfill_in_progress():
+        logger.info(
+            "native_balance.rollup: cold start declining -- a "
+            "`backfill_native_balances` run is already in progress (a "
+            "running Celery manifest, or unwatermarked rows already "
+            "stamped in the rollup); leaving it to finish and hand the "
+            "watermark over itself"
+        )
+        return None
+
     unseeded = _unseeded_safe_addresses(NATIVE_BALANCE_MAX_SEED_PER_RUN)
     if unseeded is None:
         logger.error(
@@ -1388,13 +1461,36 @@ def _cold_start_native_balance_rollup(head: int) -> AnalyticsWatermark | None:
     # goes into its row, and the watermark then says so. Seeding at 0 would
     # be equally correct and would make the first delta re-read the entire
     # chain for nothing.
+    #
+    # `get_or_create`, not `create()`: this task and a bootstrap-started
+    # `backfill_native_balances --celery` chunk could both reach "no
+    # watermark yet" and both try to create the same primary-key row,
+    # with the loser raising `IntegrityError` instead of declining
+    # gracefully. `backfill_native_balance_chunk`
+    # (`tasks_shards.py`) now takes the same lock
+    # `compute_native_balance_rollup_task` holds while calling this, so in
+    # practice the two can no longer even reach this point concurrently --
+    # `get_or_create` is belt-and-braces for the remaining instant between
+    # this call's own SELECT and the caller's lock, and needs no rollback
+    # of `_seed_native_balances` above: its INSERT is `ON CONFLICT (safe_address)
+    # DO NOTHING`, so seeding under the "wrong" `head` while another writer
+    # wins the watermark race is already a no-op for every row the winner
+    # also touched.
     with transaction.atomic():
         _seed_native_balances(unseeded, head)
-        watermark_row = AnalyticsWatermark.objects.create(
+        watermark_row, created = AnalyticsWatermark.objects.get_or_create(
             name=NATIVE_BALANCE_WATERMARK,
-            block_number=head,
-            computed_at=timezone.now(),
+            defaults={"block_number": head, "computed_at": timezone.now()},
         )
+    if not created:
+        logger.info(
+            "native_balance.rollup: cold start found the '%s' watermark "
+            "already written (a concurrent backfill run finished first); "
+            "declining -- the seed step above is idempotent, nothing to "
+            "undo",
+            NATIVE_BALANCE_WATERMARK,
+        )
+        return None
     logger.info(
         "native_balance.rollup: cold start — initialised %d Safes at block "
         "%d. Subsequent runs are incremental.",
@@ -1509,6 +1605,140 @@ def compute_native_balance_rollup_task(self):
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             return run_native_balance_rollup()
+
+
+# ──────── Native-balance backfill auto-start (bootstrap stage) ─────────
+#
+# `analytics.bootstrap.native.NativeStage` always drives
+# `backfill_native_balances --celery`'s own dispatch code
+# (`tasks_shards.start_native_balance_backfill_run`,
+# `tasks_shards.backfill_native_balance_chunk`), never a copy. The two
+# helpers below are read-only: they decide WHAT the stage should
+# dispatch, mirroring the `erc20_balance_backfill_*` split above
+# (`erc20_balance_backfill_looks_stalled`, `erc20_balance_backfill_auto_start_target`);
+# the stage itself owns the actual dispatch call.
+#
+# **Liveness, not elapsed time, decides "stalled".**
+#   1. `tasks_shards.backfill_native_balance_chunk` takes
+#      `get_task_lock_name(compute_native_balance_rollup_task.name)` --
+#      the SAME lock the nightly rollup task takes via
+#      `only_one_running_task(self)` -- for the duration of its DB work,
+#      exactly like `backfill_erc20_balance_chunk_task`. This is the
+#      chunk's *lease*: while it holds the lock the run is provably
+#      alive, however long the chunk takes, and the nightly task's
+#      small-fleet inline cold start (`_cold_start_native_balance_rollup`)
+#      can no longer race a chunk's own seed/finish step.
+#   2. The native manifest (`tasks_shards.build_native_balance_run`) gets
+#      a `heartbeat_at`, written by `_save_native_balance_run` at chunk
+#      start AND finish (mirroring `_save_erc20_balance_backfill_run`'s
+#      shape). Unlike the ERC-20 side, this heartbeat is only a SECONDARY
+#      signal here -- see `native_balance_backfill_looks_stalled` below,
+#      which checks the shared lock itself rather than leaving that check
+#      to the caller (native's liveness model is lock-first because a
+#      native run is exactly one lock-holding chunk at a time, never a
+#      multi-slice phase chain).
+# The staleness grace period covers the gap between one chunk releasing
+# the lock and the next one being picked up off the queue -- ordinary
+# queueing latency, plus the `contracts` queue being genuinely busy: the
+# 01:00-04:30 nightly window shares it with the 16-shard TVL chord, and
+# that queued hand-off can take longer than a short grace period covers.
+# Same figure as `ERC20_BALANCE_BACKFILL_STALE_SECONDS` for the same
+# reason. A spurious "stalled" verdict during a busy window is not a
+# correctness risk: `dispatch_seq` makes a spurious resume harmless, just
+# wasteful -- the originally queued chunk exits without work once it
+# finally runs.
+NATIVE_BALANCE_BACKFILL_STALE_SECONDS = 15 * 60
+
+
+def native_balance_backfill_looks_stalled() -> dict | None:
+    """The stalled run manifest to resume, or `None`. Same shape as
+    `erc20_balance_backfill_looks_stalled`, minus the phase concept, plus
+    one addition: this checks the shared lock itself (the lock IS the
+    liveness signal here), unlike the ERC-20 equivalent. Requires: the
+    rollup not yet handed over, a `"running"` manifest, the lock free
+    RIGHT NOW, and `heartbeat_at`/`started_at` older than
+    `NATIVE_BALANCE_BACKFILL_STALE_SECONDS`.
+    """
+    if AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists():
+        return None
+
+    run = _current_native_balance_run()
+    if run is None or run.get("state") != "running":
+        return None
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_native_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        return (
+            None  # a chunk of THIS run, or the nightly task, holds it -- provably alive
+        )
+    lock.release()
+
+    reference = run.get("heartbeat_at") or run.get("started_at")
+    if not reference:
+        return None
+    age = tasks_shards.manifest_age_seconds(reference)
+    if age is None or age < NATIVE_BALANCE_BACKFILL_STALE_SECONDS:
+        return None
+    return run
+
+
+def native_balance_backfill_auto_start_target() -> tuple[str, int] | None:
+    """What ``NativeStage.start_or_resume()`` should auto-start once a
+    live running manifest (``native_balance_backfill_looks_stalled``'s
+    job) and the shared lock (the stage's own job) have both already been
+    ruled out. Pure / read-only, same split as
+    ``erc20_balance_backfill_auto_start_target``.
+
+    Returns ``None`` when the rollup is already handed over (nothing left
+    to ever start), when the rollup table holds rows stamped at two
+    different blocks with no watermark to reconcile them (the same state
+    ``backfill_native_balances``'s own ``_resolve_head`` refuses rather
+    than guesses at -- see its docstring; auto-picking either block here
+    would risk double-counting or skipping a range, worse than doing
+    nothing this tick), or when no block is safe to consume yet
+    (``native_balance_head_block()`` returns ``None`` -- a new network
+    still syncing, or a chain shallower than the reorg depth).
+
+    Otherwise returns ``("adopt", head)`` when the table already has rows
+    stamped at one consistent block with no live running manifest (an
+    interrupted first run, or a run whose manifest is ``"failed"`` --
+    retry gating is the tick's job, not this function's), continuing at
+    that exact block for the same reason ``_resolve_head`` does: mixing
+    two blocks in one rollup with no watermark to tell them apart is
+    unrecoverable. Or ``("fresh", head)`` at the current safe head when
+    the table is empty.
+    """
+    # Second element is always a real block -- native has no phase
+    # concept, so unlike ERC-20's "fresh" (target `None`), a fresh
+    # native run still needs the head to seed at.
+    if AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists():
+        return None
+
+    from safe_transaction_service.analytics.management.commands.backfill_native_balances import (
+        _stamp_range,
+    )
+
+    low, high = _stamp_range()
+    if low is not None and low != high:
+        logger.warning(
+            "native_balance.backfill.bootstrap: rollup stamped at "
+            "inconsistent blocks (%s, %s) with no watermark -- leaving it "
+            "for a human (`manage.py backfill_native_balances --restart`)",
+            low,
+            high,
+        )
+        return None
+    if low is not None:
+        return "adopt", low
+
+    head = native_balance_head_block()
+    if head is None:
+        return None
+    return "fresh", head
 
 
 # ─────────────── Native-balance rollup drift check ────────────────
@@ -2518,6 +2748,15 @@ def _save_erc20_balance_backfill_run(run: dict) -> None:
     _erc20_backfill_redis_set_json(run["run_key"], run)
 
 
+def bump_erc20_balance_dispatch_seq(run: dict) -> int:
+    """Bump and persist ``run``'s dispatch generation -- see
+    ``tasks_shards.bump_dispatch_seq``. Called before every redispatch of
+    an existing run_id (slice/phase hand-off, or the watchdog resuming a
+    stall), so a slice whose own ``dispatch_seq`` argument no longer
+    matches has been superseded and exits without work."""
+    return tasks_shards.bump_dispatch_seq(run, _save_erc20_balance_backfill_run)
+
+
 def _erc20_backfill_options_from_run(run: dict) -> dict:
     """Reconstruct the ``options`` dict ``run_chunk_slice`` / ``run_whale_slice``
     expect, from the fields the manifest was built with."""
@@ -2539,18 +2778,34 @@ def build_erc20_balance_backfill_run(
     statement_timeout_ms: int,
     task_chunks: int,
     run_id: str | None = None,
+    origin: str = "manual",
+    phase: str = "chunks",
 ) -> dict:
     """Pure helper: a fresh manifest. Nothing is written or dispatched —
-    see ``dispatch_erc20_balance_backfill_run``."""
+    see ``dispatch_erc20_balance_backfill_run``.
+
+    ``origin`` is reporting-only (``"manual"`` for `--celery`, ``"auto"``
+    for ``Erc20Stage``'s own auto-start or its adoption of an orphaned
+    run) so `--status` can tell the two apart. ``phase`` defaults to
+    ``"chunks"`` (a brand-new run always starts there); the *adopt* path
+    passes the phase it derived from the DB watermarks instead, so
+    ``dispatch_erc20_balance_backfill_run`` re-enters at the right task
+    rather than replaying already-finished phases.
+    """
     run_id = run_id or tasks_shards.new_backfill_run_id()
     return {
         "run_id": run_id,
         "run_key": erc20_balance_backfill_run_key(run_id),
-        "phase": "chunks",
+        "phase": phase,
+        # Dispatch generation -- see `bump_erc20_balance_dispatch_seq`. A
+        # fresh manifest is always dispatched at seq 1, whether from
+        # `--celery` or the bootstrap stage's fresh-start/adopt path.
+        "dispatch_seq": 1,
         "state": "running",
         "started_at": timezone.now().isoformat(),
         "finished_at": None,
         "error": None,
+        "origin": origin,
         "chunk_size": chunk_size,
         "whale_min_frequency": whale_min_frequency,
         "whale_row_threshold": whale_row_threshold,
@@ -2570,9 +2825,13 @@ def build_erc20_balance_backfill_run(
 
 
 def dispatch_erc20_balance_backfill_run(run: dict) -> dict:
-    """Persist a fresh manifest, point the cursor key at it and dispatch
-    the first chunk-phase task. Later slices dispatch themselves on the
-    worker, so the caller (the management command) may exit immediately.
+    """Persist a manifest, point the cursor key at it and dispatch the
+    task matching its ``phase`` (``_erc20_backfill_dispatch_phase`` —
+    ``"chunks"`` for every ordinary fresh run, since
+    ``build_erc20_balance_backfill_run`` defaults to that phase). Later
+    slices dispatch themselves on the worker, so the caller (the
+    management command, or the watchdog's own auto-start/adopt path) may
+    exit immediately.
     """
     _save_erc20_balance_backfill_run(run)
     _erc20_backfill_redis_set_json(
@@ -2583,18 +2842,24 @@ def dispatch_erc20_balance_backfill_run(run: dict) -> dict:
             "started_at": run["started_at"],
         },
     )
-    backfill_erc20_balance_chunk_task.apply_async((run["run_id"],), queue="contracts")
+    _erc20_backfill_dispatch_phase(run)
     return load_erc20_balance_backfill_run(run["run_id"]) or run
 
 
 @app.shared_task(acks_late=True, reject_on_worker_lost=True)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
-def backfill_erc20_balance_chunk_task(run_id: str) -> dict:
+def backfill_erc20_balance_chunk_task(run_id: str, dispatch_seq: int) -> dict:
     """One bounded slice (up to ``task_chunks`` Safe chunks) of the
     backfill's seed phase, then dispatch the next slice — or the
     whale-walk phase once seeding is done. See the block comment above
     ``ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX`` for the two departures from
     ``backfill_native_balance_chunk``'s shape.
+
+    ``dispatch_seq`` is the manifest's dispatch generation at the moment
+    THIS invocation was dispatched (``bump_erc20_balance_dispatch_seq``).
+    A mismatch against the manifest's current value means something else
+    (the watchdog, resuming a stall) has already redispatched this run —
+    see that function's docstring.
     """
     from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
         run_chunk_slice,
@@ -2615,6 +2880,16 @@ def backfill_erc20_balance_chunk_task(run_id: str) -> dict:
             run.get("state"),
         )
         return run
+    if run.get("dispatch_seq") != dispatch_seq:
+        logger.info(
+            "erc20_balance.backfill: run=%s dispatch_seq=%s is stale "
+            "(current %s) -- a resume has already superseded this chunk; "
+            "exiting without work",
+            run_id,
+            dispatch_seq,
+            run.get("dispatch_seq"),
+        )
+        return run
 
     lock = get_redis().lock(
         get_task_lock_name(compute_erc20_balance_rollup_task.name),
@@ -2630,7 +2905,7 @@ def backfill_erc20_balance_chunk_task(run_id: str) -> dict:
             ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
         )
         backfill_erc20_balance_chunk_task.apply_async(
-            (run_id,),
+            (run_id, dispatch_seq),
             queue="contracts",
             countdown=ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
         )
@@ -2681,22 +2956,29 @@ def backfill_erc20_balance_chunk_task(run_id: str) -> dict:
 
     if result["finished_seeding"]:
         run["phase"] = "whales"
-        _save_erc20_balance_backfill_run(run)
-        backfill_erc20_balance_whale_task.apply_async((run_id,), queue="contracts")
+        next_seq = bump_erc20_balance_dispatch_seq(run)
+        backfill_erc20_balance_whale_task.apply_async(
+            (run_id, next_seq), queue="contracts"
+        )
     else:
-        backfill_erc20_balance_chunk_task.apply_async((run_id,), queue="contracts")
+        next_seq = bump_erc20_balance_dispatch_seq(run)
+        backfill_erc20_balance_chunk_task.apply_async(
+            (run_id, next_seq), queue="contracts"
+        )
     return run
 
 
 @app.shared_task(acks_late=True, reject_on_worker_lost=True)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
-def backfill_erc20_balance_whale_task(run_id: str) -> dict:
+def backfill_erc20_balance_whale_task(run_id: str, dispatch_seq: int) -> dict:
     """One bounded slice (up to ``task_chunks`` whale block-ranges) of the
     backfill's whale-walk phase, then dispatch the next slice — or the
     finish step once the walk covers ``(0, head]``. The whale address set
     is recomputed at the start of every slice from ``Erc20BalanceWhale``
     and the boundary (``whale_addresses_upto_boundary``) — safe to do on
     every invocation by construction; see that function's docstring.
+
+    ``dispatch_seq``: see ``backfill_erc20_balance_chunk_task``'s docstring.
     """
     from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
         read_boundary,
@@ -2720,6 +3002,16 @@ def backfill_erc20_balance_whale_task(run_id: str) -> dict:
             run.get("state"),
         )
         return run
+    if run.get("dispatch_seq") != dispatch_seq:
+        logger.info(
+            "erc20_balance.backfill: run=%s dispatch_seq=%s is stale "
+            "(current %s) -- a resume has already superseded this whale "
+            "slice; exiting without work",
+            run_id,
+            dispatch_seq,
+            run.get("dispatch_seq"),
+        )
+        return run
 
     lock = get_redis().lock(
         get_task_lock_name(compute_erc20_balance_rollup_task.name),
@@ -2734,7 +3026,7 @@ def backfill_erc20_balance_whale_task(run_id: str) -> dict:
             ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
         )
         backfill_erc20_balance_whale_task.apply_async(
-            (run_id,),
+            (run_id, dispatch_seq),
             queue="contracts",
             countdown=ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
         )
@@ -2782,20 +3074,27 @@ def backfill_erc20_balance_whale_task(run_id: str) -> dict:
 
     if result["finished"]:
         run["phase"] = "finish"
-        _save_erc20_balance_backfill_run(run)
-        backfill_erc20_balance_finish_task.apply_async((run_id,), queue="contracts")
+        next_seq = bump_erc20_balance_dispatch_seq(run)
+        backfill_erc20_balance_finish_task.apply_async(
+            (run_id, next_seq), queue="contracts"
+        )
     else:
-        backfill_erc20_balance_whale_task.apply_async((run_id,), queue="contracts")
+        next_seq = bump_erc20_balance_dispatch_seq(run)
+        backfill_erc20_balance_whale_task.apply_async(
+            (run_id, next_seq), queue="contracts"
+        )
     return run
 
 
 @app.shared_task(acks_late=True, reject_on_worker_lost=True)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
-def backfill_erc20_balance_finish_task(run_id: str) -> dict:
+def backfill_erc20_balance_finish_task(run_id: str, dispatch_seq: int) -> dict:
     """One-shot: write the real ``erc20_balance`` / ``erc20_balance_safes``
     watermarks and rebuild ``TokenHolding`` (``finish_run``), then mark the
     manifest finished. Runs once the chunk and whale-walk phases are both
     done — see ``backfill_erc20_balance_whale_task``.
+
+    ``dispatch_seq``: see ``backfill_erc20_balance_chunk_task``'s docstring.
     """
     from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
         finish_run,
@@ -2819,6 +3118,16 @@ def backfill_erc20_balance_finish_task(run_id: str) -> dict:
             run.get("state"),
         )
         return run
+    if run.get("dispatch_seq") != dispatch_seq:
+        logger.info(
+            "erc20_balance.backfill: run=%s dispatch_seq=%s is stale "
+            "(current %s) -- a resume has already superseded this finish "
+            "step; exiting without work",
+            run_id,
+            dispatch_seq,
+            run.get("dispatch_seq"),
+        )
+        return run
 
     lock = get_redis().lock(
         get_task_lock_name(compute_erc20_balance_rollup_task.name),
@@ -2833,7 +3142,7 @@ def backfill_erc20_balance_finish_task(run_id: str) -> dict:
             ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
         )
         backfill_erc20_balance_finish_task.apply_async(
-            (run_id,),
+            (run_id, dispatch_seq),
             queue="contracts",
             countdown=ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
         )
@@ -2882,44 +3191,37 @@ def _erc20_backfill_dispatch_phase(run: dict) -> None:
     "read `phase`, dispatch that task" step a legitimate hand-off between
     phases already does inline (see the three tasks above), just driven
     from outside the chain instead of from the end of a slice.
+
+    Passes ``run["dispatch_seq"]`` through as-is -- the caller (either
+    ``dispatch_erc20_balance_backfill_run``, for a fresh manifest already
+    at seq 1, or the watchdog, which calls
+    ``bump_erc20_balance_dispatch_seq`` first) owns deciding what that
+    value should be; this function only reads it.
     """
     phase = run.get("phase")
+    dispatch_seq = run["dispatch_seq"]
     if phase == "whales":
         backfill_erc20_balance_whale_task.apply_async(
-            (run["run_id"],), queue="contracts"
+            (run["run_id"], dispatch_seq), queue="contracts"
         )
     elif phase == "finish":
         backfill_erc20_balance_finish_task.apply_async(
-            (run["run_id"],), queue="contracts"
+            (run["run_id"], dispatch_seq), queue="contracts"
         )
     else:
         backfill_erc20_balance_chunk_task.apply_async(
-            (run["run_id"],), queue="contracts"
+            (run["run_id"], dispatch_seq), queue="contracts"
         )
 
 
 def erc20_balance_backfill_looks_stalled() -> dict | None:
-    """Pure check, no side effects (does not touch the lock): ``None``
-    when nothing needs re-dispatching, else the run manifest the watchdog
-    should resume. Split out from the task so `--status`
-    (`backfill_erc20_balances.py`'s `_print_status`) can show the same
-    verdict the watchdog would act on.
-
-    All three conditions below are required, so a healthy run, an
-    inline-mode run (which has no self-dispatch to resume — the
-    operator's own shell holds that lock, not a stalled chain), or an
-    already-finished/failed one is never flagged:
-
-    1. A backfill is genuinely mid-run: `_PROGRESS_WATERMARK` exists and
-       `ERC20_BALANCE_WATERMARK` (written only by `finish_run`) does not.
-    2. Its Celery run manifest exists, is `state == "running"`, and
-       carries a `heartbeat_at`.
-    3. That heartbeat is older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS`.
-
-    Deliberately does NOT check the shared lock here — that check has a
-    side effect (acquire-then-release) that belongs in the task, once,
-    right before it decides to act, not in a read-only helper `--status`
-    also calls on every invocation.
+    """The stalled run manifest to resume, or `None`. Pure/read-only (no
+    lock touch) so `--status` can show the same verdict the watchdog acts
+    on. Requires: progress watermarks exist and the completion one
+    doesn't, a `"running"` manifest, and `heartbeat_at`/`started_at`
+    older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS` -- falling back to
+    `started_at` so a run whose first slice never got the chance to
+    heartbeat isn't read as fresh forever.
     """
     from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
         _PROGRESS_WATERMARK,
@@ -2937,16 +3239,84 @@ def erc20_balance_backfill_looks_stalled() -> dict | None:
     if run is None or run.get("state") != "running":
         return None
 
-    heartbeat_at = run.get("heartbeat_at")
-    if not heartbeat_at:
+    reference = run.get("heartbeat_at") or run.get("started_at")
+    if not reference:
         return None
-    try:
-        age = (timezone.now() - datetime.fromisoformat(heartbeat_at)).total_seconds()
-    except ValueError:
-        return None
-    if age < ERC20_BALANCE_BACKFILL_STALE_SECONDS:
+    age = tasks_shards.manifest_age_seconds(reference)
+    if age is None or age < ERC20_BALANCE_BACKFILL_STALE_SECONDS:
         return None
     return run
+
+
+def _erc20_balance_backfill_derive_orphan_phase() -> str:
+    """Which phase an orphaned run (progress watermarks exist, no live
+    running manifest) should resume at, derived from the DB watermarks.
+
+    Reuses the exact seed-candidate query the chunk phase itself uses
+    (`erc20_balance_seed_candidates`, `LIMIT 1`) to decide whether there
+    is more to seed, so this can never disagree with what re-entering at
+    `"chunks"` unconditionally would eventually do on its own -- it only
+    skips the no-op passes through phases that already finished.
+    """
+    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        _BOUNDARY_WATERMARK,
+        _PROGRESS_WATERMARK,
+        _WHALE_PROGRESS_WATERMARK,
+    )
+
+    progress = AnalyticsWatermark.objects.filter(name=_PROGRESS_WATERMARK).first()
+    boundary_row = AnalyticsWatermark.objects.filter(name=_BOUNDARY_WATERMARK).first()
+    if progress is None or boundary_row is None:
+        # Defensive only -- `resolve_run` always writes both together in
+        # one call, so one existing without the other should not happen.
+        # Re-entering at "chunks" is safe regardless: a non-resuming call
+        # into `resolve_run` rebuilds whichever watermark is missing.
+        return "chunks"
+
+    head = progress.block_number
+    cursor = (
+        (progress.computed_at, HexBytes(progress.address))
+        if progress.address is not None
+        else None
+    )
+    boundary = (boundary_row.computed_at, HexBytes(boundary_row.address))
+    if erc20_balance_seed_candidates(cursor, boundary, 1):
+        return "chunks"
+
+    whale_progress = AnalyticsWatermark.objects.filter(
+        name=_WHALE_PROGRESS_WATERMARK
+    ).first()
+    if whale_progress is None or whale_progress.block_number < head:
+        return "whales"
+    return "finish"
+
+
+def erc20_balance_backfill_auto_start_target() -> tuple[str, str | None] | None:
+    """What ``Erc20Stage.start_or_resume()`` should auto-start once the
+    analytics gate, the completion watermark, and a live running manifest
+    have all already been ruled out. Pure / read-only, same split as
+    `erc20_balance_backfill_looks_stalled` -- the caller still owns the
+    shared-lock check and the kill switch before acting on the result.
+
+    Returns ``None`` when the completion watermark is already there
+    (nothing left to ever start), ``("adopt", phase)`` when progress
+    watermarks exist without a live running manifest (manifest lost or
+    expired, a killed `--inline` run, or a run whose manifest is
+    `"failed"` -- retry gating for the latter is the tick's job, not this
+    function's), or ``("fresh", None)`` when nothing exists yet.
+    """
+    # Second element is a phase for "adopt", or `None` for "fresh": a
+    # brand-new run always starts at phase "chunks" on its own, so
+    # "fresh" carries no target here, unlike native's head block below.
+    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        _PROGRESS_WATERMARK,
+    )
+
+    if AnalyticsWatermark.objects.filter(name=ERC20_BALANCE_WATERMARK).exists():
+        return None
+    if not AnalyticsWatermark.objects.filter(name=_PROGRESS_WATERMARK).exists():
+        return "fresh", None
+    return "adopt", _erc20_balance_backfill_derive_orphan_phase()
 
 
 @app.shared_task(
@@ -2974,6 +3344,14 @@ def erc20_balance_backfill_watchdog_task(self) -> None:
     (`_erc20_backfill_dispatch_phase`), the same re-entry point a normal
     slice-to-slice hand-off uses, and that task will itself take the lock
     before touching anything.
+
+    Auto-start (adopting an orphaned run, or starting fresh on an empty
+    instance) is NOT this task's job: that lives in
+    `analytics.bootstrap.erc20.Erc20Stage.start_or_resume()`, dispatched
+    by the bootstrap tick (`analytics_bootstrap_tick_task`, below) and
+    gated by `ANALYTICS_AUTO_BACKFILL`. This task keeps only its original
+    job, resuming a stalled run, unconditionally: a manual `--celery` run
+    stays protected even with the bootstrap switch off.
     """
     if not settings.ENABLE_ANALYTICS:
         return
@@ -3000,15 +3378,46 @@ def erc20_balance_backfill_watchdog_task(self) -> None:
     # the slice task's own acquire for no benefit.
     lock.release()
 
+    # Bump the dispatch generation BEFORE redispatching: the originally
+    # queued slice, wherever it is, still carries the OLD `dispatch_seq`
+    # and will exit without work once it finally runs, instead of
+    # continuing a second, parallel chain.
+    dispatch_seq = bump_erc20_balance_dispatch_seq(run)
+
     logger.warning(
         "erc20_balance.backfill.watchdog: run=%s heartbeat older than "
-        "%ds (last seen %s), rollup lock free -- redispatching phase=%s",
+        "%ds (last seen %s), rollup lock free -- redispatching phase=%s "
+        "dispatch_seq=%d",
         run["run_id"],
         ERC20_BALANCE_BACKFILL_STALE_SECONDS,
         run.get("heartbeat_at"),
         run.get("phase"),
+        dispatch_seq,
     )
     _erc20_backfill_dispatch_phase(run)
+
+
+@app.shared_task(
+    bind=True,
+    name="safe_transaction_service.analytics.tasks.analytics_bootstrap_tick_task",
+)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def analytics_bootstrap_tick_task(self) -> None:
+    """Beat task (every 5 minutes, `setup_service.py`): the bootstrap
+    tick -- see `analytics/bootstrap/tick.py` for the full algorithm.
+
+    A thin wrapper, same shape as `analytics_catchup_task` above: the
+    real logic lives in the `bootstrap` package (a sibling of `catchup`,
+    same import-direction rule -- see that package's docstring). Never
+    raises: `run_tick()` already catches and logs every exception from a
+    stage or the indexer gate; this wrapper's own `try/except` is only a
+    second line of defense should `run_tick` somehow be entered with a
+    broken import or similar setup failure.
+    """
+    try:
+        analytics_bootstrap_run_tick()
+    except Exception:
+        logger.exception("analytics.bootstrap.tick: unexpected failure")
 
 
 # ─────────────── ERC-20 balance rollup drift check ────────────────

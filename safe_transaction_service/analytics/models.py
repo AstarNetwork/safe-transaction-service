@@ -497,3 +497,40 @@ class AnalyticsCatchupState(models.Model):
 
     def __str__(self) -> str:
         return f"AnalyticsCatchupState({self.kind}:{self.key})"
+
+
+class AnalyticsBootstrapStage(models.Model):
+    """Durable per-stage bookkeeping for the analytics bootstrap
+    (``analytics/bootstrap/``). One row per stage, ``name`` in
+    ``("daily", "native", "erc20")`` (the registry order,
+    `bootstrap/registry.py`) — created lazily (``get_or_create``) by
+    `bootstrap/bookkeeping.py`, never migrated in with fixed rows.
+
+    This is the ONE typed table the bootstrap's retry/give-up policy and
+    its "is everything done" check both read and write; there is no
+    separate completion-marker row (`bootstrap_complete` was retired
+    from ``AnalyticsWatermark`` — see `bookkeeping.py`'s module
+    docstring). ``completed_at`` is set the first time the tick sees the
+    stage's own ``is_done()`` report ``True``; ``completed_depth`` is
+    meaningful for the ``"daily"`` row only, recording the
+    ``ANALYTICS_BOOTSTRAP_DAILY_DAYS`` window depth that completion was
+    for, so a later, larger configured depth can be told apart from a
+    merely-stale completion. ``consecutive_failures`` /
+    ``last_failure_at`` / ``gave_up_at`` drive the cooldown-then-cap
+    retry policy; ``last_dispatch_at`` is stamped by every
+    ``start_or_resume()`` the tick makes, whatever the stage's status was
+    (pending, stalled, or failed), and is what tells a *newly* failed
+    attempt apart from one already counted.
+    """
+
+    name = models.CharField(max_length=32, primary_key=True)
+    consecutive_failures = models.PositiveIntegerField(default=0)
+    last_failure_at = models.DateTimeField(null=True, blank=True)
+    last_dispatch_at = models.DateTimeField(null=True, blank=True)
+    gave_up_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_depth = models.PositiveIntegerField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"AnalyticsBootstrapStage({self.name})"

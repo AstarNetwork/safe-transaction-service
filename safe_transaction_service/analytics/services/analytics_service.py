@@ -810,7 +810,23 @@ class AnalyticsService:
             "chain_id": get_chain_id(),
             "service_version": __version__,
             "computed_at": cached.get("computed_at"),
+            "bootstrap": self._get_bootstrap_report(),
         }
+
+    def _get_bootstrap_report(self) -> dict | None:
+        """Computed fresh on every `/summary/` call, never cached into the
+        snapshot row -- the bootstrap's own state can move between two
+        polls of a warming snapshot. Any failure here must never break
+        the rest of the summary payload."""
+        from safe_transaction_service.analytics.bootstrap import (
+            build_bootstrap_report,
+        )
+
+        try:
+            return build_bootstrap_report()
+        except Exception:
+            logger.exception("analytics.summary: failed to build the bootstrap report")
+            return None
 
     # ── A.2 Active Safes (Redis-cached) ──────────────────────────────
 

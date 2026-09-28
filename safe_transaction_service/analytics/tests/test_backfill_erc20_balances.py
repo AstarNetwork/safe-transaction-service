@@ -43,12 +43,15 @@ from safe_transaction_service.analytics.models import (
     SafeTokenBalance,
 )
 from safe_transaction_service.analytics.tasks import (
+    ERC20_BALANCE_BACKFILL_CURSOR_KEY,
+    ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX,
     ERC20_BALANCE_BACKFILL_STALE_SECONDS,
     ERC20_BALANCE_SAFES_WATERMARK,
     ERC20_BALANCE_WATERMARK,
     build_erc20_balance_backfill_run,
     compute_erc20_balance_rollup_task,
     dispatch_erc20_balance_backfill_run,
+    erc20_balance_backfill_auto_start_target,
     erc20_balance_backfill_looks_stalled,
     erc20_balance_backfill_watchdog_task,
     erc20_balance_head_block,
@@ -101,6 +104,15 @@ class Erc20BalanceBackfillTestCase(TestCase):
             patcher = patch(target, side_effect=lambda: self.clock)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+        # Redis is not rolled back between tests the way the database is,
+        # so a run manifest (and the cursor pointing at it) would outlive
+        # the rows it describes -- same isolation `NativeBootstrapTestCase`
+        # gives itself.
+        redis = get_redis()
+        keys = list(redis.scan_iter(match=f"{ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX}*"))
+        keys.append(ERC20_BALANCE_BACKFILL_CURSOR_KEY)
+        redis.delete(*keys)
 
     def advance_clock(self, delta: timedelta = timedelta(hours=2)):
         self.clock += delta
@@ -1254,8 +1266,14 @@ class TestWatchdogLeavesActiveLockAlone(Erc20BalanceBackfillWatchdogTestCase):
 
 class TestWatchdogNoOpWithNothingInProgress(Erc20BalanceBackfillWatchdogTestCase):
     def test_no_progress_rows_means_nothing_to_check(self):
+        """The watchdog's whole job now is resuming a stalled manual run:
+        an empty instance's watchdog tick must not raise and must not
+        touch anything, regardless of `ANALYTICS_AUTO_BACKFILL` -- the
+        watchdog no longer reads that setting at all. See
+        `TestWatchdogNoLongerAutoStarts` below for coverage of "the
+        watchdog by itself starts nothing".
+        """
         self.assertIsNone(erc20_balance_backfill_looks_stalled())
-        # Must not raise even with an empty Redis / DB state.
         erc20_balance_backfill_watchdog_task()
         self.assertFalse(AnalyticsWatermark.objects.exists())
 
@@ -1267,6 +1285,82 @@ class TestWatchdogNoOpWithNothingInProgress(Erc20BalanceBackfillWatchdogTestCase
 
         self.run_backfill(celery=True, chunk_size=10, task_chunks=10)
         self.assertIsNone(erc20_balance_backfill_looks_stalled())
+
+
+# ═══ Auto-start moved to the bootstrap's ERC-20 stage ══════════════════
+#
+# The fresh-start / adopt / kill-switch / zombie-chain coverage that used
+# to live here now lives in `test_analytics_bootstrap.py`, driving
+# `bootstrap.tick.run_tick()` instead of the watchdog task. What's left
+# here is proof the watchdog itself no longer does any of that.
+
+
+class TestWatchdogNoLongerAutoStarts(Erc20BalanceBackfillWatchdogTestCase):
+    def test_watchdog_alone_does_not_auto_start_on_an_empty_instance(self):
+        """`ANALYTICS_AUTO_BACKFILL` (the renamed kill switch) defaults
+        to on, yet a plain watchdog tick on an empty instance starts
+        nothing -- auto-start now requires the bootstrap tick."""
+        self.safe()
+        self.advance_head()
+
+        erc20_balance_backfill_watchdog_task()
+
+        self.assertIsNone(latest_erc20_balance_backfill_run_id())
+        self.assertFalse(AnalyticsWatermark.objects.exists())
+
+    def test_watchdog_still_resumes_a_stalled_manual_run(self):
+        safe = self.safe()
+        token = self.token()
+        self.transfer(self.block(), token, 10, to=safe.address)
+        self.advance_head()
+
+        self.fabricate_stalled_run()
+        self.advance_clock(timedelta(seconds=ERC20_BALANCE_BACKFILL_STALE_SECONDS + 1))
+        self.assertIsNotNone(erc20_balance_backfill_looks_stalled())
+
+        erc20_balance_backfill_watchdog_task()
+
+        self.assertIsNone(erc20_balance_backfill_looks_stalled())
+        self.assertTrue(
+            AnalyticsWatermark.objects.filter(name=ERC20_BALANCE_WATERMARK).exists()
+        )
+
+
+class TestAutoStartTargetPureFunction(Erc20BalanceBackfillWatchdogTestCase):
+    """Direct coverage of `erc20_balance_backfill_auto_start_target`,
+    split out the same way `erc20_balance_backfill_looks_stalled` is, for
+    the same reason: `--status` reads this same verdict without
+    dispatching anything."""
+
+    def test_fresh_when_nothing_exists(self):
+        self.assertEqual(erc20_balance_backfill_auto_start_target(), ("fresh", None))
+
+    def test_adopt_with_derived_phase_when_progress_rows_exist(self):
+        self.safe()
+        self.advance_head()
+        backfill_module.resolve_run(False)
+
+        self.assertEqual(
+            erc20_balance_backfill_auto_start_target(), ("adopt", "chunks")
+        )
+
+    def test_none_once_the_completion_watermark_exists(self):
+        self.safe()
+        self.advance_head()
+        self.run_backfill(celery=True, chunk_size=10, task_chunks=10)
+
+        self.assertIsNone(erc20_balance_backfill_auto_start_target())
+
+
+class TestManualRunOriginIsMarkedManual(Erc20BalanceBackfillWatchdogTestCase):
+    def test_a_manual_celery_start_is_origin_manual(self):
+        self.safe()
+        self.advance_head()
+
+        self.run_backfill(celery=True, chunk_size=10, task_chunks=10)
+
+        run = load_erc20_balance_backfill_run(latest_erc20_balance_backfill_run_id())
+        self.assertEqual(run["origin"], "manual")
 
 
 # ═══════════════════ P7 addendum: candidates query rewrite ═════════════

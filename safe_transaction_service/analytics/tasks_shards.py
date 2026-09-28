@@ -27,6 +27,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Callable
 from datetime import date, datetime
 
 from django.db import connection
@@ -44,7 +45,7 @@ from safe_transaction_service.analytics.services.db import relaxed_statement_tim
 from safe_transaction_service.history.models import ERC20Transfer, SafeContract
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
-from safe_transaction_service.utils.tasks import LOCK_TIMEOUT
+from safe_transaction_service.utils.tasks import LOCK_TIMEOUT, get_task_lock_name
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,25 @@ BACKFILL_RUN_KEY_PREFIX = "analytics_backfill_run:"
 BACKFILL_KEY_TTL_SECONDS = 7 * 24 * 3600
 # Cap on the per-day failure records carried in the run aggregate.
 BACKFILL_MAX_FAILURES = 200
+
+
+def manifest_age_seconds(timestamp_iso: str) -> float | None:
+    """Seconds between now and `timestamp_iso`, or `None` if it doesn't
+    parse -- shared by every bootstrap staleness check."""
+    try:
+        return (timezone.now() - datetime.fromisoformat(timestamp_iso)).total_seconds()
+    except ValueError:
+        return None
+
+
+def bump_dispatch_seq(run: dict, save_fn: Callable[[dict], None]) -> int:
+    """Bump and persist `run`'s dispatch generation, returning the value
+    to pass as the chain task's `dispatch_seq` argument -- shared by the
+    native and ERC-20 backfills, `save_fn` being each side's own
+    manifest-save function."""
+    run["dispatch_seq"] = run.get("dispatch_seq", 0) + 1
+    save_fn(run)
+    return run["dispatch_seq"]
 
 
 # ────────────────────── Native-balance sharding ────────────────────────
@@ -427,9 +447,42 @@ def dispatch_tvl_chord() -> None:
 # 5000 addresses, which is the batch size the balance SQL was measured at —
 # seconds, not minutes. The unit of work is bounded here and unbounded
 # there.
+#
+# **Shared lock (liveness, not elapsed time, decides "stalled" -- see
+# `analytics/bootstrap/native.py`).** Every chunk
+# takes `get_task_lock_name(compute_native_balance_rollup_task.name)` —
+# the SAME lock `compute_native_balance_rollup_task` takes via
+# `only_one_running_task(self)` — for the duration of its DB work, exactly
+# the way `backfill_erc20_balance_chunk_task` takes the ERC-20 rollup
+# lock. Two things follow:
+#   1. The nightly rollup task (and its small-fleet inline cold start,
+#      `_cold_start_native_balance_rollup`) can no longer run concurrently
+#      with a chunk's seed/finish step — the two `analytics_safenativebalance`
+#      writers are now serialised, closing the race that used to risk an
+#      `IntegrityError` on the watermark row (`write_native_balance_watermark`
+#      and `_cold_start_native_balance_rollup` are also now `get_or_create`-based,
+#      belt-and-braces).
+#   2. The lock IS this chunk's lease: while a chunk holds it, the run is
+#      provably alive, however long the chunk takes — `LOCK_TIMEOUT` is
+#      passed as both this task's own hard time limit (`task_timeout`
+#      below) and the lock's `timeout`, so the lock can never outlive the
+#      task that holds it, and can never expire before that task would
+#      have been killed either. `native_balance_backfill_looks_stalled`
+#      (`analytics/tasks.py`) checks the lock itself for exactly this
+#      reason, unlike the ERC-20 equivalent.
+# A chunk that loses the lock race (the nightly task, or another chunk
+# instance from a redelivered message, holds it) self-reschedules with a
+# short countdown rather than treating that as failure or giving up.
 
 NATIVE_BALANCE_RUN_KEY_PREFIX = "analytics_native_balance_run:"
 NATIVE_BALANCE_CURSOR_KEY = "analytics_native_balance_cursor"
+
+# How long a chunk that lost the lock race waits before trying again. Same
+# figure and reasoning as `ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN`
+# (`analytics/tasks.py`): short enough that a run does not visibly stall
+# behind one nightly-task cycle, long enough not to hammer Redis while the
+# lock is held.
+NATIVE_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN = 15
 
 
 def native_balance_run_key(run_id: str) -> str:
@@ -467,6 +520,10 @@ def build_native_balance_run(
         "finished_at": None,
         "state": "running",
         "error": None,
+        # Dispatch generation -- see `next_native_balance_dispatch_seq`.
+        # A fresh manifest always starts at seq 1, whether from
+        # `--celery` or the bootstrap stage's fresh-start/adopt path.
+        "dispatch_seq": 1,
         # Hex of the last address the walk consumed; None = start from the
         # beginning. Carried in Redis rather than in the task signature so a
         # lost message is recoverable by re-dispatching from the manifest.
@@ -480,24 +537,59 @@ def build_native_balance_run(
 
 
 def _save_native_balance_run(run: dict) -> None:
+    """Persist the manifest and refresh its heartbeat in the same write --
+    same shape as `_save_erc20_balance_backfill_run` (`analytics/tasks.py`).
+    `heartbeat_at` is secondary liveness now (the shared lock, held for
+    the chunk's whole execution, is primary -- see the block comment
+    above `NATIVE_BALANCE_RUN_KEY_PREFIX`): it only has to cover the
+    short chunk-to-chunk hand-off, not a chunk's own running time.
+    """
+    run["heartbeat_at"] = timezone.now().isoformat()
     _redis_set_json(run["run_key"], run)
+
+
+def next_native_balance_dispatch_seq(run: dict) -> int:
+    """Bump and persist ``run``'s dispatch generation -- see
+    ``bump_dispatch_seq``. Called before every redispatch of an existing
+    run_id (chunk-to-chunk hand-off, or the bootstrap stage resuming a
+    stall), so a chunk whose own ``dispatch_seq`` argument no longer
+    matches has been superseded and exits without work."""
+    return bump_dispatch_seq(run, _save_native_balance_run)
 
 
 @app.shared_task()
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
-def backfill_native_balance_chunk(run_id: str) -> dict:
+def backfill_native_balance_chunk(run_id: str, dispatch_seq: int) -> dict:
     """One chunk of the native-balance backfill, then dispatch the next.
 
     Reads its own starting cursor from the run manifest, so the task
-    signature stays `(run_id)` and a chunk can always be re-dispatched from
-    Redis after a lost message. Exactly one chunk of a run is ever in
-    flight, so the manifest has a single writer and needs no CAS.
+    signature (besides ``dispatch_seq``, see below) stays `(run_id)` and a
+    chunk can always be re-dispatched from Redis after a lost message.
+    Exactly one chunk of a run is ever in flight, so the manifest has a
+    single writer and needs no CAS.
 
-    Failure stops the chain rather than raising into a retry storm: the
-    manifest records `state="failed"` with the message, `--status` shows it,
-    and re-running the command resumes (rows already written are skipped).
+    ``dispatch_seq`` is the manifest's dispatch generation at the moment
+    THIS invocation was dispatched (``next_native_balance_dispatch_seq``).
+    A mismatch against the manifest's current value means the bootstrap
+    stage has already redispatched this run as stalled — see that
+    function's docstring — so this invocation exits immediately without
+    touching anything.
+
+    Takes the shared rollup lock for the duration of its DB work -- see
+    the block comment above `NATIVE_BALANCE_RUN_KEY_PREFIX`. A chunk that
+    loses that race self-reschedules; it is not a failure.
+
+    Failure (the DB work itself raising, whether from the task's own time
+    limit, `relaxed_statement_timeout`, or anything else) stops the chain
+    rather than raising into a retry storm: the manifest records
+    `state="failed"` with the message, `--status` shows it, and
+    `NativeStage.status()` (`analytics/bootstrap/native.py`) reports
+    `"failed"`, not `"stalled"` -- re-running the command (or the
+    bootstrap adopting the leftover progress rows) resumes (rows already
+    written are skipped).
     """
     from safe_transaction_service.analytics.tasks import (
+        compute_native_balance_rollup_task,
         safe_addresses_after,
         seed_missing_native_balances,
         write_native_balance_watermark,
@@ -518,34 +610,63 @@ def backfill_native_balance_chunk(run_id: str) -> dict:
             run.get("state"),
         )
         return run
+    if run.get("dispatch_seq") != dispatch_seq:
+        logger.info(
+            "native_balance.backfill: run=%s dispatch_seq=%s is stale "
+            "(current %s) -- a resume has already superseded this chunk; "
+            "exiting without work",
+            run_id,
+            dispatch_seq,
+            run.get("dispatch_seq"),
+        )
+        return run
+
+    # A heartbeat the moment this chunk starts executing, before the lock
+    # attempt: even a chunk that immediately loses the lock race and
+    # self-reschedules below has just proven the run is alive, and
+    # `native_balance_backfill_looks_stalled`'s grace period should see
+    # that, not only the heartbeat from the chunk that finally gets in.
+    _save_native_balance_run(run)
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_native_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        logger.info(
+            "native_balance.backfill: run=%s chunk could not get the "
+            "rollup lock (nightly task or another writer has it); "
+            "retrying in %ds",
+            run_id,
+            NATIVE_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        backfill_native_balance_chunk.apply_async(
+            (run_id, dispatch_seq),
+            queue="contracts",
+            countdown=NATIVE_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN,
+        )
+        return run
 
     started = time.time()
     cursor_hex = run.get("cursor")
     after = bytes.fromhex(cursor_hex) if cursor_hex else None
 
     try:
-        with relaxed_statement_timeout():
-            addresses = safe_addresses_after(after, run["chunk_size"])
-            if not addresses:
-                # Walked off the end: hand the rollup over and close the run.
-                wrote = write_native_balance_watermark(run["head"])
-                run["watermark_written"] = wrote
-                run["state"] = "finished"
-                run["finished_at"] = timezone.now().isoformat()
-                _save_native_balance_run(run)
-                logger.info(
-                    "native_balance.backfill: run=%s finished chunks=%d "
-                    "seen=%d seeded=%d already_present=%d watermark=%s",
-                    run_id,
-                    run["chunks_done"],
-                    run["safes_seen"],
-                    run["safes_seeded"],
-                    run["safes_already_present"],
-                    run["head"] if wrote else "left as it was",
-                )
-                return run
-
-            seeded, present = seed_missing_native_balances(addresses, run["head"])
+        try:
+            with relaxed_statement_timeout():
+                addresses = safe_addresses_after(after, run["chunk_size"])
+                if addresses:
+                    seeded, present = seed_missing_native_balances(
+                        addresses, run["head"]
+                    )
+                else:
+                    # Walked off the end: hand the rollup over under the
+                    # same lock that serialises it against the nightly
+                    # task, and close the run.
+                    wrote = write_native_balance_watermark(run["head"])
+        finally:
+            lock.release()
     except Exception as exc:
         logger.exception(
             "native_balance.backfill: run=%s chunk %d failed after %.2fs",
@@ -559,20 +680,37 @@ def backfill_native_balance_chunk(run_id: str) -> dict:
         _save_native_balance_run(run)
         return run
 
+    if not addresses:
+        run["watermark_written"] = wrote
+        run["state"] = "finished"
+        run["finished_at"] = timezone.now().isoformat()
+        _save_native_balance_run(run)
+        logger.info(
+            "native_balance.backfill: run=%s finished chunks=%d "
+            "seen=%d seeded=%d already_present=%d watermark=%s",
+            run_id,
+            run["chunks_done"],
+            run["safes_seen"],
+            run["safes_seeded"],
+            run["safes_already_present"],
+            run["head"] if wrote else "left as it was",
+        )
+        return run
+
     run["cursor"] = addresses[-1].hex()
     run["chunks_done"] += 1
     run["safes_seen"] += len(addresses)
     run["safes_seeded"] += seeded
     run["safes_already_present"] += present
-    # Persisted BEFORE the dispatch below and never after it: under eager
-    # mode the whole remaining chain runs inside `apply_async`, so a write
-    # afterwards would clobber newer state with this stale copy. Same
-    # lesson as `_dispatch_backfill_chunk`.
-    _save_native_balance_run(run)
+    # `next_native_balance_dispatch_seq` persists BEFORE the dispatch below
+    # and never after it: under eager mode the whole remaining chain runs
+    # inside `apply_async`, so a write afterwards would clobber newer
+    # state with this stale copy. Same lesson as `_dispatch_backfill_chunk`.
+    next_seq = next_native_balance_dispatch_seq(run)
 
     logger.info(
         "native_balance.backfill: run=%s chunk %d done in %.2fs seen=%d/%d "
-        "seeded=%d present=%d",
+        "seeded=%d present=%d dispatch_seq=%d",
         run_id,
         run["chunks_done"],
         time.time() - started,
@@ -580,8 +718,9 @@ def backfill_native_balance_chunk(run_id: str) -> dict:
         run["total_safes_at_start"],
         seeded,
         present,
+        next_seq,
     )
-    backfill_native_balance_chunk.apply_async((run_id,), queue="contracts")
+    backfill_native_balance_chunk.apply_async((run_id, next_seq), queue="contracts")
     return run
 
 
@@ -589,8 +728,9 @@ def start_native_balance_backfill_run(
     head: int, chunk_size: int, total_safes: int, run_id: str | None = None
 ) -> dict:
     """Persist a new manifest, point the cursor key at it and dispatch the
-    first chunk. Later chunks dispatch themselves on the worker, so the
-    caller may exit immediately.
+    first chunk (at ``dispatch_seq=1``, from ``build_native_balance_run``).
+    Later chunks dispatch themselves on the worker, so the caller may exit
+    immediately.
     """
     run = build_native_balance_run(head, chunk_size, total_safes, run_id=run_id)
     _save_native_balance_run(run)
@@ -602,7 +742,9 @@ def start_native_balance_backfill_run(
             "started_at": run["started_at"],
         },
     )
-    backfill_native_balance_chunk.apply_async((run["run_id"],), queue="contracts")
+    backfill_native_balance_chunk.apply_async(
+        (run["run_id"], run["dispatch_seq"]), queue="contracts"
+    )
     return load_native_balance_run(run["run_id"]) or run
 
 
@@ -656,6 +798,86 @@ def _write_backfill_heartbeat(run_id: str) -> None:
     )
 
 
+# ─────────── Daily day-shard lease (liveness, not elapsed time) ─────────
+#
+# A day-shard that is merely slow -- a heavy Ethereum day, a busy worker
+# -- must never be superseded just because it has been running for a
+# while. While a
+# shard executes it holds this lease; `DailyStage.status()`
+# (`bootstrap/daily.py`) treats the run as `"running"` for as long as ANY
+# lease of it exists, however old the run's heartbeat is, and only calls
+# it `"stalled"` once no lease exists AND the grace period past the last
+# dispatch/heartbeat has elapsed -- at that point the work is provably
+# dead, because the lease's own TTL would have expired it.
+#
+# One sorted set per RUN (not one string key per day) -- `ZADD ... EX`
+# doesn't exist, so per-day string keys made `any_daily_backfill_lease_held`
+# a `SCAN`, which walks the whole keyspace on the no-match path (a stalled
+# or idle run, i.e. the common case) every 5-minute tick, on a shared
+# Redis. A sorted set answers "is anything still live" with one `ZCOUNT`
+# instead: each day-shard is a member scored by its OWN expiry timestamp
+# (`now + TTL`), "held" is "any member scored at or after now" (`ZCOUNT
+# key now +inf`), which also self-heals a shard that died without
+# releasing -- once its score passes, it silently stops counting, no
+# separate reaper needed. A chunk runs every one of its days' shards in
+# parallel (`dispatch_backfill`'s `group(...)`), so the set holds several
+# members at once mid-chunk.
+
+DAILY_BACKFILL_LEASES_KEY_PREFIX = "analytics_backfill_leases:"
+
+# The hard time limit `compute_daily_metric_shard` runs under, below --
+# pulled out to a named constant (rather than left as a literal in the
+# `@task_timeout(...)` line) so the lease TTL can be derived from the
+# EXACT number the shard is killed at instead of a second guess that
+# could silently drift from it.
+_DAILY_SHARD_HARD_TIME_LIMIT_SECONDS = LOCK_TIMEOUT * 4
+
+# Small margin added on top of the hard time limit, so a lease can never
+# expire a moment before `task_timeout`'s own `Timeout(...)` would have
+# fired and unwound the shard (which releases its own lease member, in
+# its `finally`) -- the TTL is a backstop for the case that release never
+# runs at all (worker killed, process segfault), not the normal path.
+_DAILY_SHARD_LEASE_MARGIN_SECONDS = 60
+
+DAILY_BACKFILL_LEASE_TTL_SECONDS = (
+    _DAILY_SHARD_HARD_TIME_LIMIT_SECONDS + _DAILY_SHARD_LEASE_MARGIN_SECONDS
+)
+
+
+def daily_backfill_leases_key(run_id: str) -> str:
+    return f"{DAILY_BACKFILL_LEASES_KEY_PREFIX}{run_id}"
+
+
+def _acquire_daily_backfill_lease(run_id: str, day_iso: str) -> None:
+    """Add (or refresh) `day_iso` as a member of `run_id`'s lease set,
+    scored by its expiry timestamp. `EXPIRE` on the whole set is a
+    belt-and-braces cap so the set itself is eventually reclaimed even if
+    every member is released (or every shard dies) and nothing ever
+    calls `ZREM` again -- `ZCOUNT` already ignores expired *members* on
+    their score alone, this is only about the set key not lingering
+    forever at zero members.
+    """
+    key = daily_backfill_leases_key(run_id)
+    redis = get_redis()
+    redis.zadd(key, {day_iso: time.time() + DAILY_BACKFILL_LEASE_TTL_SECONDS})
+    redis.expire(key, DAILY_BACKFILL_LEASE_TTL_SECONDS)
+
+
+def _release_daily_backfill_lease(run_id: str, day_iso: str) -> None:
+    get_redis().zrem(daily_backfill_leases_key(run_id), day_iso)
+
+
+def any_daily_backfill_lease_held(run_id: str) -> bool:
+    """``True`` while at least one day-shard of ``run_id`` is still
+    executing -- one ``ZCOUNT`` against the run's lease set, scored by
+    each member's own expiry, rather than a keyspace ``SCAN``: a member
+    whose shard died without releasing simply stops counting once its
+    score passes ``now``, no separate reaper needed.
+    """
+    key = daily_backfill_leases_key(run_id)
+    return get_redis().zcount(key, time.time(), "+inf") > 0
+
+
 def new_backfill_run_id() -> str:
     return f"{timezone.now().strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}"
 
@@ -692,6 +914,36 @@ def latest_backfill_run_id() -> str | None:
     if pointer and isinstance(pointer.get("run_id"), str):
         return pointer["run_id"]
     return None
+
+
+def supersede_backfill_run(run_id: str) -> dict | None:
+    """Mark ``run_id``'s manifest ``superseded`` so its next chunk hand-off
+    (``_advance_backfill_run``, the chord callback's continuation) refuses
+    to dispatch and the run stops for good at its current chunk boundary.
+
+    Used by the bootstrap's ``DailyStage.start_or_resume()``
+    (``analytics/bootstrap/daily.py``) right before it starts a fresh run
+    over a stalled run's still-missing days -- without this, the old
+    chord (merely SLOW, not dead: a heavy day, a busy worker) would still
+    hand off its own next chunk once it finally completes, and two daily
+    backfills would be running at once.
+
+    Idempotent and safe to call on a run that has already finished
+    naturally or failed to dispatch: ``finished_at`` is set only if not
+    already set, so a genuinely finished run's own timestamp is never
+    overwritten. Returns the updated manifest, or ``None`` if it's
+    already gone (expired/flushed) -- nothing to mark then, and
+    ``_advance_backfill_run``'s own ``run is None`` branch already stops
+    a manifest-less chain.
+    """
+    run = load_backfill_run(run_id)
+    if run is None:
+        return None
+    run["superseded"] = True
+    if not run.get("finished_at"):
+        run["finished_at"] = timezone.now().isoformat()
+    _save_backfill_run(run)
+    return run
 
 
 def build_backfill_run(
@@ -858,6 +1110,39 @@ def _advance_backfill_run(run_id: str, chunk_index: int, summary: dict) -> None:
         )
         return
 
+    # Refuse to hand off to the next chunk once this run is no longer the
+    # one anybody should be progressing: either something explicitly
+    # marked it `superseded` (`supersede_backfill_run` -- the bootstrap's
+    # `DailyStage.start_or_resume()` calls this before starting a fresh
+    # run over a stalled one's still-missing days, see
+    # `analytics/bootstrap/daily.py`), or the cursor key names a
+    # DIFFERENT `run_id` (the same safety net
+    # `erc20_balance_backfill_auto_start_target`'s "at most one live
+    # chain" gives ERC-20). A missing pointer is not a supersession --
+    # `dispatch_backfill()`'s standalone/legacy path never points the
+    # cursor at all, so a bare run must still hand off its own chunks.
+    # Without this, an old chord that was merely SLOW (a heavy day, a
+    # busy worker) rather than dead would still dispatch its own next
+    # chunk after being superseded, and two daily backfills would run at
+    # once. The aggregate/summary bookkeeping above still lands; only
+    # the dispatch is skipped.
+    current_pointer = latest_backfill_run_id()
+    if run.get("superseded") or (
+        current_pointer is not None and current_pointer != run_id
+    ):
+        if not run.get("finished_at"):
+            run["finished_at"] = timezone.now().isoformat()
+        _save_backfill_run(run)
+        logger.info(
+            "backfill: run=%s is no longer current (superseded=%s, "
+            "latest=%s); not dispatching chunk %d",
+            run_id,
+            run.get("superseded", False),
+            current_pointer,
+            next_index,
+        )
+        return
+
     try:
         _dispatch_backfill_chunk(run, next_index)
     except Exception as exc:  # noqa: BLE001 — surface via manifest
@@ -873,7 +1158,7 @@ def _advance_backfill_run(run_id: str, chunk_index: int, summary: dict) -> None:
 
 
 @app.shared_task()
-@task_timeout(timeout_seconds=LOCK_TIMEOUT * 4)
+@task_timeout(timeout_seconds=_DAILY_SHARD_HARD_TIME_LIMIT_SECONDS)
 def compute_daily_metric_shard(
     day_iso: str, run_id: str | None = None, skip_settle_check: bool = False
 ) -> dict:
@@ -887,10 +1172,20 @@ def compute_daily_metric_shard(
 
     - `run_id`, when given, is this shard's own backfill run. A heartbeat
       (`backfill_heartbeat_key(run_id)`, same TTL as the manifest) is
-      written at start and finish, so the sweeper can tell a long-running
-      backfill from a dead one by *shard* activity rather than the run's
-      original `started_at`. A shard dispatched without `run_id` (a bare
-      `dispatch_backfill()` call) writes no heartbeat.
+      written at start and finish, so `DailyStage.status()` has SOME
+      timestamp to fall back to for its grace period even before the
+      first shard's lease lands. The lease itself (a member of
+      `daily_backfill_leases_key(run_id)`'s sorted set, scored
+      `DAILY_BACKFILL_LEASE_TTL_SECONDS` out) is the thing that actually
+      decides liveness, not elapsed time: held for the shard's whole
+      execution and released in the `finally` below, including on the
+      exception path, so a genuinely slow-but-alive day
+      never reads as stalled, however long it runs -- only a lease that
+      is truly gone (the shard died without unwinding, e.g. a killed
+      worker) lets `status()` call the run stalled, and only after its
+      grace period on top of that. A shard dispatched without `run_id` (a
+      bare `dispatch_backfill()` call) writes no heartbeat and holds no
+      lease.
     - `skip_settle_check` carries `backfill_daily_metrics
       --skip-settle-check` down to this one day; the nightly task and the
       sweeper never set it.
@@ -904,6 +1199,7 @@ def compute_daily_metric_shard(
     day = _parse_iso_date(day_iso)
     if run_id:
         _write_backfill_heartbeat(run_id)
+        _acquire_daily_backfill_lease(run_id, day_iso)
     started = time.time()
     logger.info("compute_daily_metric_shard: starting day=%s", day_iso)
     try:
@@ -923,6 +1219,7 @@ def compute_daily_metric_shard(
     finally:
         if run_id:
             _write_backfill_heartbeat(run_id)
+            _release_daily_backfill_lease(run_id, day_iso)
 
     elapsed = time.time() - started
     if result.status == DayStatus.DEFERRED:
@@ -1072,8 +1369,13 @@ __all__ = [
     "load_backfill_run",
     "load_backfill_chunk_summary",
     "latest_backfill_run_id",
+    "supersede_backfill_run",
     "backfill_run_key",
     "backfill_chunk_key",
     "backfill_heartbeat_key",
+    "DAILY_BACKFILL_LEASES_KEY_PREFIX",
+    "DAILY_BACKFILL_LEASE_TTL_SECONDS",
+    "daily_backfill_leases_key",
+    "any_daily_backfill_lease_held",
     "new_backfill_run_id",
 ]

@@ -235,6 +235,33 @@ class TestPerChunkKeysAndAggregate(BackfillRedisMixin, TestCase):
         self.assertEqual(run["written"], 3)
         self.assertIsNotNone(run["finished_at"])
 
+    def test_missing_pointer_still_hands_off_the_next_chunk(self):
+        """A manifest saved without ever pointing `BACKFILL_CURSOR_KEY` at
+        it (the standalone/legacy `dispatch_backfill()` path) must still
+        hand off its own next chunk -- a missing pointer is not the same
+        as the pointer naming a DIFFERENT run, and only the latter means
+        superseded."""
+        run = build_backfill_run(_dates(4), chunk_days=2, run_id="no-pointer-run")
+        run["chunks"][0]["state"] = "running"
+        _save_backfill_run(run)
+        self.assertIsNone(latest_backfill_run_id())
+
+        with patch(UPSERT_TARGET, return_value=DONE_RESULT):
+            backfill_done(
+                [
+                    {"date": "2026-06-10", "ok": True},
+                    {"date": "2026-06-11", "ok": True},
+                ],
+                stats_key=run["chunks"][0]["key"],
+                run_id="no-pointer-run",
+                chunk_index=0,
+            )
+
+        run = load_backfill_run("no-pointer-run")
+        self.assertEqual([c["state"] for c in run["chunks"]], ["done", "done"])
+        self.assertEqual(run["written"], 4)
+        self.assertIsNotNone(run["finished_at"])
+
     def test_standalone_dispatch_backfill_keeps_legacy_cursor_summary(self):
         with patch(UPSERT_TARGET, return_value=DONE_RESULT):
             dispatch_backfill(_dates(2))

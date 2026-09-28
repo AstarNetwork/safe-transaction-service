@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from safe_transaction_service.analytics.bootstrap.bookkeeping import reset_stage
 from safe_transaction_service.analytics.catchup import (
     DayNotReady,
     DayStatus,
@@ -212,6 +213,9 @@ class Command(BaseCommand):
                     "fully indexed -- see --help."
                 )
             )
+
+        # A manual start resets the bootstrap's retry bookkeeping for this stage.
+        reset_stage("daily")
 
         if options["inline"]:
             return self._run_inline(
@@ -487,7 +491,16 @@ class Command(BaseCommand):
         if started is not None:
             elapsed = ((finished or now) - started).total_seconds()
         done = sum(1 for c in run["chunks"] if c["state"] == "done")
-        if finished is None:
+        if run.get("superseded"):
+            # `tasks_shards.supersede_backfill_run` -- the bootstrap
+            # (`DailyStage.start_or_resume()`) marked this run superseded
+            # before starting a fresh one over its still-missing days.
+            # Checked ahead of `finished is None` because a superseded run
+            # that hadn't dispatched its last chunk yet still has no
+            # `finished_at` of its own at the moment it's marked -- this
+            # state is more informative than "IN PROGRESS" either way.
+            state = "SUPERSEDED"
+        elif finished is None:
             state = "IN PROGRESS"
         elif any(c["state"] == "dispatch_failed" for c in run["chunks"]):
             state = "STOPPED (dispatch failed)"

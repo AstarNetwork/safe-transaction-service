@@ -1156,7 +1156,7 @@ class TestChunkedCeleryBackfill(NativeBalanceRollupTestCase):
         run_id = latest_native_balance_run_id()
         before = load_native_balance_run(run_id)
 
-        backfill_native_balance_chunk(run_id)
+        backfill_native_balance_chunk(run_id, before["dispatch_seq"])
 
         self.assertEqual(load_native_balance_run(run_id), before)
 

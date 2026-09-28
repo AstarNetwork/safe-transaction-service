@@ -112,6 +112,7 @@ from django.utils import timezone
 
 from hexbytes import HexBytes
 
+from safe_transaction_service.analytics.bootstrap.bookkeeping import reset_stage
 from safe_transaction_service.analytics.models import (
     AnalyticsSnapshot,
     AnalyticsWatermark,
@@ -1043,6 +1044,9 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if options["status"]:
             return self._print_status()
+
+        # A manual start resets the bootstrap's retry bookkeeping for this stage.
+        reset_stage("erc20", data_wiped=options["restart"])
 
         if options["celery"]:
             return self._run_celery(options)

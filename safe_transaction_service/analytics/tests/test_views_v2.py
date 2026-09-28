@@ -8,6 +8,11 @@ from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
+from safe_transaction_service.analytics.bootstrap import Stage
+from safe_transaction_service.analytics.bootstrap.bookkeeping import (
+    mark_completed,
+    mark_gave_up,
+)
 from safe_transaction_service.analytics.models import AnalyticsSnapshot
 from safe_transaction_service.analytics.services.analytics_service import (
     AnalyticsService,
@@ -168,6 +173,9 @@ class TestSummaryView(AnalyticsTestMixin, APITestCase):
         self.assertIsNone(data["first_safe_created"])
         self.assertIsNone(data["last_safe_created"])
         self.assertEqual(data["chain_id"], 84532)
+        self.assertIn("bootstrap", data)
+        self.assertIsNotNone(data["bootstrap"])
+        self.assertIn("stages", data["bootstrap"])
 
     @patch(
         "safe_transaction_service.utils.ethereum.get_chain_id",
@@ -198,6 +206,106 @@ class TestSummaryView(AnalyticsTestMixin, APITestCase):
         self.assertEqual(data["total_erc721_transfers"], 1)
         self.assertIsNotNone(data["first_safe_created"])
         self.assertIsNotNone(data["last_safe_created"])
+        self.assertIn("bootstrap", data)
+        self.assertIsNotNone(data["bootstrap"])
+        self.assertIn("stages", data["bootstrap"])
+
+
+class _FakeBootstrapStage(Stage):
+    """Stand-in for `DailyStage`/`NativeStage`/`Erc20Stage` so a test can
+    control a stage's live `status()` directly, without arranging that
+    stage's own manifest/watermark machinery -- mirrors the `_SpyStage`
+    pattern in `test_analytics_bootstrap.py`, duplicated here rather than
+    imported (no precedent in this suite for a shared test base across
+    files)."""
+
+    def __init__(self, name, status_value):
+        self.name = name
+        self._status = status_value
+
+    def is_done(self):
+        return False
+
+    def status(self):
+        return self._status
+
+    def start_or_resume(self):
+        raise AssertionError("the summary view must never dispatch anything")
+
+
+class TestSummaryBootstrapObject(AnalyticsTestMixin, APITestCase):
+    """The `bootstrap` object on `/summary/` (`AnalyticsSummaryView`,
+    `AnalyticsService.get_summary`)."""
+
+    @patch(
+        "safe_transaction_service.utils.ethereum.get_chain_id",
+        return_value=84532,
+    )
+    def test_stage_states_come_out_right(self, mock_chain_id):
+        mark_completed("native")
+        mark_gave_up("erc20")
+        fake_stages = [
+            _FakeBootstrapStage("daily", "running"),
+            _FakeBootstrapStage("native", "pending"),
+            _FakeBootstrapStage("erc20", "pending"),
+        ]
+
+        with patch(
+            "safe_transaction_service.analytics.bootstrap.report.build_default_stages",
+            return_value=fake_stages,
+        ):
+            response = self.client.get(
+                reverse("v2:analytics:analytics-summary"), **self.auth_header
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        bootstrap = response.data["bootstrap"]
+        self.assertIsNotNone(bootstrap)
+        self.assertEqual(bootstrap["stages"]["daily"]["state"], "running")
+        self.assertEqual(bootstrap["stages"]["native"]["state"], "done")
+        self.assertEqual(bootstrap["stages"]["erc20"]["state"], "gave_up")
+        self.assertEqual(bootstrap["current_stage"], "daily")
+
+    @patch(
+        "safe_transaction_service.utils.ethereum.get_chain_id",
+        return_value=84532,
+    )
+    def test_a_raising_report_gives_null_bootstrap_with_summary_intact(
+        self, mock_chain_id
+    ):
+        SafeContractFactory()
+        compute_summary_task()
+
+        with patch(
+            "safe_transaction_service.analytics.bootstrap.build_bootstrap_report",
+            side_effect=RuntimeError("boom"),
+        ):
+            response = self.client.get(
+                reverse("v2:analytics:analytics-summary"), **self.auth_header
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["bootstrap"])
+        self.assertEqual(response.data["total_safes"], 1)
+
+    @patch(
+        "safe_transaction_service.utils.ethereum.get_chain_id",
+        return_value=84532,
+    )
+    def test_a_raising_report_on_the_warming_path_still_returns_200(
+        self, mock_chain_id
+    ):
+        with patch(
+            "safe_transaction_service.analytics.bootstrap.build_bootstrap_report",
+            side_effect=RuntimeError("boom"),
+        ):
+            response = self.client.get(
+                reverse("v2:analytics:analytics-summary"), **self.auth_header
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["bootstrap"])
+        self.assertIsNone(response.data["computed_at"])
 
 
 class TestActiveSafesView(AnalyticsTestMixin, APITestCase):

@@ -2,6 +2,7 @@
 Base settings to build other settings files upon.
 """
 
+import logging
 from pathlib import Path
 
 import environ
@@ -54,6 +55,32 @@ SSO_ENABLED = False
 
 # Enable analytics endpoints
 ENABLE_ANALYTICS = env.bool("ENABLE_ANALYTICS", default=False)
+
+# Kill switch for the whole analytics bootstrap: the self-starting,
+# ordered daily-metrics -> native-balances -> ERC-20-balances backfill
+# chain. Default on: every instance with ENABLE_ANALYTICS backfills
+# itself within one bootstrap tick of deploy + migrate, with no per-host
+# manual step. Turning this off stops the whole bootstrap (all three
+# stages); the ERC-20 watchdog still resumes a stalled *manual*
+# `--celery` run unconditionally, since that task no longer reads this
+# setting at all.
+ANALYTICS_AUTO_BACKFILL = env.bool("ANALYTICS_AUTO_BACKFILL", default=True)
+
+# Sliding-window depth (complete UTC days) the bootstrap's daily-metrics
+# stage backfills: the window is always [today - N, yesterday],
+# recomputed on every tick. Raising N later only backfills the
+# newly-missing older days; lowering it does nothing, since data already
+# written is never deleted. Must be >= 1 -- rather than crashing the
+# whole service at boot on a bad value, this is clamped (logged once at
+# WARNING), in keeping with the bootstrap's own "never raise, never
+# block" mandate.
+ANALYTICS_BOOTSTRAP_DAILY_DAYS = env.int("ANALYTICS_BOOTSTRAP_DAILY_DAYS", default=90)
+if ANALYTICS_BOOTSTRAP_DAILY_DAYS < 1:
+    logging.getLogger(__name__).warning(
+        "ANALYTICS_BOOTSTRAP_DAILY_DAYS=%d is invalid (must be >= 1); clamping to 1",
+        ANALYTICS_BOOTSTRAP_DAILY_DAYS,
+    )
+    ANALYTICS_BOOTSTRAP_DAILY_DAYS = 1
 
 # GUNICORN
 GUNICORN_REQUEST_TIMEOUT = gunicorn_request_timeout

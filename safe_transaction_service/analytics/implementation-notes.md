@@ -1505,6 +1505,22 @@ Verified against Sonic staging, whose current chord output is honest
 1030423823669599423227126788`, `total_safes_with_balance: 628`) —
 `native_balance_wei` after the backfill must match it exactly.
 
+**Superseded by the analytics bootstrap ("Analytics bootstrap
+(self-starting backfills)", below).** Step 2 is no longer a required
+manual step on any fleet instance: `bootstrap.native.NativeStage`
+dispatches `backfill_native_balances --celery` itself, once the daily
+stage is done, the indexer gate is settled, and
+`ANALYTICS_AUTO_BACKFILL` (default on) hasn't been switched off. The
+command above still works unchanged as a manual override — an operator
+who runs it by hand is never raced by the bootstrap (see that section's
+"Liveness" and "Manual commands vs. the bootstrap" notes). Also note
+`run_native_balance_rollup`'s own small-fleet cold start
+(`_cold_start_native_balance_rollup`) now declines outright, before
+touching anything, whenever `_native_balance_backfill_in_progress()`
+says a native backfill (bootstrap-started or manual) already has work
+under way — it used to race a concurrent backfill and collide on the
+watermark row.
+
 ## What `makemigrations` also wanted, and did not get
 
 Migration 0008 omits four `AlterField` operations turning the `Daily*`
@@ -2595,6 +2611,19 @@ watermark) is a no-op with a log line pointing at the backfill command, same con
 the native rollup. `check_erc20_balance_drift_task` runs Sundays 05:15, fifteen minutes
 after the native drift check.
 
+**Superseded by the analytics bootstrap ("Analytics bootstrap
+(self-starting backfills)", below).** The one-time `backfill_erc20_balances`
+step is no longer a required manual action on any fleet instance:
+`bootstrap.erc20.Erc20Stage` runs it automatically (adopt-or-fresh-start,
+never resume — resuming a stalled run stays `erc20_balance_backfill_watchdog_task`'s
+job alone) once the daily and native stages are both
+done and the indexer gate is settled. `compute_erc20_balance_rollup_task`
+itself is untouched — it still never cold-starts on its own (see
+`run_erc20_balance_rollup`'s own docstring) — but a fresh instance no
+longer needs a human to run the backfill command first: the bootstrap
+does. The command remains the manual override for an operator who wants
+to run it by hand or off-cycle.
+
 ## Not done here (P6 scope)
 
 No code changes; this section and the workspace `CLAUDE.md` contract table / refresh
@@ -2891,3 +2920,200 @@ unconditional per-chunk line). `run_chunk_slice` also logs the same event at WAR
 module logger (`erc20_balance.backfill: chunk at (...): seed timed out, run-time whale
 detection flagged N address(es); retrying without them`) so it shows up in worker logs under
 `--celery`, which never wires a `progress_cb`.
+
+---
+
+# Analytics bootstrap (self-starting backfills)
+
+~100 instances run analytics
+(33 Protofire-managed, ~68 client-hosted), and every one of them needs the same three
+one-time historical backfills — daily metrics, native balances, ERC-20 balances — before its
+nightly tasks can keep the data current. There is no shell access to the client-hosted
+instances and no fleet tooling, so "run the three management commands by hand, per host" does
+not scale, and every new network DevOps brings up adds another round of it. The bootstrap
+(`analytics/bootstrap/`) makes analytics self-starting: deploy the image, set
+`ENABLE_ANALYTICS=True`, `migrate`, and the instance backfills itself.
+
+## Three stages, strictly one at a time, in this order
+
+`bootstrap/registry.py`'s `build_default_stages()` returns `[DailyStage(), NativeStage(),
+Erc20Stage()]` — the fixed order the tick enforces, never edited per-instance. Each
+implements the `Stage` interface (`bootstrap/stage.py`): `is_done()`, `status()`,
+`start_or_resume()`. Completion is read from data already in Postgres, never a flag of its
+own, so an instance already backfilled by hand — fully or partly — is recognised
+without the bootstrap ever running:
+
+- **daily** (`bootstrap/daily.py`) — done when every day in the sliding
+  `[today - ANALYTICS_BOOTSTRAP_DAILY_DAYS, yesterday]` window has `DailyMetric.completed_at`
+  (one indexed count query, `DailyStage._completed_and_total`). Dispatch reuses
+  `tasks_shards.start_backfill_run` for the missing days only.
+- **native** (`bootstrap/native.py`) — done when an `AnalyticsWatermark(name=NATIVE_BALANCE_WATERMARK)`
+  row exists. Always drives `backfill_native_balances`'s `--celery` mode
+  (`tasks_shards.start_native_balance_backfill_run` / `backfill_native_balance_chunk`), never
+  the inline path and never the nightly task's own small-fleet cold start — see
+  "Rollout" in the native-balance-rollup section above for why that cold start now declines
+  outright while a backfill is in progress.
+- **erc20** (`bootstrap/erc20.py`) — done when an `AnalyticsWatermark(name=ERC20_BALANCE_WATERMARK)`
+  row exists. `start_or_resume()` is the watchdog's former auto-start logic, relocated: adopt an
+  orphaned run or start a fresh one, reusing `build_erc20_balance_backfill_run` /
+  `dispatch_erc20_balance_backfill_run` from `tasks.py`.
+
+Order is not a per-stage check — it falls out of `bookkeeping.pick_current_stage`: the first
+stage, in registry order, whose `AnalyticsBootstrapStage` row is not terminal (not completed,
+not given up) is the only one ever asked to act this tick. A later stage is never even looked
+at while an earlier one is open.
+
+## The tick algorithm
+
+`bootstrap/tick.py`'s `run_tick()`, wired to the beat task `analytics_bootstrap_tick_task`
+(every 5 minutes, `contracts` queue, `setup_service.py`). First match wins, every branch
+returns in milliseconds:
+
+1. `ENABLE_ANALYTICS` off or `ANALYTICS_AUTO_BACKFILL` off → no-op.
+2. `bookkeeping.bootstrap_complete(depth)` (all three rows terminal, daily's own
+   `completed_depth` at or above the configured depth) → no-op; `maybe_reopen_daily(depth)`
+   clears only daily's row first, if the configured depth has grown.
+3. `pick_current_stage()` picks the first non-terminal stage, marking any stage whose
+   `is_done()` now reports `True` as completed along the way; nothing non-terminal left →
+   stop (the next call's step 2 will see it as complete).
+4. The current stage is `"running"` → no-op always; `"stalled"` → no-op only if
+   `stage.resumed_externally` (ERC-20 alone: its watchdog task owns resuming a stall).
+5. `gate.indexer_caught_up()` says not caught up → no-op (logged at INFO only on a state
+   change).
+6. `"failed"` → count it if it's new, give up (one ERROR line) at the retry cap, else cool
+   down or fall through.
+7. Otherwise → `bookkeeping.record_dispatch()` then `stage.start_or_resume()`.
+
+`run_tick()` wraps every step in one `try/except` so a stage (or the gate) raising can never
+take the beat worker down with it.
+
+## The indexer gate
+
+`bootstrap/gate.py` reuses `analytics/catchup/gate.py` — the same settle check the nightly
+task and `backfill_daily_metrics` use — rather than inventing a second notion of "caught up".
+`check_indexer()` asks `ensure_day_settled` about **yesterday**, the most recent
+UTC day that could ever be complete; a new network still mid-sync fails this immediately,
+which is what stops the bootstrap from freezing incomplete history under a watermark.
+`check_indexer()` is pure (no Redis, no logging) so `analytics_bootstrap --status` can read
+the live verdict without side effects; `indexer_caught_up()` wraps it with a Redis-remembered
+last-state key so the tick logs a change of verdict once, not every 5 minutes.
+
+## Liveness, not elapsed time, decides "stalled"
+
+A run is never superseded or redispatched merely for being slow, however long one day takes:
+
+- **Daily.** Every day-shard holds a Redis lease, `analytics_backfill_leases:<run_id>` (a
+  per-run sorted set, `tasks_shards.py`), TTL = the shard's hard time limit + 60s. While
+  `any_daily_backfill_lease_held()` is true the run is `"running"` no matter how long it
+  takes; only past `DAILY_BACKFILL_STALE_SECONDS` with no lease is it `"stalled"`, and
+  `start_or_resume()` calls `tasks_shards.supersede_backfill_run()` on the stale manifest
+  before dispatching a fresh one — the old manifest's own chunk hand-off then refuses to
+  continue.
+- **Native and ERC-20.** Each chunk/slice task holds the shared rollup lock
+  (`get_task_lock_name(compute_native_balance_rollup_task.name)` /
+  `..._erc20_balance_rollup_task.name`, `utils.tasks.LOCK_TIMEOUT`) for the duration of its
+  own work — the lock *is* the lease. A manifest also carries `heartbeat_at`, a secondary
+  signal consulted only once the lock is free (`native_balance_backfill_looks_stalled()` /
+  `erc20_balance_backfill_looks_stalled()`).
+- **The `dispatch_seq` generation token** (native and all three ERC-20 chain tasks,
+  `tasks_shards.next_native_balance_dispatch_seq` and its ERC-20 analogue) closes the race a
+  bare lock-plus-heartbeat check leaves open: on a busy `contracts` queue an already-queued
+  chunk can still be picked up *after* a resumer decided the run looked stalled and bumped
+  the sequence to redispatch it. The stale chunk's own `dispatch_seq` argument no longer
+  matches the manifest's, so it exits without work and without dispatching a successor —
+  never a second, parallel chain against the same `run_id`.
+- **`superseded`** (daily only) is the equivalent guard for a run that gets *replaced* rather
+  than resumed in place: the old manifest is marked, and its own next-chunk hand-off
+  (`_advance_backfill_run`) refuses to fire once it does.
+
+A unit that raises inside its hard time limit or statement timeout is a **failure**, not a
+stall — it goes to the retry policy below, never an infinite stall-detect loop.
+
+## Failed vs. stalled, and the retry policy
+
+`"stalled"` and `"failed"` are reported distinctly by every stage's `status()`: a stalled run
+is provably dead (no lease, past the grace period) and gets resumed either by the tick itself
+(daily, native — `resumed_externally = False`) or by ERC-20's watchdog task alone
+(`resumed_externally = True`, so the tick's step 4 leaves it alone — two resumers on the same
+5-minute cadence could otherwise dispatch the same `run_id` twice). A failed run is one whose
+own unit of work raised or came back unable to finish.
+
+The retry policy (`tick.py`, module constants `BOOTSTRAP_RETRY_COOLDOWN` = 6h,
+`BOOTSTRAP_RETRY_CAP` = 3) lives entirely in step 6: a `"failed"` status counts as a new
+failure only if it hasn't been counted yet (`last_failure_at` older than `last_dispatch_at`,
+or never set) — `tick._should_dispatch_after_failure`. At the cap, `bookkeeping.mark_gave_up`
+stamps `gave_up_at` and logs exactly one ERROR line; the bootstrap does not stop, it moves on
+— the next tick's `pick_current_stage` treats a given-up row as terminal and starts the next
+stage in registry order. Below the cap, a failure waits out the cooldown, then falls through
+to a fresh dispatch exactly like `"pending"`. So a pathologically broken stage costs at most 3
+attempts, never blocks the other two, and is visible via one log line plus the given-up state
+on `/summary/` and `--status`.
+
+## The `AnalyticsBootstrapStage` table, and where bootstrap state lives
+
+One row per stage (`analytics/models.py`, migration `0011`), `name` in `("daily", "native",
+"erc20")`, created lazily by `bootstrap/bookkeeping.get_stage_row()` the first time a tick or
+command touches that stage — never seeded by the migration. It holds
+`consecutive_failures` / `last_failure_at` / `last_dispatch_at` / `gave_up_at` /
+`completed_at` / `completed_depth` (the last meaningful only for `"daily"`). There is no
+separate "bootstrap complete" row — `bookkeeping.bootstrap_complete()` derives it fresh from
+these three rows on every call. The retry bookkeeping needed a home of its own, so it got a
+dedicated table rather than overloading an existing one; the rule the whole analytics app now
+follows for state:
+
+- rollup data → rollup tables (`Daily*`, `SafeNativeBalance`, `SafeTokenBalance`, …);
+- indexing cursors → `AnalyticsWatermark` (name, block, timestamp — its actual purpose);
+- bootstrap orchestration state → `AnalyticsBootstrapStage`;
+- anything ephemeral (manifests, leases, locks, gate state) → Redis with a TTL.
+
+No other new tables. (An earlier iteration stored the completion marker as a fourth
+`AnalyticsWatermark` row with the daily depth stuffed into `block_number` — `bootstrap/marker.py`
+— retired once the dedicated table existed; don't resurrect that shape.)
+
+## Depth growth, and manual commands vs. the bootstrap
+
+`ANALYTICS_BOOTSTRAP_DAILY_DAYS` (default 90, matching the dashboard's longest filter) is a
+*sliding* window depth, recomputed from `timezone.now()` on every call — raising it later (say
+to 730) makes the daily stage backfill only the older days that are now missing; lowering it
+does nothing, because data is never deleted. `bookkeeping.maybe_reopen_daily()` clears only
+daily's row once the configured depth exceeds what it last completed for — native and ERC-20
+are never re-run by a depth change.
+
+A manual `--restart` on any of the three backfill commands calls
+`bookkeeping.reset_stage(name, data_wiped=True)`: it clears that stage's failure bookkeeping
+*and* `completed_at` (and, for daily, `completed_depth`), since the underlying data was just
+truncated — the row would otherwise keep claiming a completion that no longer exists. This
+makes the stage non-terminal again, so a *later* tick may help finish it — deliberately, since
+safety never depended on the bootstrap refusing to look: the shared lock, the running
+manifest/lease, and the `dispatch_seq` guard already make `start_or_resume()` a no-op while
+the operator's own run is genuinely alive, so the tick can only ever adopt one that's been
+orphaned. A plain manual start (no `--restart`) also resets the failure bookkeeping but leaves
+`completed_at` alone.
+
+## Settings
+
+Both env-driven, next to `ENABLE_ANALYTICS` (`config/settings/base.py`):
+
+- **`ANALYTICS_AUTO_BACKFILL`** — default on. The kill switch: a client-hosted operator who
+  wants to defer the backfills, or run the commands by hand instead, sets this to `False` and
+  every tick no-ops at step 1.
+- **`ANALYTICS_BOOTSTRAP_DAILY_DAYS`** — default 90, clamped to `>= 1` at settings load time
+  (an invalid value logs a warning and is coerced rather than crashing startup).
+
+## Status and `/summary/`
+
+`analytics_bootstrap --status` (`analytics/management/commands/analytics_bootstrap.py`) is
+read-only — it builds `bootstrap/report.py`'s `build_bootstrap_report()` (the same read model
+`/summary/` uses) plus the live indexer-gate verdict and each failing stage's cooldown end
+time, neither of which the cached report itself carries. It makes no writes and dispatches
+nothing, unlike the report's own callers.
+
+`/summary/` (`AnalyticsSummaryView`, `AnalyticsService._get_bootstrap_report`) gains an
+additive `bootstrap` object: `{enabled, complete, daily_depth, current_stage, indexer_gate,
+stages: {daily|native|erc20: {state, progress, consecutive_failures, completed_at,
+gave_up_at, last_dispatch_at}}}`. Computed fresh on every request — never cached into the
+summary snapshot row, since the bootstrap's own state can move between two polls of a warming
+snapshot — and `None` if building it raises, so a bootstrap-reporting bug can never take the
+rest of the summary payload down with it. Existing keys and the warming semantics (empty
+payload, `computed_at: null`, on a cold snapshot) are unchanged. No hub change consumes this
+yet — that's a later, separate hub PR.

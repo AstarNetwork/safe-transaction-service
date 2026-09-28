@@ -150,7 +150,13 @@ class AnalyticsMultisigTxsByOriginListView(APIView):
 
 
 class AnalyticsSummaryView(APIView):
-    """A.1 — Fleet-level summary metrics (direct query)."""
+    """A.1 — Fleet-level summary metrics (direct query).
+
+    Additive ``bootstrap`` object with each backfill stage's state,
+    computed fresh per request (never cached in the snapshot row) --
+    ``None`` if building it raises, so a bootstrap-reporting bug can never
+    take the rest of this payload down with it.
+    """
 
     swagger_schema = None
     renderer_classes = (JSONRenderer,)

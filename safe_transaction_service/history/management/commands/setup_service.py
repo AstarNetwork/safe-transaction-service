@@ -247,6 +247,15 @@ TASKS = [
         ),
         cron=CronDefinition(minute="*/5"),  # Every 5 minutes - */5 * * * *
     ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.analytics_bootstrap_tick_task",
+        description=(
+            "Self-starting analytics bootstrap: daily metrics -> native "
+            "balances -> ERC-20 balances, one at a time, until a "
+            "completion marker is written (every 5 minutes)"
+        ),
+        cron=CronDefinition(minute="*/5"),  # Every 5 minutes - */5 * * * *
+    ),
 ]
 
 

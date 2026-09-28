@@ -10,7 +10,9 @@ Not a `test_*` module -- pytest won't collect it -- same convention as
 from datetime import UTC, datetime
 from unittest.mock import patch
 
+from safe_transaction_service.analytics.bootstrap.gate import _LAST_STATE_KEY
 from safe_transaction_service.analytics.catchup.gate import IndexerStatus
+from safe_transaction_service.utils.redis import get_redis
 
 #: Far enough in the future that `ensure_day_settled` accepts any day one
 #: of these tests computes, regardless of which UTC date the test itself
@@ -37,7 +39,16 @@ GATE_PATCH_TARGETS = (
     "safe_transaction_service.analytics.management.commands."
     "backfill_daily_metrics.get_indexer_status",
     "safe_transaction_service.analytics.catchup.sweeper.get_indexer_status",
+    "safe_transaction_service.analytics.bootstrap.gate.get_indexer_status",
 )
+
+
+def clear_bootstrap_gate_state() -> None:
+    """Delete `bootstrap/gate.py`'s remembered last verdict. Redis isn't
+    rolled back between tests the way the database is, so a verdict one
+    test's `indexer_caught_up()` call writes would otherwise leak into
+    whichever test reads `last_indexer_gate_state()` next."""
+    get_redis().delete(_LAST_STATE_KEY)
 
 
 class SettledGateMixin:
@@ -50,6 +61,7 @@ class SettledGateMixin:
 
     def setUp(self):
         super().setUp()
+        clear_bootstrap_gate_state()
         for target in GATE_PATCH_TARGETS:
             patcher = patch(target, return_value=SETTLED_INDEXER_STATUS)
             patcher.start()

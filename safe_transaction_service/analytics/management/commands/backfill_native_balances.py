@@ -22,12 +22,14 @@ import time
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 
+from safe_transaction_service.analytics.bootstrap.bookkeeping import reset_stage
 from safe_transaction_service.analytics.models import (
     AnalyticsWatermark,
     SafeNativeBalance,
 )
 from safe_transaction_service.analytics.services.db import relaxed_statement_timeout
 from safe_transaction_service.analytics.tasks import (
+    NATIVE_BALANCE_SEED_BATCH_SIZE,
     NATIVE_BALANCE_WATERMARK,
     _iter_safe_addresses_keyset,
     native_balance_head_block,
@@ -40,6 +42,14 @@ from safe_transaction_service.analytics.tasks_shards import (
     start_native_balance_backfill_run,
 )
 from safe_transaction_service.history.models import SafeContract
+
+# The batch size the balance SQL was measured at (same constant the
+# rollup's own seed step uses -- `NATIVE_BALANCE_SEED_BATCH_SIZE`,
+# `analytics/tasks.py`). Exposed as a module constant, mirroring
+# `backfill_erc20_balances.py`'s `DEFAULT_CHUNK_SIZE`, so
+# `analytics.bootstrap.native.NativeStage` can reuse the exact default
+# instead of hard-coding a second copy of "5000".
+DEFAULT_CHUNK_SIZE = NATIVE_BALANCE_SEED_BATCH_SIZE
 
 
 def _stamp_range() -> tuple[int | None, int | None]:
@@ -73,11 +83,12 @@ class Command(BaseCommand):
         parser.add_argument(
             "--chunk-size",
             type=int,
-            default=5000,
+            default=DEFAULT_CHUNK_SIZE,
             help=(
-                "Safe addresses per batch (default 5000). The same size the "
-                "existing balance SQL was measured at; lower it if a batch "
-                "outruns the 30-minute relaxed statement timeout."
+                f"Safe addresses per batch (default {DEFAULT_CHUNK_SIZE}). The "
+                "same size the existing balance SQL was measured at; lower "
+                "it if a batch outruns the 30-minute relaxed statement "
+                "timeout."
             ),
         )
         parser.add_argument(
@@ -158,6 +169,9 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if options["status"]:
             return self._print_status()
+
+        # A manual start resets the bootstrap's retry bookkeeping for this stage.
+        reset_stage("native", data_wiped=options["restart"])
 
         if options["restart"]:
             self._restart()
