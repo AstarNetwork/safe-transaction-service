@@ -27,6 +27,6 @@ pillow==11.3.0
 psycopg[binary,pool]==3.2.13
 redis[hiredis]==7.1.0
 requests==2.32.5
-git+https://github.com/protofire/safe-eth-py.git@v7.20.0#egg=safe-eth-py
+git+https://github.com/protofire/safe-eth-py.git@v7.20.1#egg=safe-eth-py
 #safe-eth-py[django]==7.19.0
 web3==7.14.1
